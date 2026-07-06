@@ -1,0 +1,184 @@
+# Autobehaver full-project configuration template.
+#
+# Copy this file, edit project.main_dir, and adjust stage-specific settings for a
+# new analysis project. Relative paths are resolved relative to this YAML file.
+# The smaller example configuration is configs/smoke_config.yaml.
+
+project:
+  main_dir: ../my_autobehaver_project
+
+registry:
+  enabled: true
+  csv: ../my_autobehaver_project/registry.csv
+  lock_timeout_sec: 120
+  lock_stale_sec: 3600
+
+moviechecker:
+  review_all: false
+  playback_stride: 1
+
+autocropper:
+  file_filter: null
+  chamber_rows: 2
+  chamber_columns: 3
+  approx_radius: 265
+  crop_dim_2k: 600
+  down_factor: 2
+  frame_avg: 100
+  crop_crf: 12
+  validate_chambers: true
+  require_exclusions: true
+  skip_labeling: false
+  num_workers: 8
+
+dlc:
+  dlc_config: ../autobehaver/resources/dlc/trial#3-mixed-training-na-2024-11-29/config.yaml
+  file_filter: null
+  videotype: .mp4
+  shuffle: 1
+  overwrite: false
+  recursive: false
+  keep_dlc_tag: false
+  make_movie: false
+  fastmode: true
+  trailpoints: 0
+  pcutoff: 0.6
+  dotsize: 4
+  colormap: rainbow
+  color_by: bodypart
+  codec: mp4v
+
+keypre:
+  file_filter: null
+  raw_only: false
+  dry_run: false
+  movie_dim: 600
+  num_workers: 8
+  clobber: false
+  log_level: INFO
+
+keyprenorm:
+  file_filter: null
+  pattern: '*_positional_calcs.csv'
+  norm_params: ../autobehaver/resources/norm_params/norm_params.csv
+  calculate_norm: false
+  norm_only: false
+  size_check: true
+  require_full_length: false
+  batch_size: 10
+  edge_skip: 5
+  max_rows: 64750
+  num_workers: 8
+  clobber: false
+  log_level: INFO
+
+# Optional: pose prediction model training settings. The bundled smoke workflow
+# uses the pretrained checkpoint below rather than retraining.
+posepred_training: {}
+
+posepred_inference:
+  inference_model:
+    - ../autobehaver/resources/posepred_checkpoint/posepred_d256_best_model_epoch.pth
+  file_filter: null
+  num_workers: 8
+  batch: 1024
+  inf_average: 10
+  sequence_length: 41
+  use_tta: true
+  tta_noise_level: 0.01
+  min_pose_bout: 5
+  min_orient_bout: 5
+  clobber: false
+  archive_existing: true
+  flat_output: true
+  write_run_log: true
+
+mmgen:
+  file_filter: null
+  inf_tag: _normalized_inference
+  min_bout: 5
+  edge_skip: 5
+  num_workers: 8
+  input_batch_size: 256
+  random_seed: 0
+  video_fps: 40.0
+  chamber_diameter_px: 530
+  mm_per_px: null
+  make_measurements: true
+  calculate_occupancy: true
+  calculate_postural_features: true
+  generate_quiver_plots: true
+  run_transition_statistics: true
+  make_detailed_transition_outputs: true
+  master_matrix: true
+  full_outputs: true
+  resume: true
+  keep_temp_files: false
+
+featureimp:
+  stage: all
+  analysis_run_name: featureimp_analysis
+  control_group_tag: CONTROL-SPD2-czmab-15day
+  training_group_a: CONTROL-SPD2-czmab-15day
+  training_group_b: MUTANT-SPD2-Z3-czmab-15day
+  sex_filter: all
+  include_feature_categories: null
+  min_feature_completeness_per_group: 0.25
+  MIN_VARIANCE_THRESHOLD: 0.000001
+  n_splits: 5
+  H_hits_per_feature: 100
+  n_features_per_model: 100
+  n_estimators: 1000
+  learning_rate: 0.01
+  max_depth: 6
+  model_subsample: 0.8
+  run_permutation_test: true
+  n_permutations: 1
+  subset_weight_tau_quantile: 0.95
+  subset_weight_gamma: 2.0
+  run_fsea_analysis: true
+  run_pca_analysis: true
+  postanalysis_strict: false
+  postanalysis_debug: false
+  pca_fixed_k: 50
+  n_pca_components_to_save: 0
+  fsea_permutations: 100000
+  fsea_min_size: 15
+  fsea_max_size: 500
+  fsea_fdr_threshold: 0.25
+  fsea_viz_top_n: 1000
+  fsea_viz_plot_all_groups: false
+  fsea_viz_color_percentile: 100
+  GLOBAL_RANDOM_SEED: 7
+  num_workers: 8
+
+infmovie:
+  mode: qc
+  file_filter: null
+  num_clips: 1
+  clip_duration_sec: 10.0
+  clip_padding_sec: 1.0
+  min_gap_sec: 20.0
+  max_clips_per_recording: 1
+  random_seed: 0
+  selection_label_source: smoothed
+  qc_uncertainty_threshold: 0.6
+  qc_min_uncertainty_frames: 4
+  qc_switch_window_sec: 5.0
+  qc_switch_min_changes: 8
+  qc_use_uncertainty: true
+  qc_use_switching: true
+  num_workers: 8
+  skip_first_n_frames: 5
+  timeline: both
+  timeline_compare: false
+  timeline_labels: predicted
+  timeline_height: 36
+  white_mode: false
+  speed_factor: 1.0
+  max_output_fps: 40.0
+  show_timestamp: true
+  timestamp_position: top_right
+  timestamp_decimals: 1
+  timestamp_reference: movie
+  clobber: false

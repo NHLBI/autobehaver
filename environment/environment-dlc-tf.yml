@@ -1,0 +1,29 @@
+name: autobehaver-dlc
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip>=23
+  - ffmpeg
+  - hdf5
+  - pytables=3.8
+  - libstdcxx-ng>=12
+  - libgcc-ng>=12
+  - lerc
+  - numpy=1.23.5
+  - pandas>=1.5,<2.3
+  - pyyaml>=6
+  - h5py>=3.8
+  - opencv>=4.8
+  - imageio
+  - imageio-ffmpeg
+  - tqdm>=4.65
+  - pip:
+      # TensorFlow-style DeepLabCut environment for DLC 2.x projects.
+      # This is intentionally separate from the main Autobehaver environment.
+      - "tensorflow==2.12.*"
+      - "tensorpack>=0.11"
+      - "tf_slim>=1.1.0"
+      - "deeplabcut[tf]==2.3.11"

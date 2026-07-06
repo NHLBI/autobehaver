@@ -1,0 +1,24 @@
+U.S. Government Work
+
+Unless otherwise noted, this software was prepared by employees of the National
+Institutes of Health, National Heart, Lung, and Blood Institute, as part of their
+official duties. Pursuant to 17 U.S.C. § 105, works of the United States
+Government are not subject to copyright protection in the United States.
+
+Permission is granted to use, copy, modify, distribute, and create derivative
+works of this software without restriction, subject to any applicable third-party
+licenses, data-use restrictions, export-control restrictions, and other applicable
+law or policy.
+
+This software is provided "as is" without any warranty, express or implied,
+including but not limited to the warranties of merchantability, fitness for a
+particular purpose, and non-infringement. The United States Government, NIH,
+NHLBI, and the authors assume no responsibility for the use of this software by
+other parties and make no guarantees about its quality, reliability, or suitability
+for any purpose.
+
+Reference to any specific commercial product, process, or service does not imply
+endorsement, recommendation, or favoring by the United States Government, NIH,
+NHLBI, or the authors. The names of NIH, NHLBI, and the authors may not be used
+to imply endorsement of any derived product or service without prior written
+permission where such permission is required.

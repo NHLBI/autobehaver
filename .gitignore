@@ -1,0 +1,47 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter/editor/OS clutter
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+
+# Generated Autobehaver outputs
+test_runs/
+*.log
+
+# Local scratch files
+scratch/
+tmp/
+
+# Python packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Local Conda metadata, if ever created in-tree
+conda-meta/
+
+# Large data/model assets restored locally from the project data archive.
+# Keep only the small README placeholders in Git.
+test_data/*
+!test_data/README.md
+autobehaver/resources/dlc/*
+!autobehaver/resources/dlc/README.md
+autobehaver/resources/posepred_checkpoint/*
+!autobehaver/resources/posepred_checkpoint/README.md

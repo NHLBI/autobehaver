@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autobehaver"
+dynamic = ["version"]
+description = "Pipeline utilities for processing and analyzing behavior videos."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "LicenseRef-US-Government-Work"
+license-files = ["LICENSE.txt"]
+authors = [
+  { name = "NIH/NHLBI" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Runtime dependencies are managed by the files in environment/ because this
+# project uses Conda-sensitive packages such as PyTorch, OpenCV, TensorFlow, and
+# DeepLabCut. `python -m pip install -e .` is therefore used to register the
+# local source tree as an editable package after the Conda environment exists;
+# it is not the primary dependency solver for Autobehaver.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[project.scripts]
+autobehaver = "autobehaver.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["autobehaver*"]
+
+[tool.setuptools.package-data]
+autobehaver = ["resources/**/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "autobehaver._version.__version__"}

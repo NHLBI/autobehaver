@@ -1,0 +1,22 @@
+# Core Autobehaver dependencies for pip-based environments.
+# Prefer environment/environment.yml for the recommended Conda setup.
+# Install PyTorch separately with the CPU/GPU build appropriate for your machine
+# if you are not using the Conda environment file.
+numpy>=1.23.5,<1.24
+pandas>=1.5,<2.3
+scipy>=1.9
+scikit-learn>=1.2
+statsmodels>=0.14
+matplotlib>=3.7
+seaborn>=0.12
+opencv-python>=4.8
+imageio-ffmpeg>=0.4
+h5py>=3.8
+PyYAML>=6
+tqdm>=4.65
+joblib>=1.2
+openpyxl>=3.1
+xgboost>=1.7
+shap>=0.42
+gseapy>=1.0
+wandb>=0.16

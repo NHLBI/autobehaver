@@ -1,0 +1,6 @@
+# Optional TensorFlow-style DeepLabCut support for DLC 2.x projects.
+# Prefer environment/environment-dlc-tf.yml or an HPC-provided DLC module when available.
+tensorflow==2.12.*
+tensorpack>=0.11
+tf_slim>=1.1.0
+deeplabcut[tf]==2.3.11

@@ -1,0 +1,178 @@
+# Autobehaver example smoke-test configuration.
+# Run commands from the repository root with:
+#   --config configs/smoke_config.yaml
+#
+# Paths are resolved relative to this YAML file. Generated outputs are written
+# to test_runs/smoke_config/. Edit input paths before running on new data.
+
+moviechecker:
+  input_dir: ../test_data/preinf
+  review_all: false
+  playback_stride: 1
+
+autocropper:
+  input_dir: ../test_data/preinf
+  output_dir: ../test_runs/smoke_config/autocropper
+  file_filter: full_frame_movie_compressed
+  require_exclusions: false
+  skip_labeling: true
+  chamber_rows: 2
+  chamber_columns: 3
+  approx_radius: 265
+  crop_dim_2k: 600
+  down_factor: 2
+  frame_avg: 10
+  crop_crf: 12
+  validate_chambers: true
+  num_workers: 1
+
+dlc:
+  input_dir: ../test_data/postinf/cropped_movie
+  output_dir: ../test_runs/smoke_config/dlc
+  dlc_config: ../autobehaver/resources/dlc/trial#3-mixed-training-na-2024-11-29/config.yaml
+  videotype: .mp4
+  shuffle: 1
+  make_movie: false
+  clobber: true
+
+keypre:
+  input_dir: ../test_data/preinf/DLC_outputs
+  output_dir: ../test_runs/smoke_config/keypre
+  file_filter: null
+  raw_only: false
+  dry_run: false
+  movie_dim: 600
+  num_workers: 8
+  clobber: true
+  log_level: INFO
+
+keyprenorm:
+  input_dir: ../test_runs/smoke_config/keypre
+  output_dir: ../test_runs/smoke_config/keyprenorm
+  pattern: '*_positional_calcs.csv'
+  norm_params: ../autobehaver/resources/norm_params/norm_params.csv
+  calculate_norm: false
+  norm_only: false
+  size_check: false
+  require_full_length: false
+  batch_size: 4
+  edge_skip: 5
+  max_rows: 1200
+  num_workers: 8
+  clobber: true
+  log_level: INFO
+
+posepred_inference:
+  input_dir: ../test_runs/smoke_config/keyprenorm
+  output_dir: ../test_runs/smoke_config/posepred_inference
+  inference_model:
+    - ../autobehaver/resources/posepred_checkpoint/posepred_d256_best_model_epoch.pth
+  file_filter: null
+  num_workers: 0
+  batch: 256
+  inf_average: 10
+  sequence_length: 41
+  use_tta: false
+  tta_noise_level: 0.01
+  min_pose_bout: 5
+  min_orient_bout: 5
+  clobber: true
+  archive_existing: false
+  flat_output: true
+  write_run_log: true
+
+mmgen:
+  poscalc_dir: ../test_data/postinf/preprocessed_keypoints
+  inference_csv_dir: ../test_data/postinf/posepred_inferences
+  output_dir: ../test_runs/smoke_config/mmgen
+  file_filter: null
+  inf_tag: _normalized_inference
+  min_bout: 5
+  edge_skip: 5
+  num_workers: 8
+  input_batch_size: 64
+  random_seed: 0
+  video_fps: 40.0
+  chamber_diameter_px: 530
+  mm_per_px: null
+  make_measurements: true
+  calculate_occupancy: true
+  calculate_postural_features: true
+  generate_quiver_plots: false
+  run_transition_statistics: true
+  make_detailed_transition_outputs: false
+  master_matrix: true
+  full_outputs: false
+  resume: false
+  keep_temp_files: false
+
+featureimp:
+  matrix_dir: ../test_runs/smoke_config/mmgen
+  results_dir: ../test_runs/smoke_config/featureimp
+  stage: all
+  analysis_run_name: featureimp_smoke
+
+  control_group_tag: CONTROL-SPD2-czmab-15day
+  training_group_a: CONTROL-SPD2-czmab-15day
+  training_group_b: MUTANT-SPD2-Z3-czmab-15day
+
+  sex_filter: all
+  include_feature_categories: null
+  min_feature_completeness_per_group: 0.10
+  MIN_VARIANCE_THRESHOLD: 0.0
+
+  n_splits: 5
+  H_hits_per_feature: 5
+  n_features_per_model: 500
+  n_estimators: 10
+  learning_rate: 0.1
+  max_depth: 4
+  model_subsample: 1.0
+
+  run_permutation_test: true
+  n_permutations: 1
+  subset_weight_tau_quantile: 0.95
+  subset_weight_gamma: 2.0
+
+  run_fsea_analysis: true
+  run_pca_analysis: true
+  postanalysis_strict: false
+  postanalysis_debug: false
+  pca_fixed_k: 3
+  n_pca_components_to_save: 3
+
+  fsea_permutations: 100000
+  fsea_min_size: 15
+  fsea_max_size: 500
+  fsea_fdr_threshold: 0.10
+  fsea_viz_top_n: 10
+  fsea_viz_plot_all_groups: false
+  fsea_viz_color_percentile: 100
+
+  GLOBAL_RANDOM_SEED: 7
+  num_workers: 8
+
+infmovie:
+  inference_csv_dir: ../test_data/postinf/posepred_inferences
+  movie_dir: ../test_data/postinf/cropped_movie
+  output_dir: ../test_runs/smoke_config/infmovie
+  mode: manual
+  recording_id: SPD2_czmab_15day_trial1_rpi-1_movie0_20250828112037AM_chamber6
+  file_filter: rpi-1_movie0_20250828112037AM_chamber6
+  start_sec: 0
+  duration_sec: 2.0
+  num_workers: 1
+  skip_first_n_frames: 5
+  timeline: both
+  timeline_compare: false
+  timeline_labels: predicted
+  timeline_height: 36
+  white_mode: false
+  speed_factor: 1.0
+  max_output_fps: 40.0
+  default_movie_fps: 40.0
+  show_timestamp: true
+  timestamp_position: top_right
+  timestamp_decimals: 1
+  timestamp_reference: movie
+  clobber: true
