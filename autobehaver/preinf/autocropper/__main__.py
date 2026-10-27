@@ -1,4 +1,4 @@
-"""Package entry point for the autocropper stage."""
+"""Run the Autocropper command-line entry point."""
 
 from .cli import main
 

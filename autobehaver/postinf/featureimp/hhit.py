@@ -1,17 +1,7 @@
-"""autobehaver.postinf.featureimp.hhit
+"""Create stratified folds and specialist feature subsets for FeatureImp coverage
+rounds.
 
-Utilities for the *h_hit-first* specialist-committee training design.
-
-In the FeatureImp pipeline, each "h_hit" round:
-  1) creates a fresh StratifiedKFold split, and
-  2) generates feature subsets such that every feature is included at least once
-     across the subsets for that round.
-
-This module centralizes the shared h-hit logic used by both the real-model and
-permutation specialist committees.
-
-Important: this module is intended to be *pure* (no global settings) and
-should not import heavy ML deps (xgboost/shap).
+Each round covers every feature, with optional balancing of repeated padding features.
 """
 
 from __future__ import annotations
@@ -63,13 +53,7 @@ def validate_stratified_cv_labels(
     n_splits: int,
     context: str = "StratifiedKFold",
 ) -> Dict[str, int]:
-    """Validate that every stratum can support the requested fold count.
-
-    FeatureImp uses sex+group composite strata for committee fold generation.
-    A too-small stratum does not just make the split fragile; it makes the
-    requested ``n_splits`` invalid.  We fail early with a clear message rather
-    than letting ``StratifiedKFold`` surface a lower-level exception later.
-    """
+    """Require each sex/group stratum to contain enough samples for the requested folds."""
 
     if not isinstance(n_splits, int) or n_splits < 2:
         raise ValueError(f"n_splits must be an int >= 2, got {n_splits!r}")
@@ -182,23 +166,10 @@ def generate_feature_subsets_for_hhit(
     context_label: str = "",
     extra_rep_count: Optional[Dict[str, int]] = None,
 ) -> HHITSubsetPlan:
-    """Generate feature subsets for one h_hit round.
+    """Generate subsets that cover every feature in one coverage round.
 
-    This matches the historical FeatureImp subset-construction behavior:
-      - repeatedly sample subsets until every feature is used at least once
-      - if the last subset cannot be filled with unused features, pad with already-used
-        features (no duplicates within a subset)
-
-    New behavior (optional):
-      - if `extra_rep_count` is provided, padding features are chosen using a
-        *min-count* policy so that features that have already received extra
-        representation across previous h_hit rounds are less likely to be
-        chosen again.
-
-    IMPORTANT:
-      - This only affects *padding* in the final subset of a round.
-      - Callers must update `extra_rep_count` across h_hit rounds to get the
-        intended variance reduction.
+    Pad the final subset without duplicates. When extra_rep_count is supplied, prefer
+    features with fewer prior padding uses; callers carry those counts between rounds.
     """
 
     feats = list(all_feature_names)

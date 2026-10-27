@@ -2,40 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import yaml
+def test_keyprenorm_cli_options_reach_runtime(monkeypatch, tmp_path: Path) -> None:
+    """Explicit options reach normalization unchanged without loading YAML."""
 
-
-def test_keyprenorm_cli_supports_pipeline_config(monkeypatch, tmp_path: Path) -> None:
-    """Smoke test: keyprenorm CLI accepts --config and maps keyprenorm: defaults.
-
-    This ensures the README and pipeline template config are accurate.
-    """
-
-    # Create a minimal input folder (does not need real CSVs because we monkeypatch run_keyprenorm).
+    # Capture settings without executing normalization.
     input_dir = tmp_path / "positional_calcs"
     input_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create a YAML config with keyprenorm section.
-    cfg_path = tmp_path / "config.yaml"
-    cfg = {
-        "registry": {
-            "enabled": False,
-        },
-        "keyprenorm": {
-            "input_dir": str(input_dir),
-            "output_dir": str(tmp_path / "out"),
-            "pattern": "*_positional_calcs.csv",
-            "file_filter": "trial",
-            "clobber": True,
-            "calculate_norm": True,
-            "edge_skip": 7,
-            "max_rows": 0,
-            "num_workers": 3,
-        },
-    }
-    cfg_path.write_text(yaml.safe_dump(cfg))
-
-    # Capture the cfg passed to run_keyprenorm
     captured = {}
 
     def _fake_run_keyprenorm(*, cfg, args) -> None:  # type: ignore[no-untyped-def]
@@ -46,7 +19,11 @@ def test_keyprenorm_cli_supports_pipeline_config(monkeypatch, tmp_path: Path) ->
 
     monkeypatch.setattr(keyprenorm_cli, "run_keyprenorm", _fake_run_keyprenorm)
 
-    keyprenorm_cli.main(["--config", str(cfg_path)])
+    keyprenorm_cli.main([
+        "--input-dir", str(input_dir), "--output-dir", str(tmp_path / "out"),
+        "--pattern", "*_positional_calcs.csv", "--file-filter", "trial",
+        "--clobber", "--calculate-norm", "--edge-skip", "7", "--num-workers", "3",
+    ])
 
     assert "cfg" in captured
     kcfg = captured["cfg"]
@@ -60,7 +37,6 @@ def test_keyprenorm_cli_supports_pipeline_config(monkeypatch, tmp_path: Path) ->
     assert kcfg.file_filter == "trial"
     assert kcfg.calculate_norm is True
     assert kcfg.edge_skip == 7
-    assert kcfg.max_rows == 0
     assert kcfg.num_workers == 3
 
     assert kcfg.clobber is True

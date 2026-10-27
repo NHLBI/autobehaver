@@ -1,7 +1,4 @@
-"""Entrypoint for ``python -m autobehaver.training``.
-
-This routes to the pose prediction training CLI.
-"""
+"""Route ``python -m autobehaver.training`` to the PosePred training CLI."""
 
 from .posepred_training.cli import main
 

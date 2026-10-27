@@ -1,16 +1,23 @@
-"""Explicit runtime settings for mmgen.
-
-This module centralizes the per-run settings that were previously propagated by
-mutating module-level variables across the mmgen submodules. The goal is to
-keep a single explicit source of truth for one mmgen invocation.
+"""Resolve and pass the settings for one MMGen run explicitly to workers and analysis
+helpers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Sequence
 
-from .kinematics import KIN_FRAMES_SIGNAL_COLS as DEFAULT_KIN_FRAMES_SIGNAL_COLS
+
+
+def validate_calibration(*, mm_per_px, video_fps, chamber_diameter_px):
+    """Reject invalid supplied calibration; None and diameter zero retain auto/default semantics."""
+    for name, value in [('mm_per_px', mm_per_px), ('video_fps', video_fps)]:
+        if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
+            raise ValueError(f'{name} must be finite and positive')
+    if chamber_diameter_px is not None and (
+            not math.isfinite(float(chamber_diameter_px)) or float(chamber_diameter_px) < 0):
+        raise ValueError('chamber_diameter_px must be finite and nonnegative (zero selects auto)')
 
 
 @dataclass(frozen=True)
@@ -23,7 +30,7 @@ class MMGenRuntimeSettings:
 
     num_workers: int = 16
     input_batch_size: int = 20
-    keep_temp_files: bool = True
+    keep_temp_files: bool = False
     emit_master_matrix: bool = True
     emit_full_outputs: bool = True
 
@@ -43,7 +50,12 @@ class MMGenRuntimeSettings:
     chamber_diameter_px: int | None = 530
     mm_per_px: float | None = 0.0169896744624207
     video_fps: float | None = 40.0
-    kin_frames_signal_cols: tuple[str, ...] = tuple(DEFAULT_KIN_FRAMES_SIGNAL_COLS)
+    allow_unsafe_alignment_fallback: bool = False
+    source_frame_offset: int = 0
+
+    def __post_init__(self):
+        validate_calibration(mm_per_px=self.mm_per_px, video_fps=self.video_fps,
+                             chamber_diameter_px=self.chamber_diameter_px)
 
     @classmethod
     def from_config(cls, cfg) -> "MMGenRuntimeSettings":
@@ -68,5 +80,6 @@ class MMGenRuntimeSettings:
             chamber_diameter_px=(None if cfg.chamber_diameter_px is None else int(cfg.chamber_diameter_px)),
             mm_per_px=(None if cfg.mm_per_px is None else float(cfg.mm_per_px)),
             video_fps=(None if cfg.video_fps is None else float(cfg.video_fps)),
-            kin_frames_signal_cols=tuple(DEFAULT_KIN_FRAMES_SIGNAL_COLS),
+            allow_unsafe_alignment_fallback=bool(cfg.allow_unsafe_alignment_fallback),
+            source_frame_offset=int(cfg.source_frame_offset),
         )

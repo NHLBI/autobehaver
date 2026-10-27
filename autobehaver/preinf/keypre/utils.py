@@ -1,4 +1,4 @@
-"""Small helpers for keypre."""
+"""Provide ordered-column, polygon-area, and log-discovery helpers for KeyPre."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def add_existing_columns(poscorr_dict: dict, source_df: pd.DataFrame, columns: I
 
 
 def shoelace_area(df: pd.DataFrame, vertices: list[str]) -> pd.Series:
-    """Calculate polygon area for each row using the Shoelace formula."""
+    """Return one absolute polygon area per row using the shoelace formula."""
 
     # Extract x and y coordinates for all vertices into numpy arrays for performance
     x_coords = df[[f"{v}_x" for v in vertices]].values

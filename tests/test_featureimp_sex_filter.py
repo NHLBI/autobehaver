@@ -13,8 +13,8 @@ def _make_matrix(tmp_path: Path) -> tuple[Path, Path, Path]:
 
     rng = np.random.default_rng(1)
     rows = []
-    for i in range(12):
-        group = "A" if i < 6 else "B"
+    for i in range(40):
+        group = "A" if i < 20 else "B"
         sex = "M" if i % 2 == 0 else "F"
         rows.append(
             {
@@ -33,7 +33,7 @@ def _make_matrix(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 
-def test_featureimp_sex_filter_male_smoke(tmp_path: Path):
+def test_featureimp_sex_filter_male_integration(tmp_path: Path):
     from autobehaver.postinf.featureimp import core
 
     matrix_dir, results_dir, analysis_dir = _make_matrix(tmp_path)
@@ -48,7 +48,9 @@ def test_featureimp_sex_filter_male_smoke(tmp_path: Path):
         "training_group_a": "A",
         "training_group_b": "B",
         "num_workers": 1,
-        "n_estimators": 5,
+        "n_estimators": 12,
+        "learning_rate": 0.3,
+        "max_depth": 2,
         "n_splits": 2,
         "H_hits_per_feature": 1,
         "n_features_per_model": 2,
@@ -88,4 +90,4 @@ def test_featureimp_sex_filter_male_smoke(tmp_path: Path):
 
     preds = pd.read_excel(analysis_dir / "AVERAGED_PREDICTIONS_FULL.xlsx", sheet_name=0)
     observed_individuals = {str(x) for x in preds["individual"].dropna() if str(x).startswith("fly")}
-    assert observed_individuals <= {"fly0", "fly2", "fly4", "fly6", "fly8", "fly10"}
+    assert observed_individuals <= {f"fly{i}" for i in range(0, 40, 2)}

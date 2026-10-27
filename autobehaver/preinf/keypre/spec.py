@@ -1,7 +1,6 @@
-"""Keypre feature specification.
+"""Define canonical bodypart lists and feature specifications for KeyPre.
 
-This module contains the bodypart lists and feature-definition specs used by keypre.
-Ordering controls downstream output column order.
+Ordering determines downstream output column order.
 """
 
 from __future__ import annotations

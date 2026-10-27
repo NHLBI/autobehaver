@@ -1,7 +1,4 @@
-"""Augmentation utilities for sequence features.
-
-Implements runtime augmentations used during training and optional test-time augmentation during
-inference, including additive Gaussian noise and elementwise masking."""
+"""Apply Gaussian noise and elementwise masking to sequence features."""
 
 from __future__ import annotations
 
@@ -10,7 +7,72 @@ from typing import Tuple, Union
 import torch
 
 
-__all__ = ['augment_features', 'select_columns_for_augmentation']
+__all__ = ['augment_features', 'select_columns_for_augmentation', 'augment_inference_features', 'TTA_RANDOM_ALGORITHM']
+
+TTA_RANDOM_ALGORITHM = 'pcg64-original-frame-block-v1'
+_TTA_BLOCK_SIZE = 64
+
+
+def augment_inference_features(sequences, columns_to_noise, noise_level, *, seed,
+                               recording_identities, source_frames, model_identity, pass_index):
+    """Add seeded Gaussian noise, independent of file order and batch boundaries.
+
+    Each recording/model/pass uses fixed blocks of 64 original center frames.
+    Generate only blocks touched by this batch, so memory is bounded and neither
+    a per-window generator nor a whole-recording noise array is required.
+    """
+    if not columns_to_noise or noise_level == 0:
+        return sequences
+    noise = inference_noise(len(sequences), int(sequences.shape[1]), columns_to_noise,
+                            seed=seed, recording_identities=recording_identities,
+                            source_frames=source_frames, model_identity=model_identity,
+                            pass_index=pass_index)
+    return apply_inference_noise(sequences, noise, columns_to_noise, noise_level)
+
+
+def inference_noise(rows, sequence_length, columns_to_noise, *, seed,
+                    recording_identities, source_frames, model_identity, pass_index,
+                    pin_memory=False):
+    """Generate the original PCG64 values in a CPU buffer, optionally pinned.
+
+    Independent generators release the GIL in NumPy's native normal generator,
+    allowing bounded preparation threads without copying arrays between processes.
+    The key, block shape, dtype and indexing match pcg64-original-frame-block-v1.
+    """
+    import hashlib
+    import json
+    import numpy as np
+
+    if len(recording_identities) != rows or len(source_frames) != rows:
+        raise ValueError('TTA requires one recording identity and original center frame per window.')
+    groups = {}
+    for row, (recording, frame) in enumerate(zip(recording_identities, source_frames)):
+        frame = int(frame)
+        if frame < 0:
+            raise ValueError('TTA original center frames must be nonnegative.')
+        block, offset = divmod(frame, _TTA_BLOCK_SIZE)
+        groups.setdefault((recording, block), []).append((row, offset))
+    shape = (rows, sequence_length, len(columns_to_noise))
+    tensor = torch.empty(shape, dtype=torch.float32, pin_memory=pin_memory)
+    noise = tensor.numpy()
+    for (recording, block), rows in groups.items():
+        key = json.dumps([TTA_RANDOM_ALGORITHM, int(seed), recording, model_identity,
+                          int(pass_index), block, shape[1], list(columns_to_noise)],
+                         separators=(',', ':')).encode('utf-8')
+        block_seed = int.from_bytes(hashlib.sha256(key).digest(), 'little')
+        generator = np.random.Generator(np.random.PCG64(block_seed))
+        block_noise = generator.standard_normal((_TTA_BLOCK_SIZE, *shape[1:]), dtype=np.float32)
+        destinations, offsets = zip(*rows)
+        noise[list(destinations)] = block_noise[list(offsets)]
+    return tensor
+
+
+def apply_inference_noise(sequences, noise, columns_to_noise, noise_level):
+    """Apply prepared noise with the original arithmetic and column semantics."""
+    augmented = sequences.clone()
+    added = noise.to(device=sequences.device, dtype=sequences.dtype, non_blocking=noise.is_pinned())
+    augmented[:, :, columns_to_noise] += added * float(noise_level)
+    return augmented
 
 
 def augment_features(
@@ -21,21 +83,12 @@ def augment_features(
     *,
     return_mask: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Augment a (B, T, F) feature tensor.
+    """Augment a feature tensor of shape (B, T, F) or (T, F).
 
-    Uses additive Gaussian noise followed by masking. Applying masking last
-    prevents noise from being added on top of masked values.
-
-    Parameters:
-        features: Tensor of shape (B, T, F) or (T, F).
-        mask_p: Probability of masking each element (set to 0.0 to disable masking).
-        noise_level: Std-dev of Gaussian noise (set to 0.0 to disable noise).
-        columns_to_noise: Feature columns to apply Gaussian noise to.
-        return_mask: If True, also returns a boolean mask where True=kept, False=masked.
-
-    Returns:
-        If return_mask is False: augmented features tensor.
-        If return_mask is True: (augmented_features, keep_mask_bool).
+    Add Gaussian noise to ``columns_to_noise``, then mask individual elements
+    to zero so noise cannot restore masked values. ``noise_level`` is the noise
+    standard deviation in feature units. Return the augmented tensor, or
+    (tensor, keep_mask) when ``return_mask`` is true; True means unmasked.
     """
 
     was_2d = features.dim() == 2
@@ -72,17 +125,9 @@ def augment_features(
 
 
 def select_columns_for_augmentation(headers: list[str]) -> list[int]:
-    """Select feature columns for augmentation.
+    """Return all feature-column indices for Gaussian noise.
 
-    Current policy:
-      - Add Gaussian noise to all feature columns.
-      - Apply masking across all feature columns.
-
-    Parameters:
-        headers: List of feature names (already decoded to Python ``str``).
-
-    Returns:
-        list[int]: Indices of columns that should have Gaussian noise added.
+    Elementwise masking also applies across all columns.
     """
 
     return list(range(len(headers)))

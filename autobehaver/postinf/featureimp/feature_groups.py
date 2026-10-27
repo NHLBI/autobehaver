@@ -1,21 +1,8 @@
-"""Curated / programmatic feature-group definitions for FeatureImp.
-
-These constants are used by:
-- FSEA (feature set enrichment analysis) grouping logic, and
-- FSEA and related feature-set summaries.
-
-They are intentionally kept separate from analysis runners to reduce coupling and avoid circular imports.
-
-NOTE
-----
-This module contains *definitions only* (no heavy imports, no computation).
-"""
+"""Curated feature groups and grouping rules for FeatureImp enrichment analysis."""
 
 from __future__ import annotations
 
-# -----------------------------------------------------------------------------
 # Manually curated groups (small, hand-maintained)
-# -----------------------------------------------------------------------------
 
 fsea_feature_groups = {
     'StdMeasurements_All': [
@@ -49,14 +36,12 @@ fsea_feature_groups = {
 }
 
 
-# -----------------------------------------------------------------------------
 # Kinematic grouping logic helpers
-# -----------------------------------------------------------------------------
 
 KINEMATIC_MEASUREMENT_GROUPS = {
     'Velocity': ['speed', 'velocity_fwd', 'velocity_str', 'angular_vel', 'curvature'],
-    'Acceleration': ['accel_mag', 'accel_fwd', 'accel_str', 'angular_accel'],
-    'Jerk': ['jerk_mag', 'jerk_fwd', 'jerk_str', 'angular_jerk'],
+    'Acceleration': ['accel_mag', 'accel_speed', 'accel_fwd', 'accel_str', 'angular_accel'],
+    'Jerk': ['jerk_mag', 'jerk_speed', 'jerk_fwd', 'jerk_str', 'angular_jerk'],
     'FrontLeg': [
         'frontleg_velocity',
         'frontleg_acceleration',
@@ -152,9 +137,11 @@ KINEMATIC_CROSS_POSE_GROUPS = {
         'velocity_fwd',
         'velocity_str',
         'accel_mag',
+        'accel_speed',
         'accel_fwd',
         'accel_str',
         'jerk_mag',
+        'jerk_speed',
         'jerk_fwd',
         'jerk_str',
     ],

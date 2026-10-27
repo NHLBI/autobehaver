@@ -32,7 +32,7 @@ def test_normalize_tree_model_dict_mutates_base_score() -> None:
     assert out["learner"]["learner_model_param"]["base_score"] == 0.5
 
 
-def test_make_tree_explainer_smoke() -> None:
+def test_make_tree_explainer_integration() -> None:
     import shap.explainers._tree as tree_mod
     import xgboost as xgb
     from sklearn.datasets import make_classification

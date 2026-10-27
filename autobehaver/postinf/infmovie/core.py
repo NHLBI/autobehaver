@@ -1,4 +1,4 @@
-"""Core runner for inference overlay movie generation (infmovie)."""
+"""Run InfMovie overlays for inference CSVs in a source folder."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ class InfMovieConfig:
 
     num_workers: int = 16
     skip_first_n_frames: int = 5
+    source_frame_offset: int | None = None
 
     # Optional timeline "barcode" visualization appended to the bottom of the output movie.
     # - none: do not draw
@@ -83,6 +84,7 @@ def run_infmovie(cfg: InfMovieConfig) -> None:
         output_dir=output_dir,
         num_workers=int(cfg.num_workers),
         skip_first_n_frames=int(cfg.skip_first_n_frames),
+        source_frame_offset=cfg.source_frame_offset,
         timeline=str(cfg.timeline),
         timeline_compare=bool(cfg.timeline_compare),
         timeline_labels=str(cfg.timeline_labels),

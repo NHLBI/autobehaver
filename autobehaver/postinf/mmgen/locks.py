@@ -1,126 +1,133 @@
-"""Lightweight directory-lock utilities for mmgen.
-
-Why this exists
---------------
-mmgen is often run on HPC where users may launch many jobs at once.
-
-For deterministic sharding, *each shard writes to its own output directory*,
-so shards do not race each other. The two main remaining race conditions are:
-
-1) Accidentally launching two jobs with the same ``(num_shards, shard_index)``.
-   Those jobs would write to the *same* shard folder and corrupt the shard
-   ``temp_store.h5`` / double-count commits.
-
-2) Running the merge step while shard jobs are still running.
-
-To mitigate this, we use simple **directory locks** (no fcntl required).
-Directory creation is atomic across platforms / network filesystems in the
-common case.
-
-Locking philosophy
-------------------
-* **Shard lock**: acquired at shard start, released only on successful shard
-  completion. If a shard crashes, the lock directory remains as a strong signal
-  that outputs may be incomplete.
-
-* **Merge lock**: acquired for the full duration of the merge+finalize step.
-  It is released on completion (even if the merge fails) so the user can rerun.
-
-Users can always delete stale lock directories manually if needed.
-"""
+"""Coordinate MMGen writers with crash-releasing ownership and legacy migration."""
 
 from __future__ import annotations
 
 import json
 import os
 import socket
-import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from threading import get_ident
 from pathlib import Path
-from typing import Any, Dict, Optional
+import subprocess
+
+from autobehaver.file_locks import FileLock, file_lock_active
 
 
-@dataclass
-class DirLock:
-    """A minimal directory lock.
+def _legacy_owner_active(path):
+    """Verify an old directory-lock owner; unknown ownership remains protected."""
+    try:
+        info = json.loads((path / 'lock_info.json').read_text())
+    except (OSError, ValueError):
+        return True
+    job = str(info.get('slurm_job_id') or '')
+    if job.isdigit():
+        try:
+            result = subprocess.run(['sacct', '-j', job, '--noheader', '--parsable2',
+                                     '--allocations', '--format=State'],
+                                    capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
+                    'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL', 'DEADLINE', 'REVOKED'}
+        states = [line.split('|')[0].split()[0].rstrip('+') for line in result.stdout.splitlines() if line.strip()]
+        return result.returncode != 0 or not states or any(state not in terminal for state in states)
+    if info.get('host') != socket.gethostname() or not isinstance(info.get('pid'), int):
+        return True
+    pid = info['pid']
+    if pid <= 0:
+        return True
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() != 87
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
-    Parameters
-    ----------
-    lock_dir:
-        Directory path used as the lock.
-    timeout_sec:
-        How long to wait for the lock. In mmgen we generally use 0 to fail fast.
-    poll_interval_sec:
-        Poll interval while waiting.
-    stale_sec:
-        If set, a lock older than this will be treated as stale and removed.
-        (Default: None => never auto-remove).
+
+class ShardLock(FileLock):
+    """Crash-releasing shard lock with verified migration of old lock directories."""
+    def __init__(self, lock_dir, *, timeout_sec=0.0):
+        super().__init__(lock_dir, timeout_sec=timeout_sec)
+        self.lock_dir = Path(lock_dir)
+
+    def acquire(self, *, metadata=None):
+        # Serialize conversion separately; never unlink an OS lock file, since
+        # existing waiters must continue locking the same file identity.
+        with FileLock(self.path.with_name(self.path.name + '.gate'), timeout_sec=1):
+            if self.path.is_dir():
+                if self.path.is_symlink() or _legacy_owner_active(self.path):
+                    raise RuntimeError(f'Older MMGen lock has a live or unverified owner: {self.path}')
+                entries = list(self.path.iterdir())
+                if any(entry.name != 'lock_info.json' or not entry.is_file() or entry.is_symlink() for entry in entries):
+                    raise RuntimeError(f'Older lock contains unexpected files: {self.path}')
+                resolved = self.path.resolve()
+                if resolved.parent != self.path.parent.resolve():
+                    raise RuntimeError(f'Unexpected legacy lock path: {self.path}')
+                for entry in entries:
+                    entry.unlink()
+                self.path.rmdir()
+            super().acquire(metadata=metadata)
+
+
+def shard_lock_active(path):
+    path = Path(path)
+    return _legacy_owner_active(path) if path.is_dir() else file_lock_active(path)
+
+
+class DirLock(ShardLock):
+    """Compatibility name for native locks that previously used directories.
+
+    Native ownership releases on process death. A legacy directory is migrated
+    only after its owner is verified dead; age alone never authorizes removal.
     """
 
-    lock_dir: Path
-    timeout_sec: float = 0.0
-    poll_interval_sec: float = 0.25
-    stale_sec: Optional[float] = None
 
-    def acquire(self, *, metadata: Optional[Dict[str, Any]] = None) -> None:
-        lock_dir = Path(self.lock_dir)
-        start = time.time()
-
-        while True:
-            try:
-                lock_dir.mkdir(parents=False, exist_ok=False)
-
-                # Best-effort metadata for debugging (PID, host, time, etc.).
-                try:
-                    info = dict(metadata or {})
-                    info.setdefault("pid", os.getpid())
-                    info.setdefault("host", socket.gethostname())
-                    info.setdefault("created_at_unix", time.time())
-                    (lock_dir / "lock_info.json").write_text(json.dumps(info, indent=2, sort_keys=True))
-                except Exception:
-                    pass
-
-                return
-
-            except FileExistsError:
-                # Optional stale cleanup.
-                if self.stale_sec is not None:
-                    try:
-                        age = time.time() - lock_dir.stat().st_mtime
-                        if age > float(self.stale_sec):
-                            _best_effort_remove_dir(lock_dir)
-                            continue
-                    except Exception:
-                        pass
-
-                if float(self.timeout_sec) <= 0:
-                    raise RuntimeError(f"Lock already exists: {lock_dir}")
-
-                if (time.time() - start) > float(self.timeout_sec):
-                    raise TimeoutError(f"Timed out waiting for lock: {lock_dir}")
-
-                time.sleep(float(self.poll_interval_sec))
-
-    def release(self) -> None:
-        _best_effort_remove_dir(Path(self.lock_dir))
+CANONICAL_LOCK = '_mmgen_work/_mmgen_canonical.lock'
+_canonical_owners = ContextVar('mmgen_canonical_owners', default=frozenset())
 
 
-def _best_effort_remove_dir(path: Path) -> None:
-    """Best-effort recursive directory removal (very small / shallow)."""
+def _owner_key(root):
+    # Include process and thread identity: inherited contexts cannot grant a
+    # forked process or another thread permission to bypass the operating lock.
+    return (os.getpid(), get_ident(), os.path.normcase(str(Path(root).resolve())))
 
+
+def canonical_lock_held(root):
+    return _owner_key(root) in _canonical_owners.get()
+
+
+@contextmanager
+def canonical_writer(root):
+    """Own all canonical reads/publications; nested calls share this ownership."""
+    key = _owner_key(root)
+    if key in _canonical_owners.get():
+        yield
+        return
+    path = Path(root) / CANONICAL_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = ShardLock(path)
+    lock.acquire(metadata={'kind': 'mmgen_canonical', 'slurm_job_id': os.environ.get('SLURM_JOB_ID')})
+    token = _canonical_owners.set(_canonical_owners.get() | {key})
     try:
-        if not path.exists():
-            return
-        for p in path.glob("*"):
-            try:
-                if p.is_file() or p.is_symlink():
-                    p.unlink()
-            except Exception:
-                pass
-        try:
-            path.rmdir()
-        except Exception:
-            # If another process is racing, ignore.
-            pass
-    except Exception:
-        pass
+        yield
+    finally:
+        _canonical_owners.reset(token)
+        lock.release()

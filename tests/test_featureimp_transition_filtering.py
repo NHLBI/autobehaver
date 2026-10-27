@@ -86,7 +86,50 @@ def test_transition_filtering_drops_sparse_transition_probabilities_and_keeps_re
     transition_meta = params["transition_filtering"]
     assert transition_meta["dropped_transition_feature_count"] == 2
     assert set(transition_meta["dropped_transition_features"]) == set(dropped_expected)
-    assert params["normalization_method"] == "clr_then_zscore_v2_transition_filtering"
+    assert params["normalization_method"] == "clr_then_zscore_v4_canonical_rounding"
+
+
+def test_normalization_does_not_amplify_roundoff_for_constant_clr_components(tmp_path: Path):
+    rows = []
+    for i in range(12):
+        group = "CONTROL" if i < 6 else "MUTANT"
+        # Every control has the same composition. Tiny representational noise
+        # after CLR must not become an order-one Z-score.
+        scale = float(i + 1)
+        rows.append(
+            {
+                "individual": f"fly{i:02d}",
+                "group": group,
+                "sex": "F" if i % 2 == 0 else "M",
+                "TimeBudget_Pose_Walk": 0.25 if group == "CONTROL" else 0.20 * scale,
+                "TimeBudget_Pose_Stop": 0.75 if group == "CONTROL" else 0.80 * scale,
+                "StdMeasure_signal": scale,
+            }
+        )
+
+    matrix_path = tmp_path / "MASTER_FEATURE_MATRIX.csv"
+    pd.DataFrame(rows).to_csv(matrix_path, index=False)
+    normalized_path = normalize_feature_matrix(
+        results_dir=str(tmp_path),
+        raw_matrix_path=str(matrix_path),
+        analysis_folder_path=str(tmp_path),
+        control_group_tag="CONTROL",
+        training_group_a="CONTROL",
+        training_group_b="MUTANT",
+    )
+
+    normalized = pd.read_csv(normalized_path)
+    params = json.loads((tmp_path / "NORMALIZATION_PARAMS.json").read_text())
+    control = normalized[normalized["group"] == "CONTROL"]
+
+    assert np.max(np.abs(control["TimeBudget_Pose_Walk"].to_numpy())) < 1e-12
+    assert np.max(np.abs(control["TimeBudget_Pose_Stop"].to_numpy())) < 1e-12
+    assert params["zscore_std_floor"] == 1e-12
+    assert params["zscore_round_decimals"] == 12
+    assert set(params["zscore_std_floor_features"]) >= {
+        "TimeBudget_Pose_Walk",
+        "TimeBudget_Pose_Stop",
+    }
 
 
 def test_core_normalize_feature_matrix_passes_training_groups_into_transition_filtering(tmp_path: Path):

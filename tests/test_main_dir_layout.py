@@ -22,7 +22,7 @@ def test_stage_paths_for_main_dir(tmp_path: Path) -> None:
     }
 
     assert got["moviechecker"]["input_dir"].endswith("1_full_movies")
-    assert got["moviechecker"]["exclusions_csv"].endswith("1_full_movies/exclusions.csv")
+    assert Path(got["moviechecker"]["exclusions_csv"]) == (root / "1_full_movies" / "exclusions.csv").resolve()
     assert got["autocropper"]["output_dir"].endswith("2_cropped_movies")
     assert got["dlc"]["output_dir"].endswith("3_dlc")
     assert got["keypre"]["output_dir"].endswith("4_keypoint_features")
@@ -37,7 +37,7 @@ def test_moviechecker_cli_main_dir(monkeypatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
     class _FakeApp:
-        def __init__(self, *, input_dir, exclusions_csv_path, review_all, playback_stride):
+        def __init__(self, *, input_dir, exclusions_csv_path, review_all, playback_stride, recording_index):
             captured["input_dir"] = input_dir
             captured["exclusions_csv_path"] = exclusions_csv_path
             captured["review_all"] = review_all
@@ -171,10 +171,10 @@ def test_infmovie_cli_main_dir(monkeypatch, tmp_path: Path) -> None:
         captured["cfg"] = cfg
 
     from autobehaver.postinf.infmovie import cli as im_cli
-    from autobehaver.postinf.infmovie import core as im_core
+    from autobehaver.postinf.infmovie import pipeline as im_pipeline
 
-    monkeypatch.setattr(im_core, "run_infmovie", _fake_run)
-    im_cli.main(["--main_dir", str(tmp_path)])
+    monkeypatch.setattr(im_pipeline, "run_infmovie_pipeline", _fake_run)
+    im_cli.main(["--main_dir", str(tmp_path), "--recording_id", "demo"])
 
     cfg = captured["cfg"]
     assert cfg.inference_csv_dir == str((tmp_path / "6_posepred_inference").resolve())
@@ -196,6 +196,6 @@ def test_featureimp_matrix_results_dirs_and_main_dir(tmp_path: Path) -> None:
         matrix_dir=DEFAULT_SETTINGS["matrix_dir"],
         results_dir=DEFAULT_SETTINGS["results_dir"],
     )
-    _apply_featureimp_main_dir(args2, argv_list=["--main_dir", str(tmp_path)], config_defaults={})
+    _apply_featureimp_main_dir(args2, argv_list=["--main_dir", str(tmp_path)])
     assert args2.matrix_dir == str((tmp_path / "8_master_matrix").resolve())
     assert args2.results_dir == str((tmp_path / "9_feature_importance").resolve())

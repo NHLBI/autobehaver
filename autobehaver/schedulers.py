@@ -1,8 +1,4 @@
-"""Learning-rate scheduler utilities for pose prediction training.
-
-These wrappers are intentionally lightweight and provide the hooks PyTorch's
-``SequentialLR`` uses when switching schedulers after warmup.
-"""
+"""Schedule PosePred learning rates with batch steps and warmup transitions."""
 
 from __future__ import annotations
 
@@ -15,7 +11,37 @@ __all__ = [
     "InverseSquareRootDecayScheduler",
     "CosineAnnealingScheduler",
     "LinearAnnealingScheduler",
+    "EpochCosineScheduler",
 ]
+
+
+class EpochCosineScheduler(torch.optim.lr_scheduler.LRScheduler):
+    """Apply loader-sized warmup followed by cosine decay without restarts.
+
+    Step after each optimizer batch. Convert configured epoch counts using
+    the actual training loader, including files reassigned by ``--noval``.
+    """
+
+    def __init__(self, optimizer, batches_per_epoch, warmup_epochs, decay_epochs,
+                 eta_min=0.0, last_epoch=-1):
+        if batches_per_epoch < 1 or warmup_epochs < 0 or decay_epochs < 1:
+            raise ValueError("Epoch cosine requires a nonempty loader, nonnegative warmup and positive decay.")
+        self.warmup_steps = int(batches_per_epoch) * int(warmup_epochs)
+        self.decay_steps = int(batches_per_epoch) * int(decay_epochs)
+        self.eta_min = float(eta_min)
+        if any(self.eta_min > group['lr'] for group in optimizer.param_groups):
+            raise ValueError("eta_min must not exceed the base learning rate.")
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def get_lr(self):
+        import math
+        step = max(0, self.last_epoch)
+        if self.warmup_steps and step < self.warmup_steps:
+            factor = 1e-5 + (1.0 - 1e-5) * step / self.warmup_steps
+            return [base * factor for base in self.base_lrs]
+        fraction = min(1.0, max(0.0, (step - self.warmup_steps) / self.decay_steps))
+        return [self.eta_min + (base - self.eta_min) * (1 + math.cos(math.pi * fraction)) / 2
+                for base in self.base_lrs]
 
 
 class _SequentialLRMixin:
@@ -123,11 +149,10 @@ class CosineAnnealingScheduler(_SequentialLRMixin):
 
 
 class LinearAnnealingScheduler:
-    """Linear warm-restart scheduler that mirrors cosine-restart structure.
+    """Decay linearly from base_lr to eta_min and restart after t_0_batches.
 
-    The LR decays linearly from ``base_lr`` to ``eta_min`` over ``t_0_batches``
-    steps, then restarts with period multiplier ``t_mult``. The cycle base stays
-    fixed across restarts and exposes the hooks ``SequentialLR`` expects.
+    Multiply each cycle length by t_mult while retaining the cycle base LR.
+    Expose the transition hooks expected by SequentialLR.
     """
 
     def __init__(self, optimizer: Optimizer, t_0_batches: int, t_mult: float = 1.0, eta_min: float = 0.0):

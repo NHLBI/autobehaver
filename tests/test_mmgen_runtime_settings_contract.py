@@ -75,7 +75,8 @@ def test_run_mmgen_merge_shards_forwards_runtime_settings_without_stale_output_k
         captured["args"] = args
         captured["kwargs"] = kwargs
 
-    def _fake_merge(*, output_folder: str, num_shards: int, strict_missing: bool) -> None:
+    def _fake_merge(*, output_folder: str, num_shards: int, strict_missing: bool,
+                    verified_store_identities=None) -> None:
         captured["merge"] = {
             "output_folder": output_folder,
             "num_shards": num_shards,

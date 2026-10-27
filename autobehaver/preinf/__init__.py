@@ -1,4 +1,1 @@
-"""Pre-inference pipeline stages.
-
-These modules operate upstream of pose/orientation prediction.
-"""
+"""Provide video preprocessing and pose/orientation inference stages."""

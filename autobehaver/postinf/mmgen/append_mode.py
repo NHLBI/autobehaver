@@ -1,30 +1,9 @@
-"""Incremental append/update workflow for mmgen.
+"""Append new MMGen sources by recomputing affected animal rows from a frozen batch
+plan.
 
-This module implements both single-job and sharded append workflows.
-
-Design
-------
-- The canonical long-term artifacts are the master matrix plus the lightweight
-  source ledger / row-identity summary / batch manifest.
-- Append mode scans the current inference+poscalc folders, compares them to the
-  existing ledger, and identifies *affected row identities*.
-- A frozen append batch plan is written to ``_mmgen_append_batches/append_*``.
-- The delta processing can then run either:
-    * directly in one job, or
-    * across multiple shard jobs using ``shard_by=row_identity``.
-- After delta processing, the canonical master matrix is updated by replacing
-  affected existing rows and appending genuinely new rows.
-
-Important safety properties
----------------------------
-- Changed previously processed files are treated as errors.
-- If an affected row identity has historical ledger files that are no longer
-  present in the input folders, append mode fails loudly because it cannot
-  faithfully recompute that row.
-- Canonical root-level numbered/full outputs are *not* updated in place. If the
-  append batch requests ``emit_full_outputs=True``, those outputs are written
-  into the append-batch subfolder only.
-- Sharded append uses a frozen append plan and a strict merge/finalize step.
+Publish the matrix, ledger, and generation receipt together, preserving prior numbered
+reports. Changed historical inputs or missing sources needed for recomputation are
+rejected.
 """
 
 from __future__ import annotations
@@ -52,15 +31,42 @@ from .ledger import (
 )
 from .mapping import create_animal_mapping
 from .naming import collapse_individual_id, parse_group_and_individual
+from .io import find_matching_poscalc_file, read_metadata_csv
+from autobehaver.batch_inputs import select_batch_inputs
+from autobehaver.portable_paths import original_name
+from .feature_schema import complete_master_schema, write_schema_metadata, schema_metadata
 from .shard_merge import merge_shard_temp_stores
-from .locks import DirLock
+from .hdf_store import cleanup_verified_temp_stores
+from .locks import DirLock, canonical_writer
 from . import pipeline
+from autobehaver.atomic_io import atomic_write_json, sha256_file
+from .integrity import calculation_identity, content_hash, source_identities
 
 APPEND_BATCHES_DIRNAME = "_mmgen_append_batches"
 APPEND_LATEST_REPORT_FILENAME = "MMGEN_APPEND_LATEST.json"
 APPEND_PLAN_FILENAME = "APPEND_PLAN.json"
 APPEND_SELECTED_FILES_FILENAME = "APPEND_SELECTED_FILES.csv"
 APPEND_AFFECTED_ROWS_FILENAME = "APPEND_AFFECTED_ROWS.csv"
+from .publication import (OUTPUT_RECEIPT_FILENAME, IDENTITY_RELATIVE_PATH, PUBLICATION_JOURNAL,
+    CORE_ARTIFACTS, _publication_copy, _recover_publication, _verified_generation, _publish_generation)
+
+
+def _cfg_calculation(cfg):
+    return calculation_identity(cfg.runtime_settings,min_bout=cfg.min_bout,
+                                edge_skip=cfg.edge_skip,inf_tag=cfg.inf_tag)
+
+
+def _verify_existing_source_continuity(cfg, generation, inventory):
+    """Check all available prior inputs, including metadata-derived alignment."""
+    previous = generation['identity']['sources']
+    available = set(inventory['source_file'].astype(str)) if not inventory.empty else set()
+    selected = sorted(set(previous).intersection(available))
+    current = source_identities(selected, inference_csv_dir=cfg.inference_csv_dir,
+        poscalc_dir=cfg.poscalc_dir, inf_tag=cfg.inf_tag,
+        source_frame_offset=cfg.runtime_settings.source_frame_offset)
+    changed = [name for name in selected if previous[name] != current[name]]
+    if changed:
+        raise RuntimeError('Previously processed source content or original-frame metadata changed; fresh processing required: ' + ', '.join(changed[:10]))
 
 
 def _utc_now_compact() -> str:
@@ -78,16 +84,16 @@ def _schema_sha256(columns: list[str]) -> str:
 
 def _safe_file_stats(path: str | None) -> dict[str, Any]:
     if not path:
-        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA}
+        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA, 'sha256':pd.NA}
     p = Path(path)
     if not p.exists():
-        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA}
+        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA, 'sha256':pd.NA}
     try:
         stat = p.stat()
         mtime_utc = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
-        return {"exists": True, "size_bytes": int(stat.st_size), "mtime_utc": mtime_utc}
-    except Exception:
-        return {"exists": True, "size_bytes": pd.NA, "mtime_utc": pd.NA}
+        return {"exists": True, "size_bytes": int(stat.st_size), "mtime_utc": mtime_utc, 'sha256':sha256_file(p)}
+    except Exception as exc:
+        raise RuntimeError(f'Cannot verify source contents: {p}') from exc
 
 
 def _derive_poscalc_filename(source_file: str, inf_tag: str) -> str:
@@ -98,13 +104,20 @@ def _derive_poscalc_filename(source_file: str, inf_tag: str) -> str:
 
 
 def _build_current_inventory(*, inference_csv_dir: str, poscalc_dir: str, inf_tag: str) -> pd.DataFrame:
+    """Index inference/positional pairs with their animal identities and current content
+    hashes.
+    """
     rows: list[dict[str, Any]] = []
     for source_file in list_inference_csv_files(inference_csv_dir):
         source_path = os.path.join(inference_csv_dir, source_file)
-        poscalc_file = _derive_poscalc_filename(source_file, inf_tag)
-        poscalc_path = os.path.join(poscalc_dir, poscalc_file)
+        poscalc_path = find_matching_poscalc_file(source_path, poscalc_dir, inf_tag)
+        # New unrelated inputs may arrive before their positional partner. Keep
+        # them visible to selection; selected/affected and prior sources are
+        # checked before a plan is frozen or consumed.
+        poscalc_file = (os.path.basename(poscalc_path) if poscalc_path else
+                        _derive_poscalc_filename(original_name(source_path), inf_tag))
 
-        group, individual_id, sex = parse_group_and_individual(source_file)
+        group, individual_id, sex = parse_group_and_individual(source_path)
         row_identity = collapse_individual_id(individual_id)
 
         source_stats = _safe_file_stats(source_path)
@@ -117,11 +130,13 @@ def _build_current_inventory(*, inference_csv_dir: str, poscalc_dir: str, inf_ta
                 "source_exists": bool(source_stats["exists"]),
                 "source_file_size_bytes": source_stats["size_bytes"],
                 "source_file_mtime_utc": source_stats["mtime_utc"],
+                "source_file_sha256": source_stats['sha256'],
                 "poscalc_file": poscalc_file,
                 "poscalc_path": poscalc_path,
                 "poscalc_exists": bool(poscalc_stats["exists"]),
                 "poscalc_file_size_bytes": poscalc_stats["size_bytes"],
                 "poscalc_file_mtime_utc": poscalc_stats["mtime_utc"],
+                "poscalc_file_sha256": poscalc_stats['sha256'],
                 "group": group,
                 "sex": sex,
                 "individual_id": individual_id,
@@ -156,16 +171,14 @@ def _filter_inventory_by_substring(inv_df: pd.DataFrame, needle: str | None) -> 
     if inv_df.empty or needle is None or str(needle).strip() == "":
         return inv_df.copy()
     q = str(needle).strip().lower()
-    return inv_df[inv_df["source_file"].astype(str).str.lower().str.contains(q, na=False)].copy().reset_index(drop=True)
+    return inv_df[inv_df["source_path"].map(original_name).str.lower().str.contains(q, na=False, regex=False)].copy().reset_index(drop=True)
 
 
 COMPARE_COLUMNS = [
     "row_identity",
     "poscalc_file",
-    "source_file_size_bytes",
-    "source_file_mtime_utc",
-    "poscalc_file_size_bytes",
-    "poscalc_file_mtime_utc",
+    "source_file_sha256",
+    "poscalc_file_sha256",
 ]
 _NUMERIC_COMPARE_COLUMNS = {"source_file_size_bytes", "poscalc_file_size_bytes"}
 
@@ -184,7 +197,10 @@ def _classify_current_vs_ledger(*, current_inventory_df: pd.DataFrame, existing_
         empty = pd.DataFrame(columns=current.columns)
         return current.copy(), empty.copy(), empty.copy(), pd.DataFrame(columns=ledger.columns)
 
-    ledger = ledger.drop_duplicates(subset=["source_file"], keep="last").copy()
+    if ledger['source_file'].astype(str).duplicated().any():
+        raise RuntimeError('Duplicate ledger sources cannot be certified.')
+    if not {'source_file_sha256','poscalc_file_sha256'}.issubset(ledger):
+        raise RuntimeError('Legacy ledger has no content hashes; fresh processing is required.')
     merged = current.merge(
         ledger[["source_file"] + [c for c in COMPARE_COLUMNS if c in ledger.columns]],
         on="source_file",
@@ -254,39 +270,14 @@ def _write_append_report(output_folder: str, report: dict[str, Any], *, latest: 
     return path
 
 
-def _cleanup_append_batch_temp_artifacts(batch_dir: Path) -> None:
-    """Remove large batch temp stores after a successful append finalize.
-
-    We intentionally keep the lightweight plan/report/manifests in place.
-    This cleanup targets only large transient HDF5 artifacts that can otherwise
-    accumulate across append batches, especially in sharded workflows.
-    """
-
-    candidates: list[Path] = [
-        batch_dir / "temp_store.h5",
-        batch_dir / "temp_store.h5.tmp",
-    ]
-
-    shards_root = batch_dir / "_mmgen_shards"
-    if shards_root.exists():
-        for shard_dir in sorted(shards_root.glob("shard_*_of_*")):
-            candidates.extend(
-                [
-                    shard_dir / "temp_store.h5",
-                    shard_dir / "temp_store.h5.tmp",
-                ]
-            )
-
-    for p in candidates:
-        try:
-            if p.exists() and p.is_file():
-                p.unlink()
-        except Exception:
-            # Best-effort cleanup only; append itself has already succeeded.
-            pass
+def _cleanup_append_batch_temp_artifacts(batch_dir: Path, identities: list[tuple[str, str]]) -> None:
+    """Remove verified large stores after canonical append publication succeeds."""
+    cleanup_verified_temp_stores(str(batch_dir), identities)
 
 
-def _load_required_canonical_state(output_folder: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _load_required_canonical_state_owned(output_folder: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Require a verified canonical matrix and ledger with unique animal rows."""
+    _verified_generation(output_folder)
     matrix_path = os.path.join(output_folder, "MASTER_FEATURE_MATRIX.csv")
     ledger_path = os.path.join(output_folder, SOURCE_LEDGER_FILENAME)
     if not os.path.exists(matrix_path):
@@ -297,8 +288,8 @@ def _load_required_canonical_state(output_folder: str) -> tuple[pd.DataFrame, pd
         raise FileNotFoundError(
             "append_new_data requires an existing MMGEN_SOURCE_LEDGER.csv in the output folder"
         )
-    matrix_df = pd.read_csv(matrix_path)
-    ledger_df = pd.read_csv(ledger_path)
+    matrix_df = read_metadata_csv(matrix_path)
+    ledger_df = read_metadata_csv(ledger_path)
     if "individual" not in matrix_df.columns:
         raise ValueError("Existing MASTER_FEATURE_MATRIX.csv is missing required 'individual' column")
     if "row_identity" not in ledger_df.columns or "source_file" not in ledger_df.columns:
@@ -319,6 +310,7 @@ def _append_batch_dir(root_out: str, append_batch_id: str) -> Path:
 
 
 def _build_affected_rows_df(*, affected_all_files_df: pd.DataFrame, existing_matrix_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize the recordings needed for each affected animal and mark existing rows."""
     if affected_all_files_df.empty:
         return pd.DataFrame(columns=["row_identity", "already_in_canonical", "n_selected_files", "selected_files"])
 
@@ -336,12 +328,15 @@ def _build_affected_rows_df(*, affected_all_files_df: pd.DataFrame, existing_mat
 
 
 def _write_append_plan_files(*, batch_dir: Path, plan: dict[str, Any], selected_files_df: pd.DataFrame, affected_rows_df: pd.DataFrame) -> None:
-    _atomic_write_text(batch_dir / APPEND_PLAN_FILENAME, json.dumps(plan, indent=2, sort_keys=True))
     _atomic_write_df_csv(batch_dir / APPEND_SELECTED_FILES_FILENAME, selected_files_df)
     _atomic_write_df_csv(batch_dir / APPEND_AFFECTED_ROWS_FILENAME, affected_rows_df)
+    plan['plan_artifacts']={name:sha256_file(batch_dir/name) for name in (APPEND_SELECTED_FILES_FILENAME,APPEND_AFFECTED_ROWS_FILENAME)}
+    plan['plan_sha256']=content_hash({k:v for k,v in plan.items() if k!='plan_sha256'})
+    _atomic_write_text(batch_dir / APPEND_PLAN_FILENAME, json.dumps(plan, indent=2, sort_keys=True))
 
 
 def _load_append_plan(root_out: str, append_batch_id: str) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, Path]:
+    """Load an append plan and verify the identities of its selected-source artifacts."""
     batch_dir = _append_batch_dir(root_out, append_batch_id)
     plan_path = batch_dir / APPEND_PLAN_FILENAME
     selected_path = batch_dir / APPEND_SELECTED_FILES_FILENAME
@@ -351,26 +346,47 @@ def _load_append_plan(root_out: str, append_batch_id: str) -> tuple[dict[str, An
     if not selected_path.exists():
         raise FileNotFoundError(f"Append batch selected-files table not found: {selected_path}")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    selected_df = pd.read_csv(selected_path)
-    affected_df = pd.read_csv(affected_path) if affected_path.exists() else pd.DataFrame()
+    if plan.get('plan_sha256') != content_hash({k:v for k,v in plan.items() if k!='plan_sha256'}):
+        raise RuntimeError('Append plan content identity is missing or changed.')
+    if set(plan.get('plan_artifacts',{})) != {APPEND_SELECTED_FILES_FILENAME,APPEND_AFFECTED_ROWS_FILENAME}:
+        raise RuntimeError('Append plan must certify both frozen selection and affected-row tables.')
+    for name,digest in plan.get('plan_artifacts',{}).items():
+        if name not in (APPEND_SELECTED_FILES_FILENAME,APPEND_AFFECTED_ROWS_FILENAME) or sha256_file(batch_dir/name)!=digest:
+            raise RuntimeError('Frozen append-plan table changed.')
+    selected_df = read_metadata_csv(selected_path)
+    affected_df = read_metadata_csv(affected_path) if affected_path.exists() else pd.DataFrame()
     return plan, selected_df, affected_df, batch_dir
 
 
-def _create_append_plan(cfg) -> tuple[dict[str, Any] | None, pd.DataFrame | None, pd.DataFrame | None, Path | None]:
+def _create_append_plan_owned(cfg) -> tuple[dict[str, Any] | None, pd.DataFrame | None, pd.DataFrame | None, Path | None]:
+    """Freeze new sources and all recordings needed to recompute affected animals."""
     root_out = str(cfg.output_dir)
     os.makedirs(root_out, exist_ok=True)
 
     existing_matrix_df, existing_ledger_df = _load_required_canonical_state(root_out)
+    generation = _verified_generation(root_out)
+    current_calculation = _cfg_calculation(cfg)
+    if content_hash(current_calculation) != generation['identity']['calculation_sha256']:
+        raise RuntimeError('Append calculation/settings/code differ from canonical data; reprocess the whole cohort into fresh outputs.')
 
     current_inventory_df = _build_current_inventory(
         inference_csv_dir=str(cfg.inference_csv_dir),
         poscalc_dir=str(cfg.poscalc_dir),
         inf_tag=str(cfg.inf_tag),
     )
-    selected_inventory_df = _filter_inventory_by_substring(current_inventory_df, cfg.file_filter)
+    selected_inventory_df = current_inventory_df
+    if cfg.file_list:
+        selected_paths = set(select_batch_inputs(current_inventory_df['source_path'].tolist(), cfg.file_list))
+        selected_inventory_df = current_inventory_df[current_inventory_df['source_path'].isin(selected_paths)].copy()
+    selected_inventory_df = _filter_inventory_by_substring(selected_inventory_df, cfg.file_filter)
+    _verify_existing_source_continuity(cfg, generation, current_inventory_df)
+    _, changed_any_existing, _, _ = _classify_current_vs_ledger(
+        current_inventory_df=current_inventory_df,existing_ledger_df=existing_ledger_df)
+    if not changed_any_existing.empty:
+        raise RuntimeError('Previously processed source content changed, including outside the selected append filter; fresh processing required.')
 
     if selected_inventory_df.empty:
-        print("[mmgen-append] No inference files matched the current folder + file_filter selection. Nothing to do.")
+        print("[mmgen-append] No inference files matched the file_list/file_filter selection. Nothing to do.")
         return None, None, None, None
 
     new_df, changed_df, unchanged_df, missing_ledger_df = _classify_current_vs_ledger(
@@ -453,6 +469,8 @@ def _create_append_plan(cfg) -> tuple[dict[str, Any] | None, pd.DataFrame | None
                 "source_path",
                 "poscalc_file",
                 "poscalc_path",
+                "source_file_sha256",
+                "poscalc_file_sha256",
                 "group",
                 "sex",
                 "individual_id",
@@ -488,6 +506,9 @@ def _create_append_plan(cfg) -> tuple[dict[str, Any] | None, pd.DataFrame | None
             "edge_skip": int(cfg.edge_skip),
         },
         "canonical_schema_sha256": _schema_sha256(list(existing_matrix_df.columns)),
+        'canonical_generation':{'receipt_sha256':generation['receipt_sha256'],'identity_sha256':generation['identity_sha256']},
+        'calculation_sha256':content_hash(current_calculation),
+        'selected_sources':source_identities(selected_files_df['source_file'],inference_csv_dir=cfg.inference_csv_dir,poscalc_dir=cfg.poscalc_dir,inf_tag=cfg.inf_tag,source_frame_offset=cfg.runtime_settings.source_frame_offset),
         "expected_row_identities": list(map(str, affected_row_ids)),
         "counts": {
             "selected_inventory_files": int(len(selected_inventory_df)),
@@ -518,15 +539,44 @@ def _create_append_plan(cfg) -> tuple[dict[str, Any] | None, pd.DataFrame | None
     return plan, selected_files_df, affected_rows_df, batch_dir
 
 
-def _validate_plan_against_cfg(plan: dict[str, Any], cfg) -> None:
+def _validate_plan_against_cfg_owned(plan: dict[str, Any], cfg) -> None:
+    """Require append paths, calculation settings, and sources to match the frozen plan."""
+    if plan.get('plan_sha256') != content_hash({k:v for k,v in plan.items() if k!='plan_sha256'}):
+        raise RuntimeError('Append plan content identity missing or changed.')
+    if set(plan.get('plan_artifacts',{})) != {APPEND_SELECTED_FILES_FILENAME,APPEND_AFFECTED_ROWS_FILENAME}:
+        raise RuntimeError('Append plan must certify both frozen tables.')
     plan_inputs = plan.get("input_folders", {}) or {}
     if str(Path(plan_inputs.get("inference_csv_dir", "")).resolve()) != str(Path(str(cfg.inference_csv_dir)).resolve()):
         raise RuntimeError("append_new_data batch plan was created for a different inference_csv_dir than the current command")
     if str(Path(plan_inputs.get("poscalc_dir", "")).resolve()) != str(Path(str(cfg.poscalc_dir)).resolve()):
         raise RuntimeError("append_new_data batch plan was created for a different poscalc_dir than the current command")
+    if str(Path(plan.get('root_output_dir','')).resolve()) != str(Path(cfg.output_dir).resolve()):
+        raise RuntimeError('Append plan targets a different canonical output folder.')
+    if plan.get('calculation_sha256') != content_hash(_cfg_calculation(cfg)):
+        raise RuntimeError('Scientific settings/source code changed after append planning.')
+    generation=_verified_generation(cfg.output_dir)
+    if plan.get('canonical_generation') != {'receipt_sha256':generation['receipt_sha256'],'identity_sha256':generation['identity_sha256']}:
+        raise RuntimeError('Canonical generation changed after append planning; create a fresh plan.')
+    if plan.get('selected_sources') != source_identities(plan.get('selected_sources',{}),
+            inference_csv_dir=cfg.inference_csv_dir,poscalc_dir=cfg.poscalc_dir,inf_tag=cfg.inf_tag,source_frame_offset=cfg.runtime_settings.source_frame_offset):
+        raise RuntimeError('Selected source content changed after append planning.')
+    current=_build_current_inventory(inference_csv_dir=cfg.inference_csv_dir,
+                                     poscalc_dir=cfg.poscalc_dir,inf_tag=cfg.inf_tag)
+    _verify_existing_source_continuity(cfg, generation, current)
+    ledger=read_metadata_csv(Path(cfg.output_dir)/SOURCE_LEDGER_FILENAME)
+    _, changed, _, _ = _classify_current_vs_ledger(current_inventory_df=current,existing_ledger_df=ledger)
+    if not changed.empty:
+        raise RuntimeError('Previously processed input content changed after append planning.')
+    batch_dir=_append_batch_dir(cfg.output_dir,plan['append_batch_id'])
+    for name,digest in plan.get('plan_artifacts',{}).items():
+        if name not in (APPEND_SELECTED_FILES_FILENAME,APPEND_AFFECTED_ROWS_FILENAME) or sha256_file(batch_dir/name)!=digest:
+            raise RuntimeError('Frozen append-plan table changed.')
 
 
-def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_dir: Path) -> None:
+def _apply_delta_batch_to_canonical_owned(*, cfg, plan: dict[str, Any], delta_output_dir: Path) -> None:
+    """Replace affected rows and publish the matrix, ledger, and manifest as one
+    generation.
+    """
     root_out = str(cfg.output_dir)
 
     # Canonical append/update lock: prevents two append merges from racing.
@@ -539,11 +589,12 @@ def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_d
         raise RuntimeError(
             "[mmgen-append] Another append/finalize job may already be updating the canonical output folder.\n"
             f"  lock: {append_lock_dir}\n\n"
-            "If you are sure no append job is running, delete the lock directory and retry. "
+            "Native locks release automatically when their writer exits. "
             f"(Original error: {e})"
         )
 
     try:
+        _validate_plan_against_cfg(plan,cfg)
         existing_matrix_df, existing_ledger_df = _load_required_canonical_state(root_out)
         current_schema_sha = _schema_sha256(list(existing_matrix_df.columns))
         planned_schema_sha = str(plan.get("canonical_schema_sha256") or "")
@@ -559,8 +610,11 @@ def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_d
         if not delta_ledger_path.exists():
             raise FileNotFoundError(f"append_new_data delta batch did not produce {delta_ledger_path}")
 
-        delta_matrix_df = pd.read_csv(delta_matrix_path)
-        delta_ledger_df = pd.read_csv(delta_ledger_path)
+        delta_matrix_df = read_metadata_csv(delta_matrix_path)
+        delta_ledger_df = read_metadata_csv(delta_ledger_path)
+        delta_generation=_verified_generation(delta_output_dir)
+        if delta_generation['identity']['calculation_sha256'] != plan['calculation_sha256'] or delta_generation['identity']['sources'] != plan['selected_sources']:
+            raise RuntimeError('Delta output generation does not match the frozen append source/calculation plan.')
         is_valid_matrix, matrix_error, _ = validate_feature_matrix(str(delta_matrix_path))
         if not is_valid_matrix:
             raise RuntimeError(f"append_new_data delta batch produced an invalid master matrix: {matrix_error}")
@@ -575,23 +629,23 @@ def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_d
         if "row_identity" not in delta_ledger_df.columns:
             raise RuntimeError("append_new_data delta ledger is missing required 'row_identity' column")
         delta_ledger_ids = set(delta_ledger_df["row_identity"].astype(str).tolist()) if not delta_ledger_df.empty else set()
-        if not expected_row_ids.issubset(delta_ledger_ids):
+        if expected_row_ids != delta_ledger_ids:
             raise RuntimeError(
                 "append_new_data delta ledger does not cover all expected affected row identities. "
                 f"Expected subset: {sorted(expected_row_ids)}; Ledger rows: {sorted(delta_ledger_ids)}"
             )
+        if set(delta_ledger_df['source_file'].astype(str)) != set(plan['selected_sources']):
+            raise RuntimeError('Delta ledger must cover exactly the planned source files.')
 
+        # Identity/receipt checks above still enforce the scientific generation.
+        # Valid historical censored masters gain only recognized NaN columns.
+        existing_matrix_df = complete_master_schema(existing_matrix_df)
+        delta_matrix_df = complete_master_schema(delta_matrix_df)
         existing_cols = list(existing_matrix_df.columns)
-        delta_cols = list(delta_matrix_df.columns)
-        if set(existing_cols) != set(delta_cols):
-            missing_in_delta = [c for c in existing_cols if c not in delta_cols]
-            extra_in_delta = [c for c in delta_cols if c not in existing_cols]
-            raise RuntimeError(
-                "append_new_data cannot merge because the delta master-matrix schema differs from the canonical schema. "
-                f"Missing in delta: {missing_in_delta[:10]}" + (" ..." if len(missing_in_delta) > 10 else "")
-                + f"; Extra in delta: {extra_in_delta[:10]}" + (" ..." if len(extra_in_delta) > 10 else "")
-            )
-        delta_matrix_df = delta_matrix_df[existing_cols].copy()
+        optional_cols = [c for c in delta_matrix_df if c not in existing_cols]
+        aligned_cols = existing_cols + optional_cols
+        existing_matrix_df = existing_matrix_df.reindex(columns=aligned_cols)
+        delta_matrix_df = delta_matrix_df.reindex(columns=aligned_cols)
 
         affected_delta_ids = delta_matrix_df["individual"].astype(str).tolist()
         replaced_row_ids = sorted(set(existing_matrix_df["individual"].astype(str)).intersection(affected_delta_ids))
@@ -625,29 +679,33 @@ def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_d
         )
         merged_ledger_df = merged_ledger_df.sort_values(["row_identity", "source_file"], kind="stable").reset_index(drop=True)
 
-        root_matrix_path = os.path.join(root_out, "MASTER_FEATURE_MATRIX.csv")
-        _atomic_write_df_csv(root_matrix_path, merged_matrix_df)
-
-        root_ledger_path = os.path.join(root_out, SOURCE_LEDGER_FILENAME)
-        _atomic_write_df_csv(root_ledger_path, merged_ledger_df)
-
-        _copy_if_missing(delta_output_dir / "MASTER_FEATURE_MATRIX_UNITS.csv", Path(root_out) / "MASTER_FEATURE_MATRIX_UNITS.csv")
-        _copy_if_missing(
-            delta_output_dir / "MASTER_FEATURE_MATRIX_UNITS_README.txt",
-            Path(root_out) / "MASTER_FEATURE_MATRIX_UNITS_README.txt",
-        )
+        # Stage the entire canonical generation; never publish matrix before ledger.
+        stage_dir=Path(root_out)/'_mmgen_work/append_stage'
+        stage_dir.mkdir(parents=True,exist_ok=True)
+        _atomic_write_df_csv(stage_dir/'MASTER_FEATURE_MATRIX.csv',merged_matrix_df)
+        write_schema_metadata(stage_dir)
+        _atomic_write_df_csv(stage_dir/SOURCE_LEDGER_FILENAME,merged_ledger_df)
+        old_generation=_verified_generation(root_out)
+        combined_sources = {**old_generation['identity']['sources'],
+                            **delta_generation['identity']['sources']}
+        if set(combined_sources) != set(merged_ledger_df['source_file'].astype(str)):
+            raise RuntimeError('Combined source identities and canonical ledger disagree.')
+        new_identity=dict(calculation=old_generation['identity']['calculation'],
+                          calculation_sha256=plan['calculation_sha256'],sources=combined_sources,
+                          sources_sha256=content_hash(combined_sources))
+        atomic_write_json(new_identity,stage_dir/IDENTITY_RELATIVE_PATH)
 
         animal_mapping, _file_to_animal = create_animal_mapping(str(cfg.inference_csv_dir), str(cfg.poscalc_dir), root_out)
         row_identity_df = build_row_identity_summary_df(
             source_ledger_df=merged_ledger_df,
             master_matrix_df=merged_matrix_df,
         )
-        write_row_identity_summary_csv(root_out, row_identity_df)
+        write_row_identity_summary_csv(str(stage_dir), row_identity_df)
 
         lengths_like_df = merged_ledger_df[["source_file"]].drop_duplicates().copy() if not merged_ledger_df.empty else pd.DataFrame(columns=["source_file"])
         processing = plan.get("processing", {}) or {}
         write_batch_manifest_json(
-            output_dir=root_out,
+            output_dir=str(stage_dir),
             inference_csv_dir=str(cfg.inference_csv_dir),
             poscalc_dir=str(cfg.poscalc_dir),
             inf_tag=str(processing.get("inf_tag", cfg.inf_tag)),
@@ -668,7 +726,38 @@ def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_d
             master_matrix_df=merged_matrix_df,
             animal_mapping=animal_mapping,
             append_new_data=True,
+            source_frame_offset=int(cfg.runtime_settings.source_frame_offset),
         )
+
+        if not validate_feature_matrix(str(stage_dir/'MASTER_FEATURE_MATRIX.csv'))[0]:
+            raise RuntimeError('Staged canonical matrix failed validation.')
+        from .feature_matrix import write_feature_units_manifest
+        write_feature_units_manifest(merged_matrix_df, str(stage_dir),
+            mm_per_px=(0.0169896744624207 if cfg.mm_per_px is None else float(cfg.mm_per_px)),
+            fps=(40.0 if cfg.video_fps is None else float(cfg.video_fps)))
+        artifacts={}
+        for name in CORE_ARTIFACTS:
+            artifacts[name]=sha256_file(stage_dir/name)
+        artifacts['MASTER_FEATURE_MATRIX_SCHEMA.json'] = sha256_file(stage_dir/'MASTER_FEATURE_MATRIX_SCHEMA.json')
+        artifacts['MASTER_FEATURE_MATRIX_UNITS.csv'] = sha256_file(stage_dir/'MASTER_FEATURE_MATRIX_UNITS.csv')
+        historical = {name: record for name, record in
+                      old_generation['receipt'].get('historical_artifacts', {}).items()
+                      if name not in artifacts}
+        for name, digest in old_generation['receipt']['artifacts'].items():
+            if name not in artifacts:
+                historical[name] = {'sha256': digest,
+                    'calculation_sha256': old_generation['identity']['calculation_sha256'],
+                    'sources_sha256': old_generation['identity']['sources_sha256']}
+        receipt=dict(calculation_sha256=new_identity['calculation_sha256'],
+                     sources_sha256=new_identity['sources_sha256'],artifacts=artifacts,
+                     historical_artifacts=historical,
+                     output_families={'canonical_matrix': 'completed',
+                                      'canonical_full_outputs': 'not_refreshed_by_append'})
+        atomic_write_json(receipt,stage_dir/OUTPUT_RECEIPT_FILENAME)
+        # Re-verify sources and old canonical generation immediately before publication.
+        _validate_plan_against_cfg(plan,cfg)
+        _publish_generation(root_out,stage_dir,
+            (*CORE_ARTIFACTS,'MASTER_FEATURE_MATRIX_SCHEMA.json','MASTER_FEATURE_MATRIX_UNITS.csv',IDENTITY_RELATIVE_PATH,OUTPUT_RECEIPT_FILENAME))
 
         counts = plan.get("counts", {}) or {}
         report = {
@@ -721,45 +810,59 @@ def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_d
 
 
 def _run_single_job_append_from_plan(*, cfg, plan: dict[str, Any], selected_files_df: pd.DataFrame, batch_dir: Path) -> None:
-    processing = plan.get("processing", {}) or {}
-    selected_files = selected_files_df["source_file"].astype(str).tolist() if not selected_files_df.empty else []
-    if not selected_files:
-        print("[mmgen-append] Planned batch contains no files. Nothing to do.")
-        return
+    """Execute or resume one frozen batch; reuse a verified delta after publication failure."""
+    if int(cfg.shard_index) != 0:
+        raise ValueError('A one-job append plan requires shard_index=0')
+    with canonical_writer(batch_dir):
+        _validate_plan_against_cfg(plan, cfg)
+        _recover_publication(batch_dir)
+        processing = plan.get('processing', {}) or {}
+        selected_files = selected_files_df['source_file'].astype(str).tolist()
+        if not selected_files:
+            raise RuntimeError('Frozen append plan contains no selected source files.')
+        process_only = bool(cfg.process_only)
+        finalize_only = bool(cfg.finalize_only or cfg.merge_shards)
+        temp_path = batch_dir / 'temp_store.h5'
 
-    print(
-        f"[mmgen-append] Running single-job delta batch {plan.get('append_batch_id')} on {len(selected_files)} files."
-    )
-    pipeline.run_post_inference_analysis(
-        str(cfg.inference_csv_dir),
-        str(cfg.poscalc_dir),
-        str(batch_dir),
-        int(processing.get("min_bout", cfg.min_bout)),
-        int(processing.get("edge_skip", cfg.edge_skip)),
-        str(processing.get("inf_tag", cfg.inf_tag)),
-        runtime_settings=replace(
-            cfg.runtime_settings,
-            emit_master_matrix=True,
-            emit_full_outputs=bool(processing.get("emit_full_outputs", False)),
-        ),
-        resume=False,
-        finalize_only=False,
-        process_only=False,
-        file_filter=None,
-        num_shards=1,
-        shard_index=0,
-        shard_by="hash",
-        selected_files=selected_files,
-    )
-    _apply_delta_batch_to_canonical(cfg=cfg, plan=plan, delta_output_dir=batch_dir)
+        if (batch_dir / OUTPUT_RECEIPT_FILENAME).is_file():
+            delta = _verified_generation(batch_dir)
+            if (delta['identity']['calculation_sha256'] != plan['calculation_sha256']
+                    or delta['identity']['sources'] != plan['selected_sources']):
+                raise RuntimeError('Completed delta differs from the frozen append plan.')
+            print('[mmgen-append] Reusing the verified completed delta generation.')
+        else:
+            if finalize_only and not temp_path.is_file():
+                raise FileNotFoundError('One-job append finalization needs its retained store; run the planned processing step first.')
+            print(f"[mmgen-append] Running one-job batch {plan.get('append_batch_id')} on {len(selected_files)} frozen sources.")
+            pipeline.run_post_inference_analysis(
+                str(cfg.inference_csv_dir), str(cfg.poscalc_dir), str(batch_dir),
+                int(processing.get('min_bout', cfg.min_bout)),
+                int(processing.get('edge_skip', cfg.edge_skip)),
+                str(processing.get('inf_tag', cfg.inf_tag)),
+                runtime_settings=replace(cfg.runtime_settings, keep_temp_files=True,
+                    emit_master_matrix=not process_only,
+                    emit_full_outputs=bool(processing.get('emit_full_outputs', False)) and not process_only),
+                resume=bool(cfg.resume), finalize_only=finalize_only, process_only=process_only,
+                file_filter=None, num_shards=1, shard_index=0, shard_by='hash',
+                selected_files=selected_files,
+            )
+        if process_only:
+            return
+        verified_stores = [(str(temp_path), sha256_file(temp_path))] if temp_path.is_file() else []
+        _apply_delta_batch_to_canonical(cfg=cfg, plan=plan, delta_output_dir=batch_dir)
+        if not cfg.keep_temp_files:
+            _cleanup_append_batch_temp_artifacts(batch_dir, verified_stores)
 
 
 def _run_append_shard_from_plan(*, cfg, plan: dict[str, Any], selected_files_df: pd.DataFrame, batch_dir: Path) -> None:
+    """Process one animal-row partition of the frozen append batch."""
+    _validate_plan_against_cfg(plan,cfg)
     processing = plan.get("processing", {}) or {}
     active_num_shards = int(processing.get("active_num_shards", 1))
     shard_by = str(processing.get("shard_by", "row_identity"))
-    if active_num_shards <= 1:
-        raise RuntimeError("Append batch does not require sharding; run append_new_data without --process_only/--merge_shards instead")
+    if active_num_shards == 1:
+        _run_single_job_append_from_plan(cfg=cfg, plan=plan, selected_files_df=selected_files_df, batch_dir=batch_dir)
+        return
     if int(cfg.shard_index) < 0 or int(cfg.shard_index) >= active_num_shards:
         raise ValueError(f"append shard_index must be in [0, {active_num_shards-1}], got {cfg.shard_index}")
 
@@ -791,6 +894,7 @@ def _run_append_shard_from_plan(*, cfg, plan: dict[str, Any], selected_files_df:
 
 
 def _validate_append_shard_done_markers(*, batch_dir: Path, active_num_shards: int, shard_by: str) -> None:
+    """Require matching completion markers and stores for every planned append shard."""
     missing_done: list[int] = []
     bad_done: list[str] = []
     for i in range(int(active_num_shards)):
@@ -829,11 +933,17 @@ def _validate_append_shard_done_markers(*, batch_dir: Path, active_num_shards: i
 
 
 def _merge_finalize_append_batch(*, cfg, plan: dict[str, Any], batch_dir: Path) -> None:
+    """Merge completed append shards and publish affected animal rows under a canonical
+    lock.
+    """
+    _validate_plan_against_cfg(plan,cfg)
     processing = plan.get("processing", {}) or {}
     active_num_shards = int(processing.get("active_num_shards", 1))
     shard_by = str(processing.get("shard_by", "row_identity"))
-    if active_num_shards <= 1:
-        raise RuntimeError("Append batch does not require shard merge/finalize; run append_new_data directly instead")
+    if active_num_shards == 1:
+        selected_df = read_metadata_csv(batch_dir / APPEND_SELECTED_FILES_FILENAME)
+        _run_single_job_append_from_plan(cfg=cfg, plan=plan, selected_files_df=selected_df, batch_dir=batch_dir)
+        return
 
     merge_lock_dir = batch_dir / "_mmgen_work" / "_mmgen_merge.lock"
     os.makedirs(str(merge_lock_dir.parent), exist_ok=True)
@@ -844,17 +954,19 @@ def _merge_finalize_append_batch(*, cfg, plan: dict[str, Any], batch_dir: Path) 
         raise RuntimeError(
             "[mmgen-append] Append-batch merge lock already exists. Another merge/finalize job may already be running for this batch.\n"
             f"  lock: {merge_lock_dir}\n\n"
-            "If you are sure no merge job is running, delete the lock directory and retry. "
+            "Native locks release automatically when their writer exits. "
             f"(Original error: {e})"
         )
 
     try:
         _validate_append_shard_done_markers(batch_dir=batch_dir, active_num_shards=active_num_shards, shard_by=shard_by)
 
+        verified_stores: list[tuple[str, str]] = []
         merge_shard_temp_stores(
             output_folder=str(batch_dir),
             num_shards=active_num_shards,
             strict_missing=True,
+            verified_store_identities=verified_stores,
         )
 
         pipeline.run_post_inference_analysis(
@@ -876,11 +988,12 @@ def _merge_finalize_append_batch(*, cfg, plan: dict[str, Any], batch_dir: Path) 
             num_shards=1,
             shard_index=0,
             shard_by="hash",
+            selected_files=list(plan.get("selected_sources", {})),
         )
         _apply_delta_batch_to_canonical(cfg=cfg, plan=plan, delta_output_dir=batch_dir)
 
-        if not bool(getattr(cfg, "keep_temp_files", True)):
-            _cleanup_append_batch_temp_artifacts(batch_dir)
+        if not cfg.keep_temp_files:
+            _cleanup_append_batch_temp_artifacts(batch_dir, verified_stores)
     finally:
         try:
             merge_lock.release()
@@ -889,45 +1002,59 @@ def _merge_finalize_append_batch(*, cfg, plan: dict[str, Any], batch_dir: Path) 
 
 
 def run_mmgen_append_new_data(cfg) -> None:
-    """Run append/update mode for mmgen.
+    """Plan, execute, resume or finalize a frozen append batch of any active size.
 
-    Supported workflows:
-      1) Single-job append (default):
-         ``mmgen --append_new_data``
-      2) Planned sharded append:
-         ``mmgen --append_new_data --plan_only --num_shards N --shard_by row_identity``
-         ``mmgen --append_new_data --append_batch_id <id> --process_only --num_shards N --shard_index k --shard_by row_identity``
-         ``mmgen --append_new_data --append_batch_id <id> --merge_shards``
+    An existing explicit append_batch_id always reuses its saved selection.
+    One-job plans, including larger plans reduced to one affected animal, support
+    process_only followed by merge_shards/finalize_only, or a direct execution.
     """
     root_out = str(cfg.output_dir)
     os.makedirs(root_out, exist_ok=True)
-
-    if bool(getattr(cfg, "plan_only", False)):
+    if bool(cfg.plan_only):
         _create_append_plan(cfg)
         return
+    if bool(cfg.process_only) and bool(cfg.merge_shards or cfg.finalize_only):
+        raise ValueError('Append processing and finalization must be separate invocations.')
 
-    if bool(getattr(cfg, "merge_shards", False)):
-        if not getattr(cfg, "append_batch_id", None):
-            raise ValueError("append_new_data shard merge/finalize requires append_batch_id")
-        plan, selected_df, _affected_df, batch_dir = _load_append_plan(root_out, str(cfg.append_batch_id))
-        _validate_plan_against_cfg(plan, cfg)
+    batch_id = getattr(cfg, 'append_batch_id', None)
+    explicit_plan = bool(batch_id and (_append_batch_dir(root_out, str(batch_id)) / APPEND_PLAN_FILENAME).is_file())
+    if explicit_plan or bool(cfg.process_only or cfg.merge_shards or cfg.finalize_only):
+        if not batch_id:
+            raise ValueError('Planned append processing/finalization requires append_batch_id')
+        plan, selected_df, _affected_df, batch_dir = _load_append_plan(root_out, str(batch_id))
+    else:
+        if int(cfg.num_shards) > 1:
+            raise ValueError('append_new_data with num_shards > 1 requires a saved --plan_only batch first')
+        plan, selected_df, _affected_df, batch_dir = _create_append_plan(cfg)
+        if plan is None:
+            return
+    _validate_plan_against_cfg(plan, cfg)
+    active = int(plan['processing']['active_num_shards'])
+    if active == 1:
+        _run_single_job_append_from_plan(cfg=cfg, plan=plan, selected_files_df=selected_df, batch_dir=batch_dir)
+    elif bool(cfg.merge_shards or cfg.finalize_only):
         _merge_finalize_append_batch(cfg=cfg, plan=plan, batch_dir=batch_dir)
-        return
-
-    if bool(getattr(cfg, "process_only", False)):
-        if not getattr(cfg, "append_batch_id", None):
-            raise ValueError("append_new_data shard processing requires append_batch_id")
-        plan, selected_df, _affected_df, batch_dir = _load_append_plan(root_out, str(cfg.append_batch_id))
-        _validate_plan_against_cfg(plan, cfg)
+    elif bool(cfg.process_only):
         _run_append_shard_from_plan(cfg=cfg, plan=plan, selected_files_df=selected_df, batch_dir=batch_dir)
-        return
+    else:
+        raise ValueError('A multi-job append plan requires per-shard --process_only, then --merge_shards.')
 
-    if int(getattr(cfg, "num_shards", 1)) > 1:
-        raise ValueError(
-            "append_new_data with num_shards > 1 uses a planned workflow: run --plan_only first, then per-shard --process_only jobs, then --merge_shards"
-        )
 
-    plan, selected_df, _affected_df, batch_dir = _create_append_plan(cfg)
-    if plan is None or selected_df is None or batch_dir is None:
-        return
-    _run_single_job_append_from_plan(cfg=cfg, plan=plan, selected_files_df=selected_df, batch_dir=batch_dir)
+def _load_required_canonical_state(output_folder: str):
+    with canonical_writer(output_folder):
+        return _load_required_canonical_state_owned(output_folder)
+
+
+def _create_append_plan(cfg):
+    with canonical_writer(cfg.output_dir):
+        return _create_append_plan_owned(cfg)
+
+
+def _validate_plan_against_cfg(plan: dict[str, Any], cfg):
+    with canonical_writer(cfg.output_dir):
+        return _validate_plan_against_cfg_owned(plan, cfg)
+
+
+def _apply_delta_batch_to_canonical(*, cfg, plan: dict[str, Any], delta_output_dir: Path):
+    with canonical_writer(cfg.output_dir):
+        return _apply_delta_batch_to_canonical_owned(cfg=cfg, plan=plan, delta_output_dir=delta_output_dir)

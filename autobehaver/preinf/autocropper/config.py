@@ -1,4 +1,4 @@
-"""Configuration for autocropper."""
+"""Define runtime options and output paths for Autocropper."""
 
 from __future__ import annotations
 
@@ -8,21 +8,9 @@ import re
 from pathlib import Path
 
 
-def default_resource_path(filename: str) -> str:
-    """Return an absolute path to a packaged resource file.
-
-    The repo/zip layout is expected to include:
-        autobehaver/resources/autocropper/<filename>
-    """
-    here = Path(__file__).resolve()
-    autobehaver_dir = here.parents[2]
-    p = autobehaver_dir / "resources" / "autocropper" / filename
-    return str(p)
-
-
 @dataclass(frozen=True)
 class AutocropperConfig:
-    """Runtime configuration for autocropper."""
+    """Store runtime options for Autocropper."""
 
     # Full-frame movies live here
     input_dir: str
@@ -52,6 +40,7 @@ class AutocropperConfig:
     chamber_columns: int = 3
     chamber_rows: int = 2
     crop_dim_2k: int = 600
+    chamber_calibration_json: str | None = None
 
     # Detection settings
     frame_avg: int = 10
@@ -71,65 +60,42 @@ class AutocropperConfig:
     # Output encoding
     crop_crf: int = 12
 
-    # Validation
-    skip_validation: bool = False
-    model_path: str | None = None
-    norm_params_path: str | None = None
-
     # Logging
     log_level: str = "INFO"
 
-    # ----------------------
     # Project registry (single CSV at project root)
-    # ----------------------
     registry_enabled: bool = False
     registry_csv: str | None = None
     registry_lock_timeout_sec: int = 120
     registry_lock_stale_sec: int = 60 * 60
 
-    # ----------------------
-    # Resource resolution
-    # ----------------------
-    def resolved_model_path(self) -> str:
-        return self.model_path or default_resource_path(
-            "emptychamber_detector_v2_checkpoint_epoch_331.pt"
-        )
-
-    def resolved_norm_params_path(self) -> str:
-        return self.norm_params_path or default_resource_path("normalization_params.json")
-
-    # ----------------------
     # Path resolution
-    # ----------------------
     def resolved_crop_output_dir(self) -> str:
-        """Directory where cropped chamber movies are written."""
+        """Return the directory for cropped chamber movies."""
         if self.output_dir:
             return str(self.output_dir)
         return str(Path(self.input_dir) / "cropped_chambers")
 
     def resolved_run_dir(self) -> str:
-        """Directory where logs/validation artifacts are written."""
+        """Return the directory for logs and stage artifacts."""
         return str(self.output_dir or self.input_dir)
 
     def resolved_exclusions_csv(self) -> str:
-        """Path to exclusions.csv (moviechecker output)."""
+        """Return the explicit exclusions path or the input-folder default."""
         if self.exclusions_csv:
-            return str(self.exclusions_csv)
-        return str(Path(self.input_dir) / "exclusions.csv")
+            return str(Path(self.exclusions_csv).expanduser().resolve())
+        return str((Path(self.input_dir).expanduser().resolve() / "exclusions.csv"))
 
     def resolved_recording_database_dir(self) -> str:
-        """Directory that contains recording_database_*.csv files.
-
-        If not provided, defaults to ``input_dir``.
-        """
+        """Return the metadata directory, defaulting to input_dir."""
         return str(self.recording_database_dir or self.input_dir)
 
     def resolved_recording_database_csv(self) -> str | None:
-        """Explicit path to a recording database CSV (optional override)."""
+        """Return the explicit recording metadata path, if supplied."""
         return str(self.recording_database_csv) if self.recording_database_csv else None
 
     def resolved_registry_csv(self) -> str | None:
-        """Path to the project-wide registry CSV (or None if disabled)."""
+        """Return the explicit or inferred registry path, or None when disabled."""
 
         if not bool(self.registry_enabled):
             return None

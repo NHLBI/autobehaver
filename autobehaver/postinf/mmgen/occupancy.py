@@ -1,31 +1,31 @@
-"""Behavior-specific occupancy / spatial analysis for mmgen.
+"""Transform MMGen positions and summarize behavior-specific occupancy and orientation.
 
-This module contains the behavior-specific occupancy and spatial analysis
-logic used during mmgen finalization.
-
-Implementation note:
-  - Stream per-individual positional transformations to disk (CSV) instead of
-    concatenating all transformed frames into one in-memory DataFrame.
-  - Compute occupancy heatmaps, orientation quivers, and radial KDE plots using
-    bounded, streaming accumulators (including capped KDE sampling).
-
-This eliminates the gradual memory growth previously caused by accumulating
-"all_transformed_dfs" and then calling pd.concat(...).
+Process animal data in bounded chunks and use bounded samples for radial-density plots.
 """
 
 from __future__ import annotations
+
+from .input_contract import navigation_to_image_angle
+from .hdf_store import select_individual_rows
 
 import hashlib
 import os
 import re
 import shutil
-from multiprocessing import Pool
+from pathlib import Path
+from .batching import ordered_worker_results
+from .table_metadata import read_individual_metadata
+
+from autobehaver.atomic_io import atomic_write_json, sha256_file
 
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+from autobehaver.progress import progress as tqdm
 
 from .naming import collapse_individual_id
 
@@ -33,9 +33,7 @@ DEFAULT_CHAMBER_DIAMETER_PX: int | None = 530
 DEFAULT_GENERATE_QUIVER_PLOTS: bool = True
 
 
-# ---------------------------------------------------------------------------
 # Internal bounded sampling + accumulation helpers
-# ---------------------------------------------------------------------------
 
 class _BottomKSampler:
     """Maintain a bounded sample of values using a bottom-K random-key scheme.
@@ -57,6 +55,7 @@ class _BottomKSampler:
         self.values = np.empty((0,), dtype=np.float32)
 
     def update(self, values: np.ndarray) -> None:
+        """Retain the values with the smallest random keys while bounding sample memory."""
         if values is None:
             return
 
@@ -114,6 +113,9 @@ class _OccupancyAccumulator:
         kde_max_points: int = 50_000,
         seed: int = 0,
     ):
+        """Allocate bounded heatmap, orientation-vector, and radial-sampling
+        accumulators.
+        """
         self.behavior_cols = ["masked_pose", "masked_orient", "masked_pose_orient"]
 
         self.heatmap_bins = int(heatmap_bins)
@@ -148,10 +150,9 @@ class _OccupancyAccumulator:
             self._kde[key] = _BottomKSampler(self.kde_max_points, self._stable_seed(key, self.seed))
         return self._kde[key]
 
-    # ------------------------
     # Heatmap accumulation
-    # ------------------------
     def add_heatmap(self, col: str, behavior: str, group: str, x: np.ndarray, y: np.ndarray) -> None:
+        """Add positional counts to the behavior/group occupancy histogram."""
         key = (col, behavior, group)
         if key not in self._heat_counts:
             self._heat_counts[key] = np.zeros((self.heatmap_bins, self.heatmap_bins), dtype=np.float32)
@@ -168,19 +169,16 @@ class _OccupancyAccumulator:
         self._heat_n[key] += int(len(x))
         self.behaviors[col].add(str(behavior))
 
-    # ------------------------
     # KDE sampling accumulation
-    # ------------------------
     def add_kde(self, col: str, behavior: str, group: str, r_norm: np.ndarray) -> None:
         key = (col, behavior, group)
         sampler = self._get_kde_sampler(key)
         sampler.update(r_norm)
         self.behaviors[col].add(str(behavior))
 
-    # ------------------------
     # Quiver accumulation
-    # ------------------------
     def add_quiver(self, col: str, behavior: str, group: str, x: np.ndarray, y: np.ndarray, angle_deg: np.ndarray) -> None:
+        """Accumulate image-coordinate orientation vectors by spatial bin."""
         key = (col, behavior, group)
         if key not in self._q_sum_u:
             gs = self.quiver_grid_size
@@ -204,7 +202,9 @@ class _OccupancyAccumulator:
         ang = angle_deg[valid]
 
         # Vector components
-        ang_rad = np.deg2rad(ang)
+        # Input uses KeyPre navigation bearing (0=N, 90=E). Plot axes use
+        # image coordinates (+x right, +y down), including inverted display y.
+        ang_rad = np.deg2rad(navigation_to_image_angle(ang))
         u = np.cos(ang_rad).astype(np.float32, copy=False)
         v = np.sin(ang_rad).astype(np.float32, copy=False)
 
@@ -220,9 +220,7 @@ class _OccupancyAccumulator:
         self._q_sum_v[key] += sv.reshape(gs, gs).astype(np.float32, copy=False)
         self.behaviors[col].add(str(behavior))
 
-    # ------------------------
     # Accessors for plotting
-    # ------------------------
     def heatmap_keys(self):
         return list(self._heat_counts.keys())
 
@@ -245,9 +243,7 @@ class _OccupancyAccumulator:
         )
 
 
-# ---------------------------------------------------------------------------
 # Streaming transform + accumulation
-# ---------------------------------------------------------------------------
 
 def _category_subfolder_name(col: str) -> str:
     # Keep the current label capitalization behavior (note: .capitalize() lowercases the rest).
@@ -262,6 +258,7 @@ def _stream_transform_write_and_accumulate(
     chamber_diameter_px: int | None = DEFAULT_CHAMBER_DIAMETER_PX,
     generate_quiver_plots: bool = DEFAULT_GENERATE_QUIVER_PLOTS,
     transformed_output_path: str | None = None,
+    num_workers: int = 1,
 ) -> _OccupancyAccumulator | None:
     """Stream per-individual transformations to CSV and update bounded accumulators.
 
@@ -302,12 +299,6 @@ def _stream_transform_write_and_accumulate(
 
     transformed_path = transformed_output_path or os.path.join(output_dir, "temp_transformed_positional_data.csv")
     os.makedirs(os.path.dirname(transformed_path), exist_ok=True)
-    if os.path.exists(transformed_path):
-        try:
-            os.remove(transformed_path)
-        except Exception:
-            pass
-
     header_written = False
 
     # Columns we need for downstream feature_matrix + occupancy plots.
@@ -336,143 +327,31 @@ def _stream_transform_write_and_accumulate(
         "anglefeature_Legs_BL_BR",
     ]
 
+    from .finalize_execution import prepare_report_tasks, budgeted_results, report_part, merge_reduction
+    with pd.HDFStore(temp_store_path, mode="r") as store:
+        cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
+    tasks, estimates = prepare_report_tasks(temp_store_path, positional_key, output_dir,
+                                           cols_for_select, fixed_arena_radius, generate_quiver_plots)
+    temporary_output = transformed_path + '.assembling'
     try:
-        with pd.HDFStore(temp_store_path, mode="r") as store:
-            individuals = store.select_column(positional_key, "individual").unique()
-
-            # Ensure deterministic iteration order (helps stable sampling)
-            individuals = sorted([str(x) for x in individuals])
-
-            # Attempt to figure out which columns exist for safer selection
-            existing_cols = None
-            try:
-                # 0-row schema read is safe and cheap
-                schema0 = store.select(positional_key, start=0, stop=0)
-                existing_cols = set(schema0.columns)
-            except Exception:
-                existing_cols = None
-
-            if existing_cols is not None:
-                cols_for_select = [c for c in cols_to_load if c in existing_cols]
-            else:
-                cols_for_select = None
-
-            for individual_id in tqdm(individuals, desc="Calibrating arenas"):
-                # Load one individual's data
-                try:
-                    if cols_for_select:
-                        individual_df = store.select(
-                            positional_key,
-                            where=f"individual == '{individual_id}'",
-                            columns=cols_for_select,
-                        )
-                    else:
-                        individual_df = store.select(positional_key, where=f"individual == '{individual_id}'")
-                except Exception:
-                    individual_df = store.select(positional_key, where=f"individual == '{individual_id}'")
-
-                if individual_df is None or individual_df.empty:
+        with open(temporary_output, 'w', encoding='utf-8', newline='') as output:
+            for result in tqdm(budgeted_results(report_part, tasks, estimates, num_workers=num_workers),
+                               total=len(tasks), desc="Calibrating arenas"):
+                qc_n, qc_1, qc_12 = result['qc']
+                qc_total += qc_n
+                qc_over_1p0 += qc_1
+                qc_over_1p2 += qc_12
+                if not result['rows']:
                     continue
-
-                # Drop rows with missing positional data for calibration
-                clean_df = individual_df.dropna(subset=["centroid_x", "centroid_y"])
-                if clean_df.empty:
-                    continue
-
-                # Arena center is fixed in a 600x600 frame
-                center_x = 299.5
-                center_y = 299.5
-
-                centered_x = individual_df["centroid_x"] - center_x
-                centered_y = individual_df["centroid_y"] - center_y
-
-                r = np.sqrt(centered_x**2 + centered_y**2)
-
-                if fixed_arena_radius is not None:
-                    arena_radius = fixed_arena_radius
-                else:
-                    arena_radius = np.nanpercentile(r, 99)
-
-                if (not np.isfinite(arena_radius)) or (arena_radius <= 0):
-                    arena_radius = 1.0
-
-                r_norm_raw = r / arena_radius
-
-                rnr = r_norm_raw.to_numpy()
-                finite_mask = np.isfinite(rnr)
-                qc_total += int(np.sum(finite_mask))
-                qc_over_1p0 += int(np.sum(rnr[finite_mask] > 1.0))
-                qc_over_1p2 += int(np.sum(rnr[finite_mask] > 1.2))
-
-                # Positional angle
-                theta_pos_rad = np.arctan2(centered_y, centered_x)
-                theta_pos_deg = np.degrees(theta_pos_rad)
-
-                # Compute columns in-place (no large copy)
-                individual_df["r_norm"] = r_norm_raw
-                individual_df["positional_angle"] = theta_pos_deg
-
-                fly_angle_math_deg = individual_df["angle"]
-                individual_df["fly_angle_math"] = fly_angle_math_deg
-
-                relative_angle = (fly_angle_math_deg - theta_pos_deg + 180) % 360 - 180
-                individual_df["relative_angle"] = relative_angle
-
-                # Guard extreme radial values for plots
-                individual_df["r_norm"] = individual_df["r_norm"].clip(lower=0, upper=1.5)
-
-                # Collapse individual IDs to animal IDs
-                individual_df["individual"] = individual_df["individual"].map(collapse_individual_id)
-
-                # Write transformed chunk to disk
-                individual_df.to_csv(
-                    transformed_path,
-                    index=False,
-                    mode="a" if header_written else "w",
-                    header=not header_written,
-                )
+                merge_reduction(acc, result)
+                with open(result['csv'], encoding='utf-8', newline='') as part:
+                    if header_written:
+                        next(part, None)
+                    shutil.copyfileobj(part, output)
                 header_written = True
-
-                # -----------------------------
-                # Update bounded accumulators
-                # -----------------------------
-                # We update from the transformed DF (contains r_norm, etc.)
-                for col in acc.behavior_cols:
-                    if col not in individual_df.columns:
-                        continue
-
-                    # Drop rows where behavior label or group is missing
-                    df_bg = individual_df.dropna(subset=[col, "group"]) 
-                    if df_bg.empty:
-                        continue
-
-                    # Group by behavior+group for this individual
-                    for (behavior, group), gdf in df_bg.groupby([col, "group"], observed=False):
-                        # Coordinates for heatmap and quiver
-                        coords = gdf[["centroid_x", "centroid_y"]].dropna()
-                        if not coords.empty:
-                            x = coords["centroid_x"].to_numpy(dtype=float)
-                            y = coords["centroid_y"].to_numpy(dtype=float)
-                            acc.add_heatmap(col, str(behavior), str(group), x, y)
-
-                        # r_norm KDE sample
-                        if "r_norm" in gdf.columns:
-                            rn = gdf["r_norm"].to_numpy(dtype=float)
-                            acc.add_kde(col, str(behavior), str(group), rn)
-
-                        # Quiver update (optional)
-                        if generate_quiver_plots and ("angle" in gdf.columns):
-                            # Need finite x/y/angle
-                            x_all = gdf["centroid_x"].to_numpy(dtype=float)
-                            y_all = gdf["centroid_y"].to_numpy(dtype=float)
-                            a_all = gdf["angle"].to_numpy(dtype=float)
-                            m = np.isfinite(x_all) & np.isfinite(y_all) & np.isfinite(a_all)
-                            if np.any(m):
-                                acc.add_quiver(col, str(behavior), str(group), x_all[m], y_all[m], a_all[m])
-
-    except (FileNotFoundError, KeyError, pd.errors.HDFDatabaseError) as e:
-        print(f"Error reading positional data from HDF5 store: {e}")
-        return None
+        os.replace(temporary_output, transformed_path)
+    except (OSError, KeyError) as e:
+        raise RuntimeError('Failed to finalize positional reports; completed recording parts are retained') from e
 
     if not header_written:
         print("Warning: No data could be transformed.")
@@ -489,13 +368,12 @@ def _stream_transform_write_and_accumulate(
     return acc
 
 
-# ---------------------------------------------------------------------------
 # Plot generation from bounded accumulators
-# ---------------------------------------------------------------------------
 
-def _generate_radial_distribution_plots_from_acc(acc: _OccupancyAccumulator, output_dir: str) -> None:
+def _generate_radial_distribution_plots_from_acc(acc: _OccupancyAccumulator, output_dir: str) -> list[str]:
     """Generate radial KDE plots from bounded samples."""
     base_plot_folder = os.path.join(output_dir, "9_Occupancy_Plots")
+    generated = []
 
     for col in acc.behavior_cols:
         if not acc.behaviors.get(col):
@@ -546,14 +424,16 @@ def _generate_radial_distribution_plots_from_acc(acc: _OccupancyAccumulator, out
 
             try:
                 plt.savefig(plot_path, dpi=300)
-            except Exception as e:
-                print(f"Could not save plot {plot_path}: {e}")
-            plt.close()
+                generated.append(plot_path)
+            finally:
+                plt.close()
+    return generated
 
 
-def _generate_2d_heatmaps_from_acc(acc: _OccupancyAccumulator, output_dir: str) -> None:
+def _generate_2d_heatmaps_from_acc(acc: _OccupancyAccumulator, output_dir: str) -> list[str]:
     """Generate 2D binned occupancy heatmaps from accumulated histograms."""
     base_plot_folder = os.path.join(output_dir, "10_Occupancy_Heatmaps")
+    generated = []
     bins = acc.heatmap_bins
     plot_range = acc.heatmap_range
 
@@ -608,7 +488,7 @@ def _generate_2d_heatmaps_from_acc(acc: _OccupancyAccumulator, output_dir: str) 
                 ax.set_yticks(np.linspace(0, bins, 5))
                 ax.set_yticklabels(np.linspace(plot_range[1][0], plot_range[1][1], 5, dtype=int))
 
-                ax.invert_yaxis()
+                # Seaborn already puts image-coordinate y=0 at the top.
                 ax.set_aspect("equal", adjustable="box")
                 ax.set_title(f"Occupancy Histogram: {group}\n{behavior}", fontsize=14)
                 ax.set_xlabel("X Coordinate")
@@ -616,8 +496,12 @@ def _generate_2d_heatmaps_from_acc(acc: _OccupancyAccumulator, output_dir: str) 
 
                 safe_bh_name = re.sub(r"[\\/*?:\"<>| +]", "_", behavior)
                 cartesian_path = os.path.join(plot_output_folder, f"{safe_bh_name}_{group}_heatmap_histogram.png")
-                plt.savefig(cartesian_path, dpi=150, bbox_inches="tight")
-                plt.close()
+                try:
+                    plt.savefig(cartesian_path, dpi=150, bbox_inches="tight")
+                    generated.append(cartesian_path)
+                finally:
+                    plt.close()
+    return generated
 
 
 def _generate_orientation_quiver_plots_from_acc(
@@ -625,10 +509,11 @@ def _generate_orientation_quiver_plots_from_acc(
     output_dir: str,
     *,
     min_samples_per_bin: int = 5,
-) -> None:
+) -> list[str]:
     """Generate orientation quiver plots from accumulated vector sums."""
 
     base_plot_folder = os.path.join(output_dir, "11_Orientation_Quiver_Plots")
+    generated = []
 
     gs = acc.quiver_grid_size
     bins = np.linspace(acc.heatmap_range[0][0], acc.heatmap_range[0][1], gs + 1)
@@ -686,6 +571,7 @@ def _generate_orientation_quiver_plots_from_acc(
                     headlength=4,
                     scale=25,
                     pivot="mid",
+                    angles="xy",  # Follow image axes, including inverted y.
                 )
 
                 fig.colorbar(q, ax=ax, label="Orientation Consistency (Vector Magnitude)")
@@ -700,19 +586,20 @@ def _generate_orientation_quiver_plots_from_acc(
 
                 safe_bh_name = re.sub(r"[\\/*?:\"<>| +]", "_", behavior)
                 plot_path = os.path.join(plot_output_folder, f"{safe_bh_name}_{group}_quiver.png")
-                plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-                plt.close()
+                try:
+                    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+                    generated.append(plot_path)
+                finally:
+                    plt.close()
+    return generated
 
 
-# ---------------------------------------------------------------------------
 # Matrix-first fast-path helpers (no plot accumulators)
-# ---------------------------------------------------------------------------
-
-def _escape_hdf_string(value: str) -> str:
-    return str(value).replace("\\", "\\\\").replace("'", "\\'")
-
 
 def _resolve_fixed_arena_radius(chamber_diameter_px: int | None) -> float | None:
+    """Resolve a positive fixed radius from the configured diameter, or disable fixed
+    calibration.
+    """
     fixed_arena_radius = None
     if chamber_diameter_px is not None:
         try:
@@ -731,15 +618,15 @@ def _resolve_fixed_arena_radius(chamber_diameter_px: int | None) -> float | None
 
 
 def _load_positional_cols_for_select(store: pd.HDFStore, positional_key: str, cols_to_load: list[str]) -> list[str] | None:
-    try:
-        schema0 = store.select(positional_key, start=0, stop=0)
-        existing_cols = set(schema0.columns)
-        return [c for c in cols_to_load if c in existing_cols]
-    except Exception:
-        return None
+    schema0 = store.select(positional_key, start=0, stop=0)
+    existing_cols = set(schema0.columns)
+    return [c for c in cols_to_load if c in existing_cols]
 
 
 def _transform_positional_individual_df(individual_df: pd.DataFrame, *, fixed_arena_radius: float | None) -> tuple[pd.DataFrame | None, int, int, int]:
+    """Center image positions and derive radial distance and relative bearing for one
+    recording.
+    """
     if individual_df is None or individual_df.empty:
         return None, 0, 0, 0
     clean_df = individual_df.dropna(subset=["centroid_x", "centroid_y"])
@@ -768,7 +655,7 @@ def _transform_positional_individual_df(individual_df: pd.DataFrame, *, fixed_ar
 
     theta_pos_rad = np.arctan2(centered_y, centered_x)
     theta_pos_deg = np.degrees(theta_pos_rad)
-    fly_angle_math_deg = individual_df["angle"]
+    fly_angle_math_deg = navigation_to_image_angle(individual_df["angle"])
     relative_angle = (fly_angle_math_deg - theta_pos_deg + 180) % 360 - 180
 
     out_df = individual_df.copy()
@@ -781,6 +668,7 @@ def _transform_positional_individual_df(individual_df: pd.DataFrame, *, fixed_ar
 
 
 def _ordered_chunks(items: list[str], n_chunks: int) -> list[list[str]]:
+    """Split ordered animal identities into contiguous worker chunks."""
     if not items:
         return []
     # Create more tasks than workers so multiprocessing can rebalance heavy
@@ -799,6 +687,7 @@ def _ordered_chunks(items: list[str], n_chunks: int) -> list[list[str]]:
 
 
 def _write_csv_parts_to_target(part_paths: list[str], output_path: str) -> None:
+    """Concatenate ordered positional CSV parts with one header."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     if os.path.exists(output_path):
         try:
@@ -809,7 +698,7 @@ def _write_csv_parts_to_target(part_paths: list[str], output_path: str) -> None:
     with open(output_path, "w", encoding="utf-8", newline="") as out_f:
         for part_path in part_paths:
             if not part_path or not os.path.exists(part_path):
-                continue
+                raise RuntimeError(f'Missing transformed positional chunk: {part_path}')
             with open(part_path, "r", encoding="utf-8", newline="") as in_f:
                 if not header_written:
                     shutil.copyfileobj(in_f, out_f)
@@ -820,6 +709,7 @@ def _write_csv_parts_to_target(part_paths: list[str], output_path: str) -> None:
 
 
 def _occupancy_transform_chunk_worker(args: tuple[str, str, list[str], list[str] | None, float | None, str]) -> dict:
+    """Transform an ordered animal chunk and write its positional CSV part."""
     temp_store_path, positional_key, individual_ids, cols_for_select, fixed_arena_radius, chunk_output_path = args
     header_written = False
     n_rows = 0
@@ -829,14 +719,8 @@ def _occupancy_transform_chunk_worker(args: tuple[str, str, list[str], list[str]
 
     with pd.HDFStore(temp_store_path, mode="r") as store:
         for individual_id in individual_ids:
-            ind_safe = _escape_hdf_string(individual_id)
-            try:
-                if cols_for_select:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'", columns=cols_for_select)
-                else:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
-            except Exception:
-                individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
+            individual_df = select_individual_rows(
+                store, positional_key, individual_id, columns=cols_for_select)
             transformed_df, qc_n, qc_1, qc_12 = _transform_positional_individual_df(
                 individual_df,
                 fixed_arena_radius=fixed_arena_radius,
@@ -866,6 +750,7 @@ def _occupancy_transform_chunk_worker(args: tuple[str, str, list[str], list[str]
 
 
 def _occupancy_transform_chunk_collect_worker(args: tuple[str, str, list[str], list[str] | None, float | None]) -> dict:
+    """Transform an ordered animal chunk and return its positional rows."""
     temp_store_path, positional_key, individual_ids, cols_for_select, fixed_arena_radius = args
     frames: list[pd.DataFrame] = []
     qc_total = 0
@@ -874,14 +759,8 @@ def _occupancy_transform_chunk_collect_worker(args: tuple[str, str, list[str], l
 
     with pd.HDFStore(temp_store_path, mode="r") as store:
         for individual_id in individual_ids:
-            ind_safe = _escape_hdf_string(individual_id)
-            try:
-                if cols_for_select:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'", columns=cols_for_select)
-                else:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
-            except Exception:
-                individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
+            individual_df = select_individual_rows(
+                store, positional_key, individual_id, columns=cols_for_select)
             transformed_df, qc_n, qc_1, qc_12 = _transform_positional_individual_df(
                 individual_df,
                 fixed_arena_radius=fixed_arena_radius,
@@ -910,6 +789,9 @@ def _serial_transform_write_without_accumulate(
     *,
     fixed_arena_radius: float | None,
 ) -> bool:
+    """Transform animal positions in order and stream them to CSV without plot
+    accumulators.
+    """
     cols_to_load = [
         "group", "individual", "source_file", "frame_idx",
         "masked_pose", "masked_orient", "masked_pose_orient",
@@ -929,18 +811,12 @@ def _serial_transform_write_without_accumulate(
     header_written = False
     qc_total = qc_over_1p0 = qc_over_1p2 = 0
     with pd.HDFStore(temp_store_path, mode="r") as store:
-        individuals = store.select_column(positional_key, "individual").unique()
+        individuals = read_individual_metadata(store, positional_key, columns=("individual",))["individual"].dropna().unique()
         individuals = sorted([str(x) for x in individuals])
         cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
         for individual_id in tqdm(individuals, desc="Transforming positional data"):
-            ind_safe = _escape_hdf_string(individual_id)
-            try:
-                if cols_for_select:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'", columns=cols_for_select)
-                else:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
-            except Exception:
-                individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
+            individual_df = select_individual_rows(
+                store, positional_key, individual_id, columns=cols_for_select)
             transformed_df, qc_n, qc_1, qc_12 = _transform_positional_individual_df(individual_df, fixed_arena_radius=fixed_arena_radius)
             qc_total += int(qc_n)
             qc_over_1p0 += int(qc_1)
@@ -971,6 +847,9 @@ def _parallel_transform_write_without_accumulate(
     fixed_arena_radius: float | None,
     num_workers: int,
 ) -> bool:
+    """Transform contiguous animal chunks in workers and combine their ordered CSV
+    parts.
+    """
     cols_to_load = [
         "group", "individual", "source_file", "frame_idx",
         "masked_pose", "masked_orient", "masked_pose_orient",
@@ -981,7 +860,7 @@ def _parallel_transform_write_without_accumulate(
     ]
 
     with pd.HDFStore(temp_store_path, mode="r") as store:
-        individuals = store.select_column(positional_key, "individual").unique()
+        individuals = read_individual_metadata(store, positional_key, columns=("individual",))["individual"].dropna().unique()
         individuals = sorted([str(x) for x in individuals])
         cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
 
@@ -1011,8 +890,8 @@ def _parallel_transform_write_without_accumulate(
             os.path.join(parts_dir, f"part_{idx:03d}.csv"),
         ))
 
-    with Pool(processes=worker_count) as pool:
-        results = pool.map(_occupancy_transform_chunk_worker, tasks, chunksize=1)
+    results = list(ordered_worker_results(
+        _occupancy_transform_chunk_worker, tasks, num_workers=worker_count))
 
     part_paths = [r["chunk_output_path"] for r in results if int(r.get("n_rows", 0)) > 0]
     if not part_paths:
@@ -1037,6 +916,9 @@ def _serial_transform_collect_without_accumulate(
     *,
     fixed_arena_radius: float | None,
 ) -> pd.DataFrame | None:
+    """Transform animal positions in order and return the resulting rows without plot
+    accumulators.
+    """
     cols_to_load = [
         "group", "individual", "source_file", "frame_idx",
         "masked_pose", "masked_orient", "masked_pose_orient",
@@ -1049,18 +931,12 @@ def _serial_transform_collect_without_accumulate(
     frames: list[pd.DataFrame] = []
     qc_total = qc_over_1p0 = qc_over_1p2 = 0
     with pd.HDFStore(temp_store_path, mode="r") as store:
-        individuals = store.select_column(positional_key, "individual").unique()
+        individuals = read_individual_metadata(store, positional_key, columns=("individual",))["individual"].dropna().unique()
         individuals = sorted([str(x) for x in individuals])
         cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
         for individual_id in tqdm(individuals, desc="Transforming positional data"):
-            ind_safe = _escape_hdf_string(individual_id)
-            try:
-                if cols_for_select:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'", columns=cols_for_select)
-                else:
-                    individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
-            except Exception:
-                individual_df = store.select(positional_key, where=f"individual == '{ind_safe}'")
+            individual_df = select_individual_rows(
+                store, positional_key, individual_id, columns=cols_for_select)
             transformed_df, qc_n, qc_1, qc_12 = _transform_positional_individual_df(individual_df, fixed_arena_radius=fixed_arena_radius)
             qc_total += int(qc_n)
             qc_over_1p0 += int(qc_1)
@@ -1083,6 +959,9 @@ def _parallel_transform_collect_without_accumulate(
     fixed_arena_radius: float | None,
     num_workers: int,
 ) -> pd.DataFrame | None:
+    """Transform contiguous animal chunks in workers and return their ordered positional
+    rows.
+    """
     cols_to_load = [
         "group", "individual", "source_file", "frame_idx",
         "masked_pose", "masked_orient", "masked_pose_orient",
@@ -1093,7 +972,7 @@ def _parallel_transform_collect_without_accumulate(
     ]
 
     with pd.HDFStore(temp_store_path, mode="r") as store:
-        individuals = store.select_column(positional_key, "individual").unique()
+        individuals = read_individual_metadata(store, positional_key, columns=("individual",))["individual"].dropna().unique()
         individuals = sorted([str(x) for x in individuals])
         cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
 
@@ -1114,8 +993,8 @@ def _parallel_transform_collect_without_accumulate(
         for chunk in chunks
     ]
 
-    with Pool(processes=worker_count) as pool:
-        results = pool.map(_occupancy_transform_chunk_collect_worker, tasks, chunksize=1)
+    results = list(ordered_worker_results(
+        _occupancy_transform_chunk_collect_worker, tasks, num_workers=worker_count))
 
     frames = [r.get("dataframe") for r in results if r.get("dataframe") is not None and int(r.get("n_rows", 0)) > 0]
     if not frames:
@@ -1129,9 +1008,7 @@ def _parallel_transform_collect_without_accumulate(
     return pd.concat(frames, ignore_index=True)
 
 
-# ---------------------------------------------------------------------------
 # Public entrypoint used by the mmgen pipeline
-# ---------------------------------------------------------------------------
 
 def calculate_and_save_occupancy_analysis(
     temp_store_path,
@@ -1145,14 +1022,10 @@ def calculate_and_save_occupancy_analysis(
     num_workers: int = 1,
     return_transformed_df: bool = False,
 ):
-    """Performs behavior-specific occupancy analysis by reading from the HDF5 store.
+    """Transform positions by animal and generate requested occupancy reports.
 
-    When ``save_outputs`` is True, this writes the
-    transformed positional CSV plus the occupancy/geometry report outputs.
-
-    When ``save_outputs`` is False and ``return_transformed_df`` is True, the
-    transformed positional substrate is returned directly in memory so matrix-first
-    shard finalization can skip the CSV write/read round-trip.
+    When reports are disabled, return the transformed substrate in memory only if
+    requested for matrix finalization.
     """
 
     print("\nStarting geometric and postural analysis...")
@@ -1171,6 +1044,7 @@ def calculate_and_save_occupancy_analysis(
             chamber_diameter_px=chamber_diameter_px,
             generate_quiver_plots=generate_quiver_plots,
             transformed_output_path=transformed_path,
+            num_workers=num_workers,
         )
 
         if acc is None:
@@ -1178,14 +1052,24 @@ def calculate_and_save_occupancy_analysis(
             return None
 
         print("\nGenerating and saving occupancy plots...")
-        _generate_radial_distribution_plots_from_acc(acc, output_dir)
+        radial = _generate_radial_distribution_plots_from_acc(acc, output_dir)
 
         print("\nGenerating and saving 2D occupancy heatmaps...")
-        _generate_2d_heatmaps_from_acc(acc, output_dir)
+        heatmaps = _generate_2d_heatmaps_from_acc(acc, output_dir)
 
         if generate_quiver_plots:
             print("\nGenerating and saving orientation quiver plots...")
-            _generate_orientation_quiver_plots_from_acc(acc, output_dir)
+            quiver = _generate_orientation_quiver_plots_from_acc(acc, output_dir)
+        else:
+            quiver = []
+        # Record only this run's applicable plots, including valid empty cases.
+        # Stale files in the output directory never establish completion.
+        artifacts = {Path(p).relative_to(output_dir).as_posix(): sha256_file(p)
+                     for p in [transformed_path, *radial, *heatmaps, *quiver]}
+        atomic_write_json({'artifacts': artifacts,
+            'plot_counts': {'radial': len(radial), 'heatmaps': len(heatmaps), 'quiver': len(quiver)},
+            'quiver_requested': bool(generate_quiver_plots)},
+            Path(output_dir)/'MMGEN_OCCUPANCY_OUTPUTS.json')
     else:
         fixed_arena_radius = _resolve_fixed_arena_radius(chamber_diameter_px)
         print("\nCalibrating arena and transforming coordinates for matrix-first spatial features...")
@@ -1235,14 +1119,8 @@ def calculate_and_save_occupancy_analysis(
 
     return transformed_path
 
-# ============================================================================
-# MASTER FEATURE MATRIX GENERATION
-# ============================================================================
 
 
-# ---------------------------------------------------------------------------
-# Feature matrix assembly helpers
-# ---------------------------------------------------------------------------
 from .feature_matrix import (
     _filter_features_by_bout_count,
     _infer_unit_for_feature_name,

@@ -1,23 +1,12 @@
-"""Feature selection / ablation utilities.
-
-This module provides a lightweight, fully deterministic way to define the *feature schema*
-used by posepred (and other Autobehaver stages) when the source HDF5 files contain more
-columns than a given experiment should use.
-
-Design goals
-------------
-1) Deterministic: the same inputs and ablation spec always produce the same ordered list.
-2) Auditable: the resolved plan can be saved (included/excluded lists + schema hash).
-3) Resume-safe: checkpoints can store the included list + schema hash and validate on resume.
-4) Lightweight: no heavy dependencies; safe to import at module import time.
-
-"""
+"""Resolve ordered feature schemas for PosePred inputs and checkpoint identity."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
+import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -32,12 +21,10 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # Presets
-# ---------------------------------------------------------------------------
 
 NO_POS_EXCLUDE_COLUMNS: list[str] = [
-    # Absolute position / angle information (commonly removed for generalization tests)
+    # Exclude absolute position and angle features in the no_pos preset.
     "centroid_x",
     "centroid_y",
     "angle_sin",
@@ -51,7 +38,6 @@ NO_POS_EXCLUDE_COLUMNS: list[str] = [
 
 
 PRESETS: dict[str, dict[str, list[str]]] = {
-    # No-op preset kept for explicitness.
     "none": {
         "exclude_columns": [],
         "exclude_keywords": [],
@@ -67,27 +53,15 @@ PRESETS: dict[str, dict[str, list[str]]] = {
 DEFAULT_PRESET: str = "no_pos"
 
 
-# ---------------------------------------------------------------------------
 # Data structures
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class FeaturePlan:
-    """A resolved feature selection plan.
+    """Store canonical, included and excluded feature names in order.
 
-    Attributes
-    ----------
-    canonical_columns:
-        Full ordered feature list from the reference schema (typically first HDF5).
-    included_columns:
-        Ordered feature list that will be fed into the model.
-    excluded_columns:
-        Ordered feature list that will be excluded (canonical minus included).
-    schema_hash:
-        SHA-256 hash derived from the *ordered* included_columns list.
-    spec:
-        The user-facing spec used to resolve this plan (preset, keywords, etc.).
+    ``schema_hash`` identifies the ordered model inputs; ``spec`` records the
+    selection rules used to obtain them.
     """
 
     canonical_columns: list[str]
@@ -110,14 +84,12 @@ class FeaturePlan:
         return json.dumps(self.to_json_dict(), indent=indent, sort_keys=True)
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def compute_schema_hash(included_columns: Sequence[str]) -> str:
     """Compute a stable hash for an ordered included-column list."""
-    # Order matters: join using a delimiter that cannot appear in column names by convention.
+    # Feature order contributes to checkpoint identity.
     payload = "\n".join(str(c) for c in included_columns).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -157,18 +129,11 @@ def _flatten_items(value: Any) -> list[str]:
             else:
                 out.append(str(v))
         return out
-    # Fallback: treat as scalar
     return [str(value)]
 
 
 def parse_csv_list_arg(value: str | Sequence[str] | None) -> list[str]:
-    """Parse a comma-separated CLI argument into a list.
-
-    Supports either:
-      - a single comma-separated string: "a,b,c"
-      - a list of strings (e.g. argparse with action='append')
-      - a list containing comma-separated strings
-    """
+    """Flatten comma- or whitespace-separated strings and lists into items."""
     flat = _flatten_items(value)
     items: list[str] = []
     for entry in flat:
@@ -221,27 +186,11 @@ def resolve_feature_plan(
     include_columns_file: str | Path | None = None,
     case_sensitive: bool = False,
 ) -> FeaturePlan:
-    """Resolve a FeaturePlan from canonical headers + an ablation/selection spec.
+    """Resolve an ordered input schema and its hash from canonical headers.
 
-    Parameters
-    ----------
-    headers:
-        Canonical ordered list of all available feature names.
-    preset:
-        Name of a preset in :data:`PRESETS`. If None, uses :data:`DEFAULT_PRESET`.
-    exclude_columns:
-        Explicit column names to exclude.
-    exclude_keywords:
-        Substrings; any feature whose name contains one of these will be excluded.
-    include_columns_file:
-        If provided, included columns are taken *exactly* from this file (one per line).
-        In this mode, exclude rules are not applied (except for validation).
-    case_sensitive:
-        Whether matching for exclude columns/keywords is case sensitive.
-
-    Returns
-    -------
-    FeaturePlan
+    An include file defines the order directly and bypasses exclusion rules.
+    Otherwise apply preset, exact-name and substring exclusions in canonical
+    order. Use ``case_sensitive`` for matching and reject an empty schema.
     """
     canonical_columns = [str(h) for h in headers]
     _validate_headers(canonical_columns)
@@ -252,7 +201,7 @@ def resolve_feature_plan(
             f"Unknown ablation preset '{chosen_preset}'. Available: {sorted(PRESETS.keys())}"
         )
 
-    # Mode 1: explicit include list file
+    # Explicit ordered schema.
     if include_columns_file is not None:
         included = read_columns_list_file(include_columns_file)
         if not included:
@@ -282,7 +231,7 @@ def resolve_feature_plan(
             spec=spec,
         )
 
-    # Mode 2: start from canonical, then exclude via preset + explicit rules.
+    # Canonical-order exclusions.
     preset_spec = PRESETS[chosen_preset]
     preset_ex_cols = list(preset_spec.get("exclude_columns", []))
     preset_ex_kw = list(preset_spec.get("exclude_keywords", []))
@@ -294,19 +243,25 @@ def resolve_feature_plan(
         [str(x) for x in preset_ex_kw] + [str(x) for x in parse_csv_list_arg(exclude_keywords)]
     )
 
-    # Precompute normalized match keys
     canon_norm = [_normalize_for_match(c, case_sensitive=case_sensitive) for c in canonical_columns]
     ex_cols_norm = {_normalize_for_match(c, case_sensitive=case_sensitive) for c in ex_cols}
     ex_kw_norm = [_normalize_for_match(k, case_sensitive=case_sensitive) for k in ex_kw]
+    if (preset_ex_cols or preset_ex_kw) and all(re.fullmatch(r'col_\d+', c) for c in canonical_columns):
+        raise ValueError(f'Semantic ablation preset {chosen_preset!r} requires meaningful feature headers. '
+                         'Supply the original schema or explicitly select preset none.')
+    unmatched_columns = [str(c) for c in parse_csv_list_arg(exclude_columns)
+                         if _normalize_for_match(str(c), case_sensitive=case_sensitive) not in canon_norm]
+    unmatched_keywords = [str(k) for k in parse_csv_list_arg(exclude_keywords)
+                          if not any(_normalize_for_match(str(k), case_sensitive=case_sensitive) in c for c in canon_norm)]
+    if unmatched_columns or unmatched_keywords:
+        logging.warning('Feature exclusions matched no columns: names=%s, keywords=%s', unmatched_columns, unmatched_keywords)
 
     included: list[str] = []
     excluded: list[str] = []
     for orig, norm in zip(canonical_columns, canon_norm):
         drop = False
-        # Exact column excludes
         if norm in ex_cols_norm:
             drop = True
-        # Keyword excludes
         if not drop and ex_kw_norm:
             for kw in ex_kw_norm:
                 if kw and kw in norm:
@@ -329,6 +284,8 @@ def resolve_feature_plan(
         "preset": chosen_preset,
         "exclude_columns": ex_cols,
         "exclude_keywords": ex_kw,
+        "unmatched_exclude_columns": unmatched_columns,
+        "unmatched_exclude_keywords": unmatched_keywords,
         "case_sensitive": bool(case_sensitive),
     }
     return FeaturePlan(

@@ -1,14 +1,7 @@
-"""Worker helpers for bout and sleep summary tables.
+"""Build recording-level MMGen bout and sleep summaries.
 
-This module contains the per-recording logic used by the mmgen multiprocessing
-worker to build:
-
-- Bout summary features for Pose / Pose+Orient / Orient categories.
-- Sleep summary features derived from Pose-only Standing bouts, with an
-  additional orientation-dominant breakdown when orientation labels exist.
-
-The code is moved out of the monolithic worker to make refactoring/testing
- easier while preserving behavior.
+Define sleep from standing duration and assign qualifying bouts to their dominant
+orientation when available.
 """
 
 from __future__ import annotations
@@ -20,6 +13,34 @@ import numpy as np
 import pandas as pd
 
 from .bouts import calculate_bout_summary_features, calculate_sleep_features
+from .categories import SUMMARY_LABELS
+
+
+def _complete_category_summary(bouts, category, num_frames, fps, observed):
+    """Absent events contribute zero rates; zero-event durations stay unknown."""
+    table = calculate_bout_summary_features(bouts, num_frames, fps=fps)
+    present = set(table['bout_type']) if not table.empty else set()
+    columns = ('bout_type','bout_frequency','bout_duration_mean_s',
+               'bout_duration_coeff_of_var','inter_bout_interval_mean_s',
+               'inter_bout_interval_std_s','initiation_prob','n_bouts','total_length_frames','observed_frames',
+               'observed_seconds','duration_sum_s','duration_sumsq_s',
+               'interval_count','interval_sum_s','interval_sumsq_s')
+    rows = []
+    for label in SUMMARY_LABELS[category]:
+        if label in present:
+            continue
+        row = {c: np.nan for c in columns}
+        row['bout_type'] = label
+        if observed and num_frames > 0:
+            row.update(bout_frequency=0.0, initiation_prob=0.0, n_bouts=0,
+                       total_length_frames=0, observed_frames=float(num_frames),
+                       observed_seconds=float(num_frames / fps), duration_sum_s=0.0,
+                       duration_sumsq_s=0.0, interval_count=0, interval_sum_s=0.0, interval_sumsq_s=0.0)
+        rows.append(row)
+    if rows:
+        table = pd.concat([table, pd.DataFrame(rows)], ignore_index=True)
+    table['category'] = category
+    return table
 
 
 def compute_bout_and_sleep_summaries(
@@ -36,6 +57,8 @@ def compute_bout_and_sleep_summaries(
     individual_id: str,
     sex: str,
     source_file: str,
+    masked_poses: Optional[np.ndarray] = None,
+    switch_counts: Optional[dict] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Compute bout summary and sleep summary tables for a single recording.
 
@@ -67,39 +90,44 @@ def compute_bout_and_sleep_summaries(
     bout_summary_df, sleep_summary_df
     """
 
-    # ------------------------------------------------------------------
     # Bout summaries (Pose / Pose+Orient / Orient)
-    # ------------------------------------------------------------------
-    pose_summary_df = calculate_bout_summary_features(pose_bouts, num_frames, fps=fps)
-    if not pose_summary_df.empty:
-        pose_summary_df["category"] = "Pose"
+    pose_frames = sum(pd.notna(v) and v != '' for v in masked_poses) if masked_poses is not None else num_frames
+    orient_frames = sum(pd.notna(v) and v != '' for v in masked_orients) if masked_orients is not None else 0
+    pair_frames = sum(pd.notna(p) and p != '' and pd.notna(o) and o != ''
+                      for p, o in zip(masked_poses, masked_orients)) if masked_poses is not None and masked_orients is not None else orient_frames
+    pose_observed = pose_frames > 0
+    orient_observed = has_orient and orient_frames > 0
+    pose_summary_df = _complete_category_summary(pose_bouts, "Pose", pose_frames, fps, pose_observed)
 
-    pose_orient_summary_df = calculate_bout_summary_features(
-        pose_orient_bouts_for_boutsummary, num_frames, fps=fps
-    )
-    if not pose_orient_summary_df.empty:
-        pose_orient_summary_df["category"] = "Pose+Orient"
+    pose_orient_summary_df = pd.DataFrame()
+    if has_orient:
+        pair_observed = pair_frames > 0
+        pose_orient_summary_df = _complete_category_summary(
+            pose_orient_bouts_for_boutsummary, "Pose+Orient", pair_frames, fps, pair_observed)
 
-    orient_summary_df = calculate_bout_summary_features(
-        orient_bouts_for_boutsummary, num_frames, fps=fps
-    )
-    if not orient_summary_df.empty:
-        orient_summary_df["category"] = "Orient"
+    orient_summary_df = pd.DataFrame()
+    if has_orient:
+        orient_summary_df = _complete_category_summary(
+            orient_bouts_for_boutsummary, "Orient", orient_frames, fps, orient_observed)
 
     bout_summary_df = pd.concat(
         [pose_summary_df, pose_orient_summary_df, orient_summary_df], ignore_index=True
     )
     if not bout_summary_df.empty:
+        if switch_counts is not None:
+            observed_by_category = {'Pose': pose_observed, 'Orient': orient_observed,
+                                    'Pose+Orient': pair_observed if has_orient else False}
+            bout_summary_df['n_switches'] = [
+                float(switch_counts.get(cat, {}).get(label, 0)) if observed_by_category[cat] else np.nan
+                for cat, label in zip(bout_summary_df['category'], bout_summary_df['bout_type'])]
         bout_summary_df["group"] = group
         bout_summary_df["individual"] = individual_id
         bout_summary_df["sex"] = sex
         bout_summary_df["source_file"] = source_file
 
-    # ------------------------------------------------------------------
     # Sleep summaries
-    # ------------------------------------------------------------------
     # Define sleep bouts using Pose-only Standing (robust to orientation blips)
-    standing_pose_bouts = [b for b in pose_bouts if "Standing" in str(b.get("label", ""))]
+    standing_pose_bouts = [b for b in pose_bouts if "Standing" in str(b.get("label", "")) and b.get("complete", True)]
 
     # 1) General (orientation-nonspecific) sleep features
     sleep_general_df = calculate_sleep_features(
@@ -108,11 +136,15 @@ def compute_bout_and_sleep_summaries(
         fps=fps,
         sleep_threshold_frames=sleep_threshold_frames,
     )
+    if sleep_general_df.empty and pose_observed and num_frames > 0:
+        sleep_general_df = pd.DataFrame([dict(bout_type='Standing', n_sleep_bouts=0,
+            sleep_bout_duration_mean_s=np.nan, sleep_bout_duration_std_s=np.nan,
+            total_sleep_time_s=0.0, total_length_frames=0, sleep_time_budget=0.0)])
 
     # 2) Orientation-specific sleep features (derived from sleep bouts)
     sleep_orient_df = pd.DataFrame()
-    if has_orient and masked_orients is not None:
-        # Define the canonical orientation set you care about
+    if pose_observed and has_orient and masked_orients is not None:
+        # Use the declared orientation categories for sleep summaries.
         orient_order_sleep = ["Floor", "Ceiling", "Wall-Side", "Wall-Up", "Wall-Down"]
         # Include Unknown so we don't silently lose bouts if orientation is missing
         orient_order_sleep_with_unknown = orient_order_sleep + ["Unknown"]
@@ -220,6 +252,7 @@ def compute_bout_and_sleep_summaries(
             sleep_summary_df = sleep_summary_df.rename(
                 columns={"total_length_frames": "sleep_total_length_frames"}
             )
+        sleep_summary_df["observed_frames"] = float(pose_frames)
         # Add metadata columns for later aggregation
         sleep_summary_df["group"] = group
         sleep_summary_df["individual"] = individual_id

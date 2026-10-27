@@ -1,0 +1,34 @@
+Pipeline examples using stage defaults. Run from the package root after selecting
+the project path, recording metadata, model resources and experimental group labels.
+Use each stage's --help for additional settings. Run manifests record resolved options.
+
+MovieChecker
+python -m autobehaver.preinf.moviechecker --main_dir ./my_autobehaver_project
+
+Autocropper
+python -m autobehaver.preinf.autocropper --main_dir ./my_autobehaver_project --recording_database_dir ./my_autobehaver_project/rec_data/trials --require_exclusions --num_workers 8
+
+DeepLabCut
+python -m autobehaver.preinf.dlc --main_dir ./my_autobehaver_project --dlc_config ./autobehaver/resources/dlc/m1/config.yaml
+
+KeyPre
+python -m autobehaver.preinf.keypre --main_dir ./my_autobehaver_project --num_workers 8
+
+KeyPreNorm
+python -m autobehaver.preinf.keyprenorm --main_dir ./my_autobehaver_project --norm_params ./autobehaver/resources/norm_params/norm_params.csv --num_workers 8
+
+PosePred inference (default final three-model ensemble)
+python -m autobehaver.preinf.posepred_inference --main_dir ./my_autobehaver_project --num_workers 8
+
+MMGen
+python -m autobehaver.postinf.mmgen --main_dir ./my_autobehaver_project --master_matrix --full_outputs --num_workers 8
+
+FeatureImp (replace CONTROL and MUTANT with the matrix's actual group labels)
+python -m autobehaver.postinf.featureimp --main_dir ./my_autobehaver_project --stage all --analysis_run_name featureimp_analysis --control_group_tag CONTROL --training_group_a CONTROL --training_group_b MUTANT --run_fsea_analysis --run_pca_analysis --num_workers 8
+
+InfMovie (two-second excerpt from a selected recording)
+python -m autobehaver.postinf.infmovie --main_dir ./my_autobehaver_project --mode manual --recording_id YOUR_RECORDING_ID --start_sec 0 --duration_sec 2
+
+Optional reporting: add --resource-monitor and, if needed, --resource-monitor-output DIR.
+Use MMGen --resume for interrupted work; successful complete runs remove temporary
+stores by default. Keep the original package version for staged or resumed runs.

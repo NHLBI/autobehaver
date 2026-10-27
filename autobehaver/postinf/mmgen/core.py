@@ -1,26 +1,28 @@
-"""Core runner for mmgen.
+"""Resolve MMGen runtime options and dispatch master-matrix workflows.
 
-This module owns the configuration object and the single top-level callable
-entrypoint for master-matrix generation. Runtime settings are now resolved once
-per run and passed explicitly into the orchestrator instead of mutating
-module-level variables across the package.
+Pass run settings explicitly to processing and finalization helpers.
 """
 
 from __future__ import annotations
 
+from autobehaver.cli_summary import reported_stage, completion_details
+
 import os
 import random
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+from autobehaver.completion import verified_run
 
 from . import pipeline
 from .append_mode import run_mmgen_append_new_data
-from .locks import DirLock
-from .runtime import MMGenRuntimeSettings
+from .locks import DirLock, ShardLock
+from .publication import canonical_generation
+from .runtime import MMGenRuntimeSettings, validate_calibration
+from .hdf_store import cleanup_verified_temp_stores
 from .shard_merge import merge_shard_temp_stores
 from .matrix_parts import finalize_shard_temp_store, get_shard_output_dir, merge_matrix_part_files
 
@@ -40,6 +42,7 @@ class MMGenConfig:
     inf_tag: str = "_normalized_inference"
     min_bout: int = 5
     edge_skip: int = 5
+    source_frame_offset: int = 0
 
     num_workers: int = 16
     random_seed: int = 42
@@ -55,7 +58,7 @@ class MMGenConfig:
     min_bout_count_for_features: int = 6
     min_bout_count_for_transitions: int = 6
 
-    keep_temp_files: bool = True
+    keep_temp_files: bool = False
     emit_master_matrix: bool = True
     emit_full_outputs: bool = True
 
@@ -63,11 +66,13 @@ class MMGenConfig:
     finalize_only: bool = False
     process_only: bool = False
     file_filter: str | None = None
+    file_list: str | None = None
     input_batch_size: int = 20
 
     chamber_diameter_px: Optional[int] = 530
     mm_per_px: Optional[float] = 0.0169896744624207
     video_fps: Optional[float] = 40.0
+    allow_unsafe_alignment_fallback: bool = False
 
     num_shards: int = 1
     shard_index: int = 0
@@ -89,6 +94,7 @@ class MMGenConfig:
         inf_tag: str = "_normalized_inference",
         min_bout: int = 5,
         edge_skip: int = 5,
+        source_frame_offset: int = 0,
         num_workers: int = 16,
         random_seed: int = 42,
         make_measurements: bool = True,
@@ -100,7 +106,7 @@ class MMGenConfig:
         filter_features_by_bout_count: bool = True,
         min_bout_count_for_features: int = 6,
         min_bout_count_for_transitions: int = 6,
-        keep_temp_files: bool = True,
+        keep_temp_files: bool = False,
         emit_master_matrix: bool = True,
         emit_full_outputs: bool = True,
         resume: bool = False,
@@ -111,6 +117,7 @@ class MMGenConfig:
         chamber_diameter_px: Optional[int] = 530,
         mm_per_px: Optional[float] = 0.0169896744624207,
         video_fps: Optional[float] = 40.0,
+        allow_unsafe_alignment_fallback: bool = False,
         num_shards: int = 1,
         shard_index: int = 0,
         shard_by: str = "hash",
@@ -121,8 +128,12 @@ class MMGenConfig:
         append_new_data: bool = False,
         plan_only: bool = False,
         append_batch_id: str | None = None,
+        file_list: str | None = None,
         **kwargs: Any,
     ) -> None:
+        """Resolve canonical runtime arguments and supported aliases, rejecting unknown
+        or conflicting options.
+        """
         if kwargs:
             unexpected = ", ".join(sorted(kwargs.keys()))
             raise TypeError(f"Unexpected MMGenConfig argument(s): {unexpected}")
@@ -140,6 +151,9 @@ class MMGenConfig:
         self.inf_tag = str(inf_tag)
         self.min_bout = int(min_bout)
         self.edge_skip = int(edge_skip)
+        if int(source_frame_offset) != source_frame_offset or source_frame_offset < 0:
+            raise ValueError("source_frame_offset must be a nonnegative integer")
+        self.source_frame_offset = int(source_frame_offset)
         self.num_workers = int(num_workers)
         self.random_seed = int(random_seed)
         self.make_measurements = bool(make_measurements)
@@ -158,10 +172,12 @@ class MMGenConfig:
         self.finalize_only = bool(finalize_only)
         self.process_only = bool(process_only)
         self.file_filter = file_filter
+        self.file_list = file_list
         self.input_batch_size = int(input_batch_size)
         self.chamber_diameter_px = None if chamber_diameter_px is None else int(chamber_diameter_px)
         self.mm_per_px = None if mm_per_px is None else float(mm_per_px)
         self.video_fps = None if video_fps is None else float(video_fps)
+        self.allow_unsafe_alignment_fallback = bool(allow_unsafe_alignment_fallback)
         self.num_shards = int(num_shards)
         self.shard_index = int(shard_index)
         self.shard_by = str(shard_by)
@@ -172,6 +188,10 @@ class MMGenConfig:
         self.append_new_data = bool(append_new_data)
         self.plan_only = bool(plan_only)
         self.append_batch_id = append_batch_id
+        validate_calibration(mm_per_px=self.mm_per_px, video_fps=self.video_fps,
+                             chamber_diameter_px=self.chamber_diameter_px)
+        if self.plan_only and not self.append_new_data:
+            raise ValueError('plan_only requires append_new_data')
 
     @property
     def runtime_settings(self) -> MMGenRuntimeSettings:
@@ -180,16 +200,17 @@ class MMGenConfig:
 
 
 
-def _acquire_mmgen_shard_lifecycle_lock(*, output_dir: str, num_shards: int, shard_index: int, shard_by: str) -> tuple[DirLock, Path]:
+def _acquire_mmgen_shard_lifecycle_lock(*, output_dir: str, num_shards: int, shard_index: int, shard_by: str) -> tuple[ShardLock, Path]:
+    """Lock one MMGen shard before processing or shard-local finalization."""
     shard_dir = Path(get_shard_output_dir(output_dir, int(num_shards), int(shard_index)))
     work_dir = shard_dir / "_mmgen_work"
     work_dir.mkdir(parents=True, exist_ok=True)
     shard_lock_dir = work_dir / "_mmgen_shard.lock"
-    shard_lock = DirLock(shard_lock_dir, timeout_sec=0.0)
+    shard_lock = ShardLock(shard_lock_dir, timeout_sec=0.0)
     try:
         shard_lock.acquire(
             metadata={
-                "kind": "mmgen_shard_matrix_first_lifecycle",
+                "kind": "mmgen_shard_lifecycle",
                 "num_shards": int(num_shards),
                 "shard_index": int(shard_index),
                 "shard_by": str(shard_by),
@@ -201,18 +222,20 @@ def _acquire_mmgen_shard_lifecycle_lock(*, output_dir: str, num_shards: int, sha
         )
     except Exception as e:
         raise RuntimeError(
-            "[mmgen] Shard lifecycle lock already exists. Another shard processing/finalize job may already be running "
+            "[mmgen] Cannot acquire the shard writer lock. Another processing/finalize job may be running "
             "for the same (num_shards, shard_index).\n"
             f"  shard: {int(shard_index)}/{int(num_shards)-1}\n"
             f"  lock: {shard_lock_dir}\n\n"
-            "If you are sure no shard job is running, delete the lock directory and retry. "
+            "Native locks release automatically when their writer exits. "
             f"(Original error: {e})"
         )
     return shard_lock, shard_lock_dir
 
-def run_mmgen(cfg: MMGenConfig) -> None:
+def _dispatch_mmgen(cfg: MMGenConfig) -> None:
     """Run master matrix generation."""
 
+    operation = "planning" if cfg.plan_only else "finalization" if (cfg.merge_shards or cfg.merge_matrix_parts or cfg.finalize_only) else "shard finalization" if cfg.finalize_shard_matrix else "shard" if cfg.num_shards > 1 else "processing" if cfg.process_only else "analysis"
+    completion_details(stage=f"MMGen {operation}", output=cfg.output_dir)
     if not os.path.isdir(cfg.inference_csv_dir):
         raise FileNotFoundError(f"Inference CSV directory not found: {cfg.inference_csv_dir}")
     if not os.path.isdir(cfg.poscalc_dir):
@@ -256,7 +279,7 @@ def run_mmgen(cfg: MMGenConfig) -> None:
             raise RuntimeError(
                 "[mmgen] Matrix-part merge lock already exists. Another matrix merge job may already be running for this output directory.\n"
                 f"  lock: {merge_lock_dir}\n\n"
-                "If you are sure no matrix merge job is running, delete the lock directory and retry. "
+                "If you are sure no matrix merge job is running, wait for the active writer; native locks release on exit. "
                 f"(Original error: {e})"
             )
         try:
@@ -281,8 +304,9 @@ def run_mmgen(cfg: MMGenConfig) -> None:
             min_bout=int(cfg.min_bout),
             edge_skip=int(cfg.edge_skip),
             inf_tag=str(cfg.inf_tag),
-            runtime_settings=runtime_settings,
+            runtime_settings=replace(runtime_settings, keep_temp_files=True),
             file_filter=cfg.file_filter,
+            file_list=cfg.file_list,
             num_shards=int(cfg.num_shards),
             shard_index=int(cfg.shard_index),
             shard_by=str(cfg.shard_by),
@@ -306,12 +330,14 @@ def run_mmgen(cfg: MMGenConfig) -> None:
             raise RuntimeError(
                 "[mmgen] Merge lock already exists. Another merge/finalize job may already be running for this output directory.\n"
                 f"  lock: {merge_lock_dir}\n\n"
-                "If you are sure no merge job is running, delete the lock directory and retry. "
+                "If you are sure no merge job is running, wait for the active writer; native locks release on exit. "
                 f"(Original error: {e})"
             )
 
         try:
-            merge_shard_temp_stores(output_folder=cfg.output_dir, num_shards=int(cfg.num_shards), strict_missing=True)
+            verified_store_identities: list[tuple[str, str]] = []
+            merge_shard_temp_stores(output_folder=cfg.output_dir, num_shards=int(cfg.num_shards),
+                                    strict_missing=True, verified_store_identities=verified_store_identities)
             pipeline.run_post_inference_analysis(
                 cfg.inference_csv_dir,
                 cfg.poscalc_dir,
@@ -324,10 +350,13 @@ def run_mmgen(cfg: MMGenConfig) -> None:
                 finalize_only=True,
                 process_only=False,
                 file_filter=cfg.file_filter,
+                file_list=cfg.file_list,
                 num_shards=1,
                 shard_index=0,
                 shard_by="hash",
             )
+            if not cfg.keep_temp_files:
+                cleanup_verified_temp_stores(cfg.output_dir, verified_store_identities)
         finally:
             try:
                 merge_lock.release()
@@ -361,6 +390,7 @@ def run_mmgen(cfg: MMGenConfig) -> None:
                     finalize_only=False,
                     process_only=True,
                     file_filter=cfg.file_filter,
+                    file_list=cfg.file_list,
                     num_shards=int(cfg.num_shards),
                     shard_index=int(cfg.shard_index),
                     shard_by=str(cfg.shard_by),
@@ -373,8 +403,9 @@ def run_mmgen(cfg: MMGenConfig) -> None:
                     min_bout=int(cfg.min_bout),
                     edge_skip=int(cfg.edge_skip),
                     inf_tag=str(cfg.inf_tag),
-                    runtime_settings=runtime_settings,
+                    runtime_settings=replace(runtime_settings, keep_temp_files=bool(cfg.keep_temp_files or cfg.resume)),
                     file_filter=cfg.file_filter,
+                    file_list=cfg.file_list,
                     num_shards=int(cfg.num_shards),
                     shard_index=int(cfg.shard_index),
                     shard_by=str(cfg.shard_by),
@@ -393,19 +424,48 @@ def run_mmgen(cfg: MMGenConfig) -> None:
             )
             cfg.process_only = True
 
-    pipeline.run_post_inference_analysis(
-        cfg.inference_csv_dir,
-        cfg.poscalc_dir,
-        cfg.output_dir,
-        int(cfg.min_bout),
-        int(cfg.edge_skip),
-        str(cfg.inf_tag),
-        runtime_settings=runtime_settings,
-        resume=bool(cfg.resume),
-        finalize_only=bool(cfg.finalize_only),
-        process_only=bool(cfg.process_only),
-        file_filter=cfg.file_filter,
-        num_shards=int(cfg.num_shards),
-        shard_index=int(cfg.shard_index),
-        shard_by=str(cfg.shard_by),
-    )
+    shard_lifecycle_lock = None
+    if int(cfg.num_shards) > 1:
+        shard_lifecycle_lock, _ = _acquire_mmgen_shard_lifecycle_lock(
+            output_dir=cfg.output_dir, num_shards=int(cfg.num_shards),
+            shard_index=int(cfg.shard_index), shard_by=str(cfg.shard_by),
+        )
+    try:
+        pipeline.run_post_inference_analysis(
+            cfg.inference_csv_dir,
+            cfg.poscalc_dir,
+            cfg.output_dir,
+            int(cfg.min_bout),
+            int(cfg.edge_skip),
+            str(cfg.inf_tag),
+            runtime_settings=runtime_settings,
+            resume=bool(cfg.resume),
+            finalize_only=bool(cfg.finalize_only),
+            process_only=bool(cfg.process_only),
+            file_filter=cfg.file_filter,
+            file_list=cfg.file_list,
+            num_shards=int(cfg.num_shards),
+            shard_index=int(cfg.shard_index),
+            shard_by=str(cfg.shard_by),
+            caller_holds_shard_lock=shard_lifecycle_lock is not None,
+        )
+    finally:
+        # Completion records certify outputs. The lock only excludes a live
+        # competing writer and must be released after an ordinary exception.
+        if shard_lifecycle_lock is not None:
+            shard_lifecycle_lock.release()
+
+
+@reported_stage("MMGen")
+@verified_run
+def run_mmgen(cfg: MMGenConfig) -> None:
+    """Use one canonical owner across ordinary, classic, and matrix publication."""
+    if not os.path.isdir(cfg.inference_csv_dir):
+        raise FileNotFoundError(f"Inference CSV directory not found: {cfg.inference_csv_dir}")
+    if not os.path.isdir(cfg.poscalc_dir):
+        raise FileNotFoundError(f"Keypoint-feature directory not found: {cfg.poscalc_dir}")
+    canonical = not cfg.append_new_data and (int(cfg.num_shards) <= 1 or cfg.merge_shards or cfg.merge_matrix_parts)
+    if canonical:
+        with canonical_generation(cfg.output_dir, producing=not cfg.process_only):
+            return _dispatch_mmgen(cfg)
+    return _dispatch_mmgen(cfg)

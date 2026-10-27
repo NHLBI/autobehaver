@@ -1,4 +1,4 @@
-"""Egocentric transforms (center + rotate) and asymmetry features."""
+"""Transform keypoints into the fly-centered frame and derive asymmetry."""
 
 from __future__ import annotations
 
@@ -13,15 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 def add_centered_and_rotated_keypoints(input_df, parts):
-    """Create *_centered_(x/y) and *_rotated_(x/y) columns in input_df.
+    """Center keypoints on the centroid and rotate them into the body frame.
 
-    Output convention (egocentric Euclidean frame):
-      - centroid is (0, 0)
-      - +y is forward/anterior ("up")
-      - +x is fly-right
-
-    NOTE: DLC image coords are +y down, so we rotate in image coords and then flip the
-    rotated y-axis to produce a standard Cartesian (+y up) frame.
+    The centroid is (0, 0), +y is anterior, and +x is fly-right. DeepLabCut image
+    coordinates have +y down; rotate there, then flip the rotated y-axis.
     """
 
     centered_columns = {}
@@ -61,11 +56,11 @@ def add_centered_and_rotated_keypoints(input_df, parts):
 
 
 def calculate_asymmetry_features(df, asymmetry_lr_pairs, asymmetry_tb_pairs):
-    """Compute asymmetry features using rotated keypoints (egocentric frame)."""
+    """Calculate absolute left/right and top/bottom asymmetries in the rotated frame."""
 
     asym_data_cols = {}
 
-    # --- 1) Left/Right asymmetry ---
+    # 1) Left/Right asymmetry
     for part1, part2, name in asymmetry_lr_pairs:
         p1x, p1y = f"{part1}_rotated_x", f"{part1}_rotated_y"
         p2x, p2y = f"{part2}_rotated_x", f"{part2}_rotated_y"
@@ -77,7 +72,7 @@ def calculate_asymmetry_features(df, asymmetry_lr_pairs, asymmetry_tb_pairs):
         # along-body mismatch
         asym_data_cols[f"asym_lr_y_{name}"] = np.abs(df[p1y] - df[p2y])
 
-    # --- 2) Top/Bottom asymmetry (same logic for consistency) ---
+    # 2) Top/Bottom asymmetry (same logic for consistency)
     for part1, part2, name in asymmetry_tb_pairs:
         p1x, p1y = f"{part1}_rotated_x", f"{part1}_rotated_y"
         p2x, p2y = f"{part2}_rotated_x", f"{part2}_rotated_y"
@@ -96,7 +91,7 @@ def calculate_asymmetry_features(df, asymmetry_lr_pairs, asymmetry_tb_pairs):
 
 
 def add_asymmetry_features(input_df, poscorr_dict):
-    """Compute asymmetry features from rotated coords and store them in poscorr_dict."""
+    """Add rotated-coordinate asymmetry features to the ordered feature mapping."""
 
     input_df, created_cols = calculate_asymmetry_features(
         input_df,

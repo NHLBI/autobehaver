@@ -1,8 +1,4 @@
-"""CLI for the manual movie checker.
-
-The movie checker is designed to be run locally (with a display) and writes an
-``exclusions.csv`` file in the full-movies folder.
-"""
+"""Review full-frame movies and save manual chamber exclusions."""
 
 from __future__ import annotations
 
@@ -10,69 +6,29 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
 
-import yaml
 
-from autobehaver.argparse_utils import add_bool_pair
-from autobehaver.pipeline_layout import apply_main_dir_overrides, config_main_dir_default
+from autobehaver.argparse_utils import add_bool_pair, parse_cli_args
+from autobehaver.resource_monitor import add_monitor_arguments, monitored_cli, record_settings
+from autobehaver.pipeline_layout import apply_main_dir_overrides
+from autobehaver.preinf.autocropper.recording_db import (
+    find_latest_recording_database_csv,
+    load_recording_database_index,
+)
 
 from .core import MovieCheckerApp
 
 
-def _load_config_defaults(config_path: str) -> Dict[str, Any]:
-    """Load moviechecker defaults from the global pipeline YAML config."""
-
-    cfg_path = Path(config_path).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
-    with cfg_path.open("r") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError("Pipeline config must be a YAML mapping (dict) at the top level")
-
-    base_dir = cfg_path.parent
-    resolved: Dict[str, Any] = {}
-
-    global_main_dir = config_main_dir_default(data, base_dir)
-    if global_main_dir:
-        resolved["main_dir"] = global_main_dir
-
-    section = data.get("moviechecker", {})
-    if section is None:
-        section = {}
-    if not isinstance(section, dict):
-        raise ValueError("Expected 'moviechecker' section in config to be a mapping (dict)")
-
-    path_keys = {"main_dir", "input_dir", "exclusions_csv"}
-    for k, v in section.items():
-        if k in path_keys and isinstance(v, str) and v.strip() != "":
-            p = Path(v.strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved[k] = str(p)
-        else:
-            resolved[k] = v
-
-    return resolved
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the MovieChecker command-line parser with runtime defaults."""
     p = argparse.ArgumentParser(description="Review full-frame movies and mark chamber exclusions")
 
-    p.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to global pipeline YAML config (reads the 'moviechecker:' section).",
-    )
 
     p.add_argument(
         "--input_dir",
         "-i",
         required=False,
-        help="Directory containing full-frame movies (flat folder; no subfolders expected).",
+        help='Directory containing full-frame movies; subfolders are not scanned.',
     )
 
     p.add_argument(
@@ -89,8 +45,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--exclusions_csv",
         default=None,
         help=(
-            "Path to exclusions.csv. Default: <input_dir>/exclusions.csv (recommended). "
-            "The file is intentionally CSV so you can manually edit it if needed."
+            'Path to the review-state CSV (default: <input_dir>/exclusions.csv).'
         ),
     )
 
@@ -100,7 +55,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Do not skip movies already listed in exclusions.csv. "
-            "By default, the tool skips already-reviewed movie pairs."
+            "By default, the tool skips already-reviewed movie pairs. "
+            "Cameras excluded entirely by recording metadata are always skipped."
         ),
     )
 
@@ -109,29 +65,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Show one frame and skip the next N-1 frames during playback. "
-            "Use 1 for every frame (default). This can make review feel much faster on 40 fps movies."
+            'Display one frame and skip the next N-1 during playback; use 1 to display every frame (default).'
         ),
     )
 
-    return p
+    p.add_argument(
+        "--recording_database_dir", default=None,
+        help="Directory containing crop_occupancy_*.csv or recording_database*.csv. "
+             "Defaults to <project>/rec_data/trials when present.",
+    )
+    p.add_argument(
+        "--recording_database_csv", default=None,
+        help="Explicit recording metadata CSV; overrides --recording_database_dir.",
+    )
+
+    return add_monitor_arguments(p)
 
 
+@monitored_cli("moviechecker")
 def main(argv: list[str] | None = None) -> None:
+    """Parse runtime options and run MovieChecker."""
+    parser = build_arg_parser()
     argv_list = list(argv) if argv is not None else sys.argv[1:]
 
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=str, default=None)
-    pre_args, _ = pre.parse_known_args(argv_list)
-
-    parser = build_arg_parser()
-
-    if pre_args.config:
-        defaults = _load_config_defaults(pre_args.config)
-        valid_dests = {a.dest for a in parser._actions}
-        parser.set_defaults(**{k: v for k, v in defaults.items() if k in valid_dests})
-
-    args = parser.parse_args(argv_list)
+    args = parse_cli_args(parser, argv_list)
+    record_settings(args)
     apply_main_dir_overrides(args, stage="moviechecker")
 
     if not args.input_dir:
@@ -142,11 +100,30 @@ def main(argv: list[str] | None = None) -> None:
     input_dir = os.path.abspath(str(args.input_dir))
     exclusions_csv = str(args.exclusions_csv) if args.exclusions_csv else os.path.join(input_dir, "exclusions.csv")
 
+    recording_index = None
+    source = None
+    if args.recording_database_csv:
+        source = Path(args.recording_database_csv).expanduser().resolve()
+    elif args.recording_database_dir:
+        source = find_latest_recording_database_csv(Path(args.recording_database_dir))
+    else:
+        project = Path(args.main_dir) if args.main_dir else Path(input_dir).parent
+        candidate = project / "rec_data" / "trials"
+        if candidate.exists():
+            source = candidate
+    if source is not None:
+        recording_index = load_recording_database_index(source)
+        print(f"Recording occupancy: {source}", flush=True)
+    else:
+        print("No recording occupancy selected; reviewing with manual exclusions only. "
+              "Use --recording_database_dir to load recording records.", flush=True)
+
     app = MovieCheckerApp(
         input_dir=input_dir,
         exclusions_csv_path=os.path.abspath(exclusions_csv),
         review_all=bool(args.review_all),
         playback_stride=max(1, int(args.playback_stride)),
+        recording_index=recording_index,
     )
     app.run()
 

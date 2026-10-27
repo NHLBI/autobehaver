@@ -1,12 +1,5 @@
-"""
-Reporting, formatting, and diagnostic output utilities for the feature importance pipeline.
-
-This module centralizes:
-- Validation summary printing and report writing
-- Excel/CSV formatting helpers for consolidated summaries and prediction outputs
-- Ensemble performance metric calculations
-
-FeatureImp reporting helpers for SHAP summary workbooks.
+"""Write FeatureImp validation reports, formatted SHAP and prediction workbooks, and
+binary ensemble metrics.
 """
 from __future__ import annotations
 
@@ -25,6 +18,7 @@ from openpyxl.utils import get_column_letter
 from sklearn.metrics import f1_score, roc_auc_score
 
 from .io_utils import _sanitize_excel_sheet_name
+from .io_utils import _atomic_excel_writer
 
 
 # For binary classification label encodings used throughout featureimp.
@@ -44,22 +38,22 @@ def _print_validation_summary(validation_results):
     skipped = sum(1 for check in validation_results['checks'].values() if check['status'] == 'SKIP')
     
     print(f"Total checks: {len(validation_results['checks'])}")
-    print(f"  ✓ Passed: {passed}")
-    print(f"  ⚠ Warnings: {warned}")
-    print(f"  ✗ Failed: {failed}")
-    print(f"  ✗ Errors: {errors}")
+    print(f"  âœ“ Passed: {passed}")
+    print(f"  âš  Warnings: {warned}")
+    print(f"  âœ— Failed: {failed}")
+    print(f"  âœ— Errors: {errors}")
     print(f"  - Skipped: {skipped}")
     
     if validation_results['has_errors']:
         print(f"\n[ERROR] {len(validation_results['errors'])} validation errors detected!")
-        for i, error in enumerate(validation_results['errors'][:5], 1):  # Show first 5
+        for i, error in enumerate(validation_results['errors'][:5], 1):  
             print(f"  {i}. {error}")
         if len(validation_results['errors']) > 5:
             print(f"  ... and {len(validation_results['errors']) - 5} more errors")
     
     if validation_results['has_warnings']:
         print(f"\n[WARNING] {len(validation_results['warnings'])} validation warnings:")
-        for i, warning in enumerate(validation_results['warnings'][:5], 1):  # Show first 5
+        for i, warning in enumerate(validation_results['warnings'][:5], 1):  
             print(f"  {i}. {warning}")
         if len(validation_results['warnings']) > 5:
             print(f"  ... and {len(validation_results['warnings']) - 5} more warnings")
@@ -139,10 +133,45 @@ def _save_validation_report(validation_results, paths):
 
 
 
-# ============================================================================
 # FILE I/O AND FORMATTING
-# ============================================================================
 
+
+
+def _consolidated_header(column):
+    """Parse known metric prefixes without splitting underscores in group names."""
+    text = str(column)
+    section = ""
+    for suffix, label in (("_OUTOFSAMPLE", "OUT-OF-SAMPLE"), ("_INSAMPLE", "IN-SAMPLE"),
+                          ("_POOLED", "POOLED"), ("_MALE", "MALE"), ("_FEMALE", "FEMALE")):
+        if text.endswith(suffix):
+            text, section = text[:-len(suffix)], label
+            break
+    if text in ("", " "):
+        return "", ""
+    if text in ("q_value", "eta_squared"):
+        return "Univariate", text
+    metrics = ("MeanSHAP_Diff_Abs_Norm", "MeanSHAP_Diff", "MeanAbsSHAP", "MeanSHAP", "StdSHAP",
+               "Direction_Agreement", "Stability_Ratio", "Rank_Correlation")
+    for metric in metrics:
+        prefix = metric + "_"
+        if text.startswith(prefix):
+            group = text[len(prefix):]
+            normalized = group.startswith("Normalized_") or group.endswith("_Normalized")
+            if group.startswith("Normalized_"):
+                group = group[len("Normalized_"):]
+            elif group.endswith("_Normalized"):
+                group = group[:-len("_Normalized")]
+            title = f"{group} ({section})" if section else group
+            return title, metric + ("_Normalized" if normalized else "")
+    return section, text
+
+
+def _graphpad_group_names(groups):
+    """Preserve original labels when sanitization would merge distinct groups."""
+    labels = [str(group) for group in groups]
+    sanitized = ["".join(c if c.isalnum() or c in ("-", "_") else "_" for c in label) for label in labels]
+    # Excel cell headers support punctuation, so use complete originals on collision.
+    return dict(zip(labels, labels if len(set(sanitized)) != len(sanitized) else sanitized))
 
 def _write_consolidated_summary_sheet_with_formatting(
     writer: pd.ExcelWriter,
@@ -163,193 +192,23 @@ def _write_consolidated_summary_sheet_with_formatting(
     workbook = writer.book
     worksheet = workbook[sheet_name]
 
-    # --- 2. Manually Write the 2-Level Header ---
+    # 2. Manually Write the 2-Level Header
     header_map: Dict[Any, Tuple[str, str]] = {}
     first_outofsample_col_idx = None
 
     for col_idx, col in enumerate(df.columns, 1):
-        col_str = str(col)
-        if col == 'feature_name':
-            header_map[col] = ('', col_str)
-        elif col == '' or col == ' ':
-            header_map[col] = ('', '')
-            if is_combined_insample_outofsample and first_outofsample_col_idx is None:
-                next_col_idx_0based = col_idx
-                if next_col_idx_0based < len(df.columns):
-                    next_col = str(df.columns[next_col_idx_0based])
-                    if next_col.endswith('_OUTOFSAMPLE') or next_col == 'Global_Importance_OUTOFSAMPLE':
-                        first_outofsample_col_idx = col_idx + 1
-        elif col_str.endswith('_INSAMPLE'):
-            base_col = col_str[:-9]
-            if base_col in {'Global_Importance', 'Global_Importance_Normalized', 'Global_Importance_Cumulative'}:
-                header_map[col] = ('IN-SAMPLE', base_col)
-            elif base_col.endswith('_Normalized') or '_Normalized_' in base_col:
-                metric_col = base_col[:-12] if base_col.endswith('_Normalized') else base_col.replace('_Normalized_', '_')
-                if metric_col.startswith('MeanSHAP_') or metric_col.startswith('MeanAbsSHAP_'):
-                    parts = metric_col.split('_')
-                    if len(parts) >= 2:
-                        top_header = f'{parts[-1]} (IN-SAMPLE)'
-                        metric = '_'.join(parts[:-1])
-                        bottom_header = f'{metric}_Normalized'
-                        header_map[col] = (top_header, bottom_header)
-                    else:
-                        header_map[col] = ('IN-SAMPLE', base_col)
-                else:
-                    header_map[col] = ('IN-SAMPLE', base_col)
-            else:
-                parts = base_col.split('_')
-                if len(parts) >= 2:
-                    top_header = parts[-1]
-                    bottom_header = '_'.join(parts[:-1])
-                    header_map[col] = (f'{top_header} (IN-SAMPLE)', bottom_header)
-                else:
-                    header_map[col] = ('IN-SAMPLE', base_col)
-        elif col_str.endswith('_OUTOFSAMPLE'):
-            base_col = col_str[:-12]
-            if base_col in {'Global_Importance', 'Global_Importance_Normalized', 'Global_Importance_Cumulative'}:
-                header_map[col] = ('OUT-OF-SAMPLE', base_col)
-            elif base_col.endswith('_Normalized') or '_Normalized_' in base_col:
-                metric_col = base_col[:-12] if base_col.endswith('_Normalized') else base_col.replace('_Normalized_', '_')
-                if metric_col.startswith('MeanSHAP_') or metric_col.startswith('MeanAbsSHAP_'):
-                    parts = metric_col.split('_')
-                    if len(parts) >= 2:
-                        top_header = f'{parts[-1]} (OUT-OF-SAMPLE)'
-                        metric = '_'.join(parts[:-1])
-                        bottom_header = f'{metric}_Normalized'
-                        header_map[col] = (top_header, bottom_header)
-                    else:
-                        header_map[col] = ('OUT-OF-SAMPLE', base_col)
-                else:
-                    header_map[col] = ('OUT-OF-SAMPLE', base_col)
-            else:
-                parts = base_col.split('_')
-                if len(parts) >= 2:
-                    top_header = parts[-1]
-                    bottom_header = '_'.join(parts[:-1])
-                    header_map[col] = (f'{top_header} (OUT-OF-SAMPLE)', bottom_header)
-                else:
-                    header_map[col] = ('OUT-OF-SAMPLE', base_col)
-            if is_combined_insample_outofsample and first_outofsample_col_idx is None:
-                first_outofsample_col_idx = col_idx
-        elif col_str.endswith('_POOLED'):
-            base_col = col_str[:-7]
-            if base_col in {'Global_Importance', 'Global_Importance_Normalized', 'Global_Importance_Cumulative'}:
-                header_map[col] = ('POOLED', base_col)
-            elif base_col.endswith('_Normalized') or '_Normalized_' in base_col:
-                metric_col = base_col[:-12] if base_col.endswith('_Normalized') else base_col.replace('_Normalized_', '_')
-                if metric_col.startswith('MeanSHAP_') or metric_col.startswith('MeanAbsSHAP_'):
-                    parts = metric_col.split('_')
-                    if len(parts) >= 2:
-                        top_header = f'{parts[-1]} (POOLED)'
-                        metric = '_'.join(parts[:-1])
-                        bottom_header = f'{metric}_Normalized'
-                        header_map[col] = (top_header, bottom_header)
-                    else:
-                        header_map[col] = ('POOLED', base_col)
-                else:
-                    header_map[col] = ('POOLED', base_col)
-            else:
-                parts = base_col.split('_')
-                if len(parts) >= 2:
-                    top_header = parts[-1]
-                    bottom_header = '_'.join(parts[:-1])
-                    header_map[col] = (f'{top_header} (POOLED)', bottom_header)
-                else:
-                    header_map[col] = ('POOLED', base_col)
-        elif col_str.endswith('_MALE'):
-            base_col = col_str[:-5]
-            if base_col in {'Global_Importance', 'Global_Importance_Normalized', 'Global_Importance_Cumulative'}:
-                header_map[col] = ('MALE', base_col)
-            elif base_col.endswith('_Normalized') or '_Normalized_' in base_col:
-                metric_col = base_col[:-12] if base_col.endswith('_Normalized') else base_col.replace('_Normalized_', '_')
-                if metric_col.startswith('MeanSHAP_') or metric_col.startswith('MeanAbsSHAP_'):
-                    parts = metric_col.split('_')
-                    if len(parts) >= 2:
-                        top_header = f'{parts[-1]} (MALE)'
-                        metric = '_'.join(parts[:-1])
-                        bottom_header = f'{metric}_Normalized'
-                        header_map[col] = (top_header, bottom_header)
-                    else:
-                        header_map[col] = ('MALE', base_col)
-                else:
-                    header_map[col] = ('MALE', base_col)
-            else:
-                parts = base_col.split('_')
-                if len(parts) >= 2:
-                    top_header = parts[-1]
-                    bottom_header = '_'.join(parts[:-1])
-                    header_map[col] = (f'{top_header} (MALE)', bottom_header)
-                else:
-                    header_map[col] = ('MALE', base_col)
-            if is_male_vs_female and first_outofsample_col_idx is None:
-                next_col_idx_0based = col_idx
-                if next_col_idx_0based < len(df.columns):
-                    next_col = str(df.columns[next_col_idx_0based])
-                    if next_col.endswith('_FEMALE') or next_col == 'Global_Importance_FEMALE':
-                        first_outofsample_col_idx = col_idx + 1
-        elif col_str.endswith('_FEMALE'):
-            base_col = col_str[:-7]
-            if base_col in {'Global_Importance', 'Global_Importance_Normalized', 'Global_Importance_Cumulative'}:
-                header_map[col] = ('FEMALE', base_col)
-            elif base_col.endswith('_Normalized') or '_Normalized_' in base_col:
-                metric_col = base_col[:-12] if base_col.endswith('_Normalized') else base_col.replace('_Normalized_', '_')
-                if metric_col.startswith('MeanSHAP_') or metric_col.startswith('MeanAbsSHAP_'):
-                    parts = metric_col.split('_')
-                    if len(parts) >= 2:
-                        top_header = f'{parts[-1]} (FEMALE)'
-                        metric = '_'.join(parts[:-1])
-                        bottom_header = f'{metric}_Normalized'
-                        header_map[col] = (top_header, bottom_header)
-                    else:
-                        header_map[col] = ('FEMALE', base_col)
-                else:
-                    header_map[col] = ('FEMALE', base_col)
-            else:
-                parts = base_col.split('_')
-                if len(parts) >= 2:
-                    top_header = parts[-1]
-                    bottom_header = '_'.join(parts[:-1])
-                    header_map[col] = (f'{top_header} (FEMALE)', bottom_header)
-                else:
-                    header_map[col] = ('FEMALE', base_col)
-            if is_male_vs_female and first_outofsample_col_idx is None:
-                first_outofsample_col_idx = col_idx
-        elif col_str == 'Global_Importance':
-            header_map[col] = ('', col_str)
-        elif col_str == 'Global_Importance_Normalized':
-            header_map[col] = ('', col_str)
-        elif col_str == 'Global_Importance_Cumulative':
-            header_map[col] = ('', col_str)
-        elif col_str.endswith('_Normalized') or '_Normalized_' in col_str:
-            base_col = col_str[:-12] if col_str.endswith('_Normalized') else col_str.replace('_Normalized_', '_')
-            if base_col.startswith('MeanSHAP_') or base_col.startswith('MeanAbsSHAP_'):
-                parts = base_col.split('_')
-                if len(parts) >= 2:
-                    top_header = parts[-1]
-                    metric = '_'.join(parts[:-1])
-                    bottom_header = f'{metric}_Normalized'
-                    header_map[col] = (top_header, bottom_header)
-                else:
-                    header_map[col] = ('', col_str)
-            else:
-                header_map[col] = ('', col_str)
-        elif col_str in ['q_value', 'eta_squared']:
-            header_map[col] = ('Univariate', col_str)
-        else:
-            parts = col_str.split('_')
-            if len(parts) >= 2:
-                top_header = parts[-1]
-                bottom_header = '_'.join(parts[:-1])
-                header_map[col] = (top_header, bottom_header)
-            else:
-                header_map[col] = ('', col_str)
+        header_map[col] = _consolidated_header(col)
+        if first_outofsample_col_idx is None and (
+            (is_combined_insample_outofsample and str(col).endswith("_OUTOFSAMPLE")) or
+            (is_male_vs_female and str(col).endswith("_FEMALE"))):
+            first_outofsample_col_idx = col_idx
 
     for col_idx, col_name in enumerate(df.columns, 1):
         top_header, bottom_header = header_map[col_name]
         worksheet.cell(row=1, column=col_idx).value = top_header
         worksheet.cell(row=2, column=col_idx).value = bottom_header
 
-    # --- 3. Merge Top-Level Header Cells ---
+    # 3. Merge Top-Level Header Cells
     header_row = worksheet[1]
     start_col_idx = 1
     current_header_val = header_row[0].value
@@ -372,7 +231,7 @@ def _write_consolidated_summary_sheet_with_formatting(
             start_col_idx = col_idx
             current_header_val = next_header_val
 
-    # --- 4. Define Styles ---
+    # 4. Define Styles
     bold_font = Font(bold=True)
     italic_font = Font(italic=True)
     bold_italic_font = Font(bold=True, italic=True)
@@ -401,7 +260,7 @@ def _write_consolidated_summary_sheet_with_formatting(
         worksheet.column_dimensions[col_letter].width = 50 if col == 'feature_name' else 18
     worksheet.freeze_panes = 'A3'
 
-    # --- 5. Apply Data Cell Formatting (Bolding, Borders, and Color Scale) ---
+    # 5. Apply Data Cell Formatting (Bolding, Borders, and Color Scale)
     df_cols = list(df.columns)
     feature_name_idx = df_cols.index('feature_name') + 1 if 'feature_name' in df_cols else -1
 
@@ -591,11 +450,11 @@ def save_consolidated_summary_sheets_with_formatting(
         if n not in ordered_names:
             ordered_names.append(n)
 
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    with _atomic_excel_writer(output_path) as writer:
         for name in ordered_names:
             df = sheets.get(name)
             if df is None:
-                continue
+                raise ValueError(f'Required consolidated sheet is None: {name}')
             _write_consolidated_summary_sheet_with_formatting(
                 writer,
                 df,
@@ -606,7 +465,7 @@ def save_consolidated_summary_sheets_with_formatting(
 
 
 def save_consolidated_summary_with_formatting(df, output_path, is_combined_insample_outofsample=False):
-    """Single-sheet formatting wrapper."""
+    """Write one formatted consolidated SHAP-summary workbook."""
 
     save_consolidated_summary_sheets_with_formatting(
         {"SHAP_Summary": df},
@@ -627,6 +486,9 @@ def save_predictions_with_formatting(df, output_path, extra_sheets=None, compari
     """
 
     def _apply_predictions_formatting(worksheet, df_cols):
+        """Apply shared prediction-sheet headers, widths, separators, and numeric
+        formats.
+        """
         bold_font = Font(bold=True)
         thick_black_side = Side(style='thick', color='000000')
         thin_grey_side = Side(style='thin', color='D3D3D3')
@@ -693,7 +555,7 @@ def save_predictions_with_formatting(df, output_path, extra_sheets=None, compari
     primary_sheet_name = str(primary_sheet_name)[:31]
     comparison_sheet_name = str(comparison_sheet_name)[:31]
 
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    with _atomic_excel_writer(output_path) as writer:
         df.to_excel(writer, sheet_name=primary_sheet_name, index=False)
         if comparison_df is not None:
             comparison_df.to_excel(writer, sheet_name=comparison_sheet_name, index=False)
@@ -753,6 +615,7 @@ def create_formatted_predictions_for_graphpad(all_predictions_df, training_group
     # Get all unique groups to identify non-training groups
     all_groups = all_predictions_df['group'].dropna().unique()
     non_training_groups = sorted([g for g in all_groups if g not in training_groups])
+    group_labels = _graphpad_group_names(non_training_groups)
     
     # Build formatted data dictionary (each key is a column name, value is array of probabilities)
     formatted_data = {}
@@ -765,7 +628,7 @@ def create_formatted_predictions_for_graphpad(all_predictions_df, training_group
         if f'Prob_{training_group_a}_outofsample' in all_predictions_df.columns:
             formatted_data[f'{safe_training_group_a}_training_group_A_outofsample'] = all_predictions_df.loc[group_a_mask, f'Prob_{training_group_a}_outofsample'].values
     
-    # Training Group B: in-sample and out-of-sample (IMPORTANT: use Prob_{training_group_a}, not Prob_{training_group_b})
+    # Express group B predictions as P(group A), matching the other export columns.
     group_b_mask = all_predictions_df['group'] == training_group_b
     if group_b_mask.sum() > 0:
         if f'Prob_{training_group_a}_insample' in all_predictions_df.columns:
@@ -778,7 +641,7 @@ def create_formatted_predictions_for_graphpad(all_predictions_df, training_group
         nt_mask = all_predictions_df['group'] == nt_group
         if nt_mask.sum() > 0 and f'Prob_{training_group_a}' in all_predictions_df.columns:
             # Sanitize group name for column name (replace spaces/special chars with underscore)
-            safe_group_name = "".join([c if c.isalnum() or c in ('-','_') else '_' for c in str(nt_group)])
+            safe_group_name = group_labels[str(nt_group)]
             formatted_data[f'{safe_group_name}_NonTraining'] = all_predictions_df.loc[nt_mask, f'Prob_{training_group_a}'].values
     
     # Pad all columns to same length (max length across all columns)
@@ -789,18 +652,15 @@ def create_formatted_predictions_for_graphpad(all_predictions_df, training_group
             if current_len < max_len:
                 formatted_data[key] = np.append(formatted_data[key], [np.nan] * (max_len - current_len))
         
-        # Create DataFrame
         formatted_main_df = pd.DataFrame(formatted_data)
     else:
         print("Warning: No data found for formatted output. Creating empty DataFrame.")
         formatted_main_df = pd.DataFrame()
     
     # Try to load permutation data
-    perm_file = os.path.join(
-        analysis_folder,
-        f'PERMUTED_{perm_idx}_RESULTS',
-        f'AVERAGED_PREDICTIONS_PERMUTED_{perm_idx}.xlsx'
-    )
+    candidates = [os.path.join(analysis_folder, 'PERMUTED_RESULTS', f'AVERAGED_PREDICTIONS_PERMUTED_{perm_idx}.xlsx'),
+                  os.path.join(analysis_folder, f'PERMUTED_{perm_idx}_RESULTS', f'AVERAGED_PREDICTIONS_PERMUTED_{perm_idx}.xlsx')]
+    perm_file = next((p for p in candidates if os.path.isfile(p)), candidates[0])
     
     formatted_perm_df = None
     if os.path.exists(perm_file):
@@ -832,10 +692,11 @@ def create_formatted_predictions_for_graphpad(all_predictions_df, training_group
             # Non-training groups
             perm_all_groups = perm_df['group'].dropna().unique()
             perm_non_training_groups = sorted([g for g in perm_all_groups if g not in training_groups])
+            perm_group_labels = _graphpad_group_names(perm_non_training_groups)
             for nt_group in perm_non_training_groups:
                 perm_nt_mask = perm_df['group'] == nt_group
                 if perm_nt_mask.sum() > 0 and f'Prob_{training_group_a}' in perm_df.columns:
-                    safe_group_name = "".join([c if c.isalnum() or c in ('-','_') else '_' for c in str(nt_group)])
+                    safe_group_name = perm_group_labels[str(nt_group)]
                     perm_formatted_data[f'{safe_group_name}_NonTraining'] = perm_df.loc[perm_nt_mask, f'Prob_{training_group_a}'].values
             
             # Pad permutation columns to same length
@@ -881,7 +742,7 @@ def create_formatted_predictions_for_graphpad(all_predictions_df, training_group
     
     # Save formatted output
     formatted_path = os.path.join(analysis_folder, f'AVERAGED_PREDICTIONS_FORMATTED_FOR_GRAPHPAD{file_suffix}.xlsx')
-    with pd.ExcelWriter(formatted_path, engine='openpyxl') as writer:
+    with _atomic_excel_writer(formatted_path) as writer:
         formatted_df.to_excel(writer, index=False, sheet_name='Sheet1')
         workbook = writer.book
         worksheet = workbook['Sheet1']
@@ -957,7 +818,7 @@ def calculate_ensemble_metrics(y_true, insample_probas, oof_probas, num_classes,
     insample_pred_classes = np.argmax(insample_probas, axis=1)
     oof_pred_classes = np.argmax(oof_probas, axis=1)
 
-    # Calculate F1 scores (binary classification) — explicitly define the positive label
+    # Calculate F1 scores (binary classification) â€” explicitly define the positive label
     metrics['f1_insample'] = f1_score(y_true, insample_pred_classes, average='binary', pos_label=POSITIVE_CLASS_INDEX)
     metrics['f1_outofsample'] = f1_score(y_true, oof_pred_classes, average='binary', pos_label=POSITIVE_CLASS_INDEX)
 

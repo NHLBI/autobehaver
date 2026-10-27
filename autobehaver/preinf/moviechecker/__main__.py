@@ -1,4 +1,4 @@
-"""Package entry point for the moviechecker stage."""
+"""Run the MovieChecker command-line entry point."""
 
 from .cli import main
 

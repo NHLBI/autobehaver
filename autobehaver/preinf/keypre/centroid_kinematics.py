@@ -1,4 +1,4 @@
-"""Centroid/body kinematics features for keypre."""
+"""Derive centroid speed, body-axis velocity, and their derivatives for KeyPre."""
 
 from __future__ import annotations
 
@@ -17,35 +17,15 @@ edge_skip = settings.edge_skip
 
 
 def calculate_vectorized_kinematics(dataframe, rolling_windows):
-    """Calculates vectorized kinematic features: speed, velocity_forward/strafe, and their derivatives.
+    """Derive centroid speed, forward/strafe velocity, acceleration, and jerk.
 
-    Definitions:
-      - speed_inst:
-          magnitude of the centroid velocity vector (pixels/frame)
-
-      - velocity_forward_inst:
-          projection of centroid velocity onto the body axis (toward the fly's front) (pixels/frame)
-
-      - velocity_strafe_inst:
-          projection of centroid velocity onto the perpendicular body axis (pixels/frame)
-
-      - acceleration_forward_inst / acceleration_strafe_inst:
-          time-derivative of the corresponding velocity components (pixels/frame^2)
-
-      - acceleration_speed_inst:
-          time-derivative of speed_inst, i.e. "speeding up vs slowing down" (pixels/frame^2).
-          NOTE: this is NOT the Euclidean magnitude of the 2D acceleration vector; it can be negative.
-
-      - jerk_forward_inst / jerk_strafe_inst:
-          time-derivative of the corresponding acceleration components (pixels/frame^3)
-
-      - jerk_speed_inst:
-          time-derivative of acceleration_speed_inst (pixels/frame^3)
-
-    Smoothed versions are computed via centered rolling means over the provided rolling_windows.
+    Use centered displacement (t+1 minus t-1)/2 in pixels per frame; derivatives
+    use pixels per frame squared/cubed. acceleration_speed_inst is the signed
+    speed derivative, not Euclidean acceleration magnitude. Fill missing
+    displacements and derivatives with zero and add centered rolling summaries.
     """
 
-    # --- Velocity Calculation ---
+    # Velocity Calculation
 
     # Centroid displacement over 2 frames (from t-1 to t+1)
     dx_raw = dataframe["centroid_x"].shift(-1) - dataframe["centroid_x"].shift(1)
@@ -78,32 +58,29 @@ def calculate_vectorized_kinematics(dataframe, rolling_windows):
     movement_vector_x = dx / 2.0
     movement_vector_y = dy / 2.0
 
-    # Feature 1: True speed (magnitude of movement vector)
+    # Speed is the magnitude of the centered centroid velocity.
     dataframe["speed_inst"] = np.sqrt(movement_vector_x**2 + movement_vector_y**2)
 
-    # Feature 2: Forward/Backward Velocity
+    # Forward velocity is positive toward Front.
     # Body axis vector (Back -> Front)
     body_axis_x = dataframe["Front_x"] - dataframe["Back_x"]
     body_axis_y = dataframe["Front_y"] - dataframe["Back_y"]
 
-    # Normalize body axis vector
     body_axis_mag = np.sqrt(body_axis_x**2 + body_axis_y**2).replace(
         0, 1e-6
     )  # Avoid division by zero
     norm_body_axis_x = body_axis_x / body_axis_mag
     norm_body_axis_y = body_axis_y / body_axis_mag
 
-    # Project movement vector onto body axis (dot product)
     dataframe["velocity_forward_inst"] = (movement_vector_x * norm_body_axis_x) + (
         movement_vector_y * norm_body_axis_y
     )
 
-    # Feature 3: Strafe Velocity (perpendicular to body axis)
+    # Project onto the perpendicular body axis for strafe velocity.
     # If body axis is the unit vector (ux, uy), a perpendicular unit vector is (-uy, ux).
     perp_body_axis_x = -norm_body_axis_y
     perp_body_axis_y = norm_body_axis_x
 
-    # Project movement vector onto the perpendicular axis (dot product)
     dataframe["velocity_strafe_inst"] = (movement_vector_x * perp_body_axis_x) + (
         movement_vector_y * perp_body_axis_y
     )
@@ -130,7 +107,7 @@ def calculate_vectorized_kinematics(dataframe, rolling_windows):
         ]
         dataframe[std_df.columns] = std_df
 
-    # --- Acceleration Calculation ---
+    # Acceleration Calculation
     # Calculate as the central difference of the instantaneous velocity components
     dataframe["acceleration_forward_inst"] = (
         (dataframe["velocity_forward_inst"].shift(-1) - dataframe["velocity_forward_inst"].shift(1))
@@ -158,7 +135,7 @@ def calculate_vectorized_kinematics(dataframe, rolling_windows):
         ]
         dataframe[mean_df.columns] = mean_df
 
-    # --- Jerk Calculation ---
+    # Jerk Calculation
     # Calculate as the central difference of the instantaneous acceleration components
     dataframe["jerk_forward_inst"] = (
         (dataframe["acceleration_forward_inst"].shift(-1) - dataframe["acceleration_forward_inst"].shift(1))
@@ -189,7 +166,7 @@ def calculate_vectorized_kinematics(dataframe, rolling_windows):
 
 
 def add_centroid_kinematics_features(input_df, poscorr_dict):
-    """Centroid speed/forward/strafe + accel/jerk (+ rolling windows) → store in poscorr_dict."""
+    """Add centroid speed, forward/strafe components, and derivatives to the feature mapping."""
 
     input_df = calculate_vectorized_kinematics(input_df, rolling_windows=rolling_windows)
 
@@ -222,7 +199,7 @@ def add_centroid_kinematics_features(input_df, poscorr_dict):
             if interval_col in input_df.columns:
                 poscorr_dict[interval_col] = input_df[interval_col]
 
-        # std features (only present for speed + velocity components currently)
+        # Standard deviations are defined only for speed and velocity components.
         for interval in intervals:
             if prefix == "speed":
                 std_col = f"speedstd_{interval}"

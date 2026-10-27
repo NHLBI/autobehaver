@@ -1,13 +1,14 @@
-"""Core logic for running DeepLabCut inference.
+"""Run DeepLabCut inference, validate outputs, and publish processing records.
 
-DeepLabCut and TensorFlow are imported lazily inside functions so that
-Autobehaver can be imported in environments where those optional dependencies
-are not installed.
+Import DeepLabCut and TensorFlow when needed so other stages remain importable
+without those optional dependencies.
 """
 
-# NOTE: This module intentionally avoids importing DeepLabCut at import-time.
-
 from __future__ import annotations
+
+from autobehaver.cli_summary import reported_stage, completion_details, validation_details
+
+from autobehaver.progress import progress, phase
 
 import glob
 import fnmatch
@@ -18,9 +19,21 @@ import os
 import re
 import sys
 import tempfile
+import hashlib
+import uuid
+from autobehaver.portable_paths import generated_path,original_name
+import shutil
+from autobehaver.completion import (receipt_matches, write_receipt, preserve_previous, verified_run,
+                                   file_digest, file_signature, remember_verified_digest, native_path)
+from autobehaver.scratch import scratch_workspace
+from .contract import model_identity, dlc_request
+from ..autocropper.selection import filter_included_paths, propagate_selection
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
+
+from autobehaver.validation import StageValidationReport
 
 from .config import DLCInferencerConfig
 
@@ -30,12 +43,11 @@ except Exception:  # pragma: no cover
     yaml = None
 
 
-# ---------------------------
 # Dependency helpers
-# ---------------------------
 
 
 def _require_deeplabcut():
+    """Import DeepLabCut or raise an environment-specific dependency error."""
     try:
         import deeplabcut  # type: ignore
 
@@ -43,11 +55,14 @@ def _require_deeplabcut():
     except Exception as e:  # pragma: no cover
         raise RuntimeError(
             "DeepLabCut is not available in this Python environment. "
-            "On the HPC, load the DLC module / activate the DLC conda env, then rerun."
+            "Keep Autobehaver in its supported main environment and pass "
+            "--dlc_python with the existing DLC interpreter or launcher "
+            "(for example, python-DLC after loading the cluster module)."
         ) from e
 
 
 def _require_tensorflow():
+    """Import TensorFlow or raise an environment-specific dependency error."""
     try:
         import tensorflow as tf  # type: ignore
 
@@ -59,13 +74,11 @@ def _require_tensorflow():
         ) from e
 
 
-# ---------------------------
 # Utilities
-# ---------------------------
 
 
 def setup_gpu() -> None:
-    """Configure GPU memory growth to prevent TF from reserving all GPU memory."""
+    """Enable TensorFlow GPU memory growth instead of reserving all device memory."""
     tf = _require_tensorflow()
 
     gpus = tf.config.experimental.list_physical_devices("GPU")
@@ -103,12 +116,10 @@ def resolve_videos(
     video_glob: Optional[str] = None,
     recursive: bool = False,
 ) -> List[str]:
-    """Resolve the list of video files to process.
+    """Resolve explicit videos or scan the input directory with an optional filename glob.
 
-    Priority:
-      1) explicit list (``videos``)
-      2) glob pattern (``video_glob``)
-      3) default: ``*{videotype}`` in input_dir
+    Basenames in the explicit list resolve under input_dir; relative paths with
+    directory components resolve from the current working directory.
     """
     input_dir = os.path.abspath(input_dir)
     if not os.path.isdir(input_dir):
@@ -127,7 +138,7 @@ def resolve_videos(
                 raise FileNotFoundError(f"Video not found: {cand}")
             resolved.append(cand)
     else:
-        pattern = video_glob if video_glob else f"*{videotype}"
+        pattern = f"*{videotype}"
         if recursive:
             search_pattern = os.path.join(input_dir, "**", pattern)
             matches = glob.glob(search_pattern, recursive=True)
@@ -140,9 +151,14 @@ def resolve_videos(
             m = os.path.abspath(m)
             if os.path.isdir(m):
                 continue
-            if "retry_attempt_" in Path(m).parts:
+            if any(part == '_old' or part.startswith('retry_attempt_')
+                   or part.startswith('.dlc-') for part in Path(m).relative_to(input_dir).parts[:-1]):
+                continue
+            if Path(m).stem.lower().endswith('_labeled'):
                 continue
             if videotype and not m.lower().endswith(videotype.lower()):
+                continue
+            if video_glob and not fnmatch.fnmatch(original_name(m), video_glob):
                 continue
             resolved.append(m)
 
@@ -150,8 +166,21 @@ def resolve_videos(
     return resolved
 
 
+def _validate_video_names(videos):
+    """DLC stages all inputs together and resolves them by native video stem."""
+    for label, name in (('native', lambda p: Path(p).stem),
+                        ('logical', lambda p: Path(original_name(p)).stem)):
+        seen = {}
+        for video in videos:
+            key = name(video).casefold()
+            if key in seen and Path(seen[key]).resolve() != Path(video).resolve():
+                raise ValueError(f'DLC {label} video name collision: {seen[key]}; {video}. '
+                                 'Select uniquely named recording inputs before analysis.')
+            seen[key] = video
+
+
 def load_config_bodyparts(config_path: str) -> Optional[List[str]]:
-    """Load bodyparts list from config.yaml if possible."""
+    """Read the bodypart list from config.yaml, returning None when unavailable."""
     if yaml is None:
         return None
     try:
@@ -165,13 +194,51 @@ def load_config_bodyparts(config_path: str) -> Optional[List[str]]:
     return None
 
 
-def _prepare_portable_dlc_config(config_path: str) -> str:
-    """Return a temporary DLC config with project_path set to this extracted project.
+def _project_model_root(config_path, cfg):
+    """Resolve a configured model project, falling back to the config's folder."""
+    source_root = Path(config_path).resolve().parent
+    configured = cfg.get("project_path")
+    if configured:
+        candidate = Path(str(configured)).expanduser()
+        if not candidate.is_absolute():
+            candidate = source_root / candidate
+        if any((candidate / name).is_dir() for name in ("dlc-models", "dlc-models-pytorch")):
+            return candidate.resolve()
+    return source_root
 
-    Bundled DLC resources are portable after extraction, but DLC's config.yaml
-    stores ``project_path`` as an absolute path. At runtime we write a small
-    temporary config with ``project_path`` pointing at the extracted DLC resource
-    folder.
+
+def _write_project_config(cfg, source_root, temporary_root) -> str:
+    """Keep a temporary config beside its linked models for DLC path resolution."""
+    source_root = Path(source_root).resolve()
+    temporary_root = Path(temporary_root).resolve()
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    for name in ("dlc-models", "dlc-models-pytorch"):
+        source = source_root / name
+        if not source.is_dir():
+            continue
+        target = temporary_root / name
+        try:
+            target.symlink_to(source.resolve(), target_is_directory=True)
+        except OSError:
+            if os.name != "nt":
+                raise
+            # Windows may require privileges for directory symlinks. Hardlink
+            # the small model directory tree without duplicating model bytes.
+            shutil.copytree(source.resolve(), target, copy_function=os.link)
+    cfg = dict(cfg)
+    cfg["project_path"] = str(temporary_root)
+    path = temporary_root / "config.yaml"
+    with path.open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(cfg, stream, sort_keys=False)
+    return str(path)
+
+
+def _prepare_portable_dlc_config(config_path: str) -> str:
+    """Stage an isolated DLC project with unchanged settings and linked models.
+
+    DLC resolves project_path from the config's directory, so a standalone YAML
+    in scratch would hide the trained model tree. Preserve the source project
+    and register temporary-project cleanup for process exit.
     """
     config_path = os.path.abspath(str(config_path))
     if yaml is None:
@@ -184,45 +251,159 @@ def _prepare_portable_dlc_config(config_path: str) -> str:
     except Exception:
         return config_path
 
-    project_root = os.path.abspath(os.path.dirname(config_path))
-    if str(cfg.get("project_path", "")).strip() == project_root:
-        return config_path
-
-    cfg["project_path"] = project_root
     if cfg.get("video_sets") is None:
         cfg["video_sets"] = {}
+    project = tempfile.TemporaryDirectory(prefix="autobehaver_dlc_project_")
+    try:
+        path = _write_project_config(cfg, _project_model_root(config_path, cfg), project.name)
+    except BaseException:
+        project.cleanup()
+        raise
+    atexit.register(project.cleanup)
+    return path
 
-    fd, tmp_path = tempfile.mkstemp(prefix="autobehaver_dlc_config_", suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
 
-    def _cleanup(path: str = tmp_path) -> None:
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except Exception:
-            pass
+class _RetainDLCScratch(RuntimeError):
+    pass
 
-    atexit.register(_cleanup)
-    return tmp_path
+
+def build_dlc_output_index(directory):
+    """Index CSV, HDF5, and metadata files by recording stem, retaining ambiguous candidates."""
+    index = {}
+    root = Path(directory)
+    if not root.exists():
+        return index
+    for path in root.iterdir():
+        name = original_name(path)
+        suffix = next((s for s in ('_meta.pickle', '.h5', '.csv') if name.endswith(s)), None)
+        if suffix is None:
+            continue
+        base = name[:-len(suffix)]
+        stems = {base}
+        for match in re.finditer('DLC', base):
+            stems.add(base[:match.start()])
+            if match.start() and base[match.start()-1] == '_':
+                stems.add(base[:match.start()-1])
+        key = {'_meta.pickle':'metadata', '.h5':'h5', '.csv':'csv'}[suffix]
+        for stem in stems:
+            index.setdefault(stem, {'h5': [], 'csv': [], 'metadata': []})[key].append(str(path))
+    return index
+
+
+def _copy_verified(source, target):
+    """Hash source bytes while copying and independently verify the destination."""
+    before = file_signature(source)
+    digest = hashlib.sha256()
+    with open(native_path(source), 'rb') as stream, open(native_path(target), 'wb') as output:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            output.write(block)
+            digest.update(block)
+    if file_signature(source) != before:
+        raise OSError('DLC source changed during publication copy')
+    value = digest.hexdigest()
+    if file_digest(target) != value:
+        raise OSError('DLC publication copy failed its checksum')
+    remember_verified_digest(source, value, before)
+    return value
+
+
+def inspect_dlc_outputs(
+    video_path: str,
+    output_dir: Optional[str] = None,
+    expected_bodyparts=None,
+    output_index=None,
+) -> tuple[bool, str, Dict[str, object]]:
+    """Validate the unique DLC CSV/HDF5/metadata set for one source video."""
+
+    video_path = os.path.abspath(video_path)
+    stem = Path(original_name(video_path)).stem
+    search_dir = os.path.abspath(output_dir) if output_dir else str(Path(video_path).parent)
+
+    if output_index is None:
+        output_index = build_dlc_output_index(search_dir)
+    # Fresh DLC files use the physical input basename; published files restore
+    # its complete recording identity through the name map. Accept both during
+    # staging without treating two matching output sets as a unique result.
+    candidates = [output_index.get(key, {}) for key in {stem, Path(video_path).stem}]
+    h5s = sorted({p for group in candidates for p in group.get('h5', [])})
+    csvs = sorted({p for group in candidates for p in group.get('csv', [])})
+    metas = sorted({p for group in candidates for p in group.get('metadata', [])})
+
+    counts = {"h5": len(h5s), "csv": len(csvs), "metadata": len(metas)}
+    if counts != {"h5": 1, "csv": 1, "metadata": 1}:
+        return (
+            False,
+            "expected exactly one matching DLC HDF5, CSV, and metadata file; "
+            f"found {counts}",
+            {"candidates": {"h5": h5s, "csv": csvs, "metadata": metas}},
+        )
+
+    try:
+        import cv2
+        import pandas as pd
+
+        capture = cv2.VideoCapture(video_path)
+        if not capture.isOpened():
+            capture.release()
+            return False, "source video cannot be decoded", {}
+        video_rows = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        readable, _frame = capture.read()
+        capture.release()
+        if not readable:
+            return False, "source video has no readable frames", {}
+
+        csv_frame = pd.read_csv(csvs[0], header=[0, 1, 2], index_col=0)
+        h5_frame = pd.read_hdf(h5s[0])
+        csv_rows = int(len(csv_frame))
+        h5_rows = int(len(h5_frame))
+        if csv_rows < 1 or h5_rows < 1:
+            return False, "DLC CSV or HDF5 output contains no frames", {}
+        if csv_rows != h5_rows:
+            return False, f"DLC CSV/HDF5 row mismatch ({csv_rows} != {h5_rows})", {}
+        if video_rows > 0 and csv_rows != video_rows:
+            return False, f"DLC row count {csv_rows} does not match video frame count {video_rows}", {}
+        if csv_frame.columns.duplicated().any() or h5_frame.columns.duplicated().any():
+            return False, "DLC output contains duplicate coordinate columns", {}
+        from autobehaver.preinf.frame_identity import consecutive_frames
+        import numpy as np
+        consecutive_frames(csv_frame.index, source=csvs[0], require_origin=True)
+        consecutive_frames(h5_frame.index, source=h5s[0], require_origin=True)
+        if not csv_frame.columns.equals(h5_frame.columns):
+            return False, 'DLC CSV/HDF5 coordinate schemas differ', {}
+        coords = {}
+        for scorer, part, coord in csv_frame.columns:
+            coords.setdefault((scorer,part),set()).add(coord)
+        if not coords or any(value != {'x','y','likelihood'} for value in coords.values()):
+            return False, 'DLC output lacks complete coordinate triplets', {}
+        if expected_bodyparts is not None and {part for _,part in coords} != set(expected_bodyparts):
+            return False, 'DLC bodyparts differ from the requested model configuration', {}
+        cv = csv_frame.to_numpy(dtype=float)
+        hv = h5_frame.to_numpy(dtype=float)
+        if np.isinf(cv).any() or np.isinf(hv).any() or not np.allclose(cv,hv,equal_nan=True,rtol=1e-5,atol=1e-5):
+            return False, 'DLC CSV/HDF5 values differ or contain infinity', {}
+        likelihood = csv_frame.loc[:, csv_frame.columns.get_level_values(2) == 'likelihood'].to_numpy(dtype=float)
+        finite = likelihood[np.isfinite(likelihood)]
+        if len(finite) and ((finite < 0) | (finite > 1)).any():
+            return False, 'DLC likelihood outside [0,1]', {}
+        if os.path.getsize(metas[0]) <= 0:
+            return False, "DLC metadata file is empty", {}
+    except Exception as exc:
+        return False, f"DLC output integrity check failed: {exc}", {}
+
+    return True, "ok", {
+        "video_frames": video_rows,
+        "rows": csv_rows,
+        "h5": h5s[0],
+        "csv": csvs[0],
+        "metadata": metas[0],
+    }
 
 
 def check_dlc_outputs(video_path: str, output_dir: Optional[str] = None) -> bool:
-    """Check if required DLC outputs exist for a given video."""
-    video_path = os.path.abspath(video_path)
-    stem = Path(video_path).stem
-    search_dir = os.path.abspath(output_dir) if output_dir else str(Path(video_path).parent)
+    """Return true only when the required DLC output set passes integrity checks."""
 
-    # DLC outputs start with the video stem; use filename startswith for robustness.
-    h5s = glob.glob(os.path.join(search_dir, f"{stem}*.h5"))
-    csvs = glob.glob(os.path.join(search_dir, f"{stem}*.csv"))
-    metas = glob.glob(os.path.join(search_dir, f"{stem}*_meta.pickle"))
-
-    has_h5 = any(Path(p).name.startswith(stem) for p in h5s)
-    has_csv = any(Path(p).name.startswith(stem) for p in csvs)
-    has_meta = any(Path(p).name.startswith(stem) for p in metas)
-
-    return has_h5 and has_csv and has_meta
+    ok, _reason, _details = inspect_dlc_outputs(video_path, output_dir=output_dir)
+    return ok
 
 
 def strip_dlc_tag_from_csvs(
@@ -232,19 +413,9 @@ def strip_dlc_tag_from_csvs(
     log_subdir: str = "filename_changes_log",
     log_filename: str = "filename_changes_log.csv",
 ) -> int:
-    """Remove a user-provided DLC tag substring from DLC CSV filenames in a directory.
+    """Remove an exact DeepLabCut tag from CSV filenames and log each rename.
 
-    DLC produces filenames like:
-        <video_stem>DLC_resnet50_...shuffle1_1000000.csv
-    This function removes the provided tag, cleans up double underscores, and
-    logs the changes.
-
-    Notes:
-      - We only rename *.csv files (to avoid interfering with DLC behaviors that
-        may rely on scorer-tagged .h5/_meta.pickle names).
-      - Collisions are not overwritten; they are logged as skipped.
-
-    Returns: number of files renamed.
+    Preserve HDF5/metadata names and skip collisions. Return the number renamed.
     """
 
     directory = os.path.abspath(directory)
@@ -308,23 +479,23 @@ def strip_dlc_tag_from_csvs(
 
 
 def _call_dlc_func(func, *args, **kwargs):
-    """Call a DLC function while only passing kwargs it accepts."""
+    """Call a DeepLabCut function with only the keyword arguments it accepts."""
     try:
         sig = inspect.signature(func)
         accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if accepts_var_kwargs:
-            return func(*args, **kwargs)
-
         allowed = set(sig.parameters.keys())
-        filtered = {k: v for k, v in kwargs.items() if k in allowed}
-        return func(*args, **filtered)
-    except Exception:
+        filtered = kwargs if accepts_var_kwargs else {k: v for k, v in kwargs.items() if k in allowed}
+    except (TypeError, ValueError):
         # If introspection fails for any reason, fall back to calling directly.
-        return func(*args, **kwargs)
+        filtered = kwargs
+    # A backend failure belongs to the explicit retry loop. Never execute the
+    # same expensive backend call again merely because it raised an exception.
+    with phase('DeepLabCut ' + getattr(func, '__name__', 'processing')):
+        return func(*args, **filtered)
 
 
 def _write_temp_config(source_config: str, updates: Dict[str, object], temp_dir: str) -> str:
-    """Write a temporary config.yaml with updated top-level keys."""
+    """Write rendering overrides in an isolated project beside linked models."""
     if yaml is None:
         raise RuntimeError(
             "PyYAML not available; cannot create a temporary config. "
@@ -336,15 +507,17 @@ def _write_temp_config(source_config: str, updates: Dict[str, object], temp_dir:
     for k, v in updates.items():
         cfg[k] = v
 
-    tmp_cfg_path = os.path.join(temp_dir, "config_temp_for_labeled_video.yaml")
-    with open(tmp_cfg_path, "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-    return tmp_cfg_path
+    return _write_project_config(cfg, _project_model_root(source_config, cfg), temp_dir)
 
 
-# ---------------------------
 # Core pipeline
-# ---------------------------
+
+
+def _matching_dlc_files(video, directory):
+    """Return indexed artifacts matching a video identity or its physical filename."""
+    index = build_dlc_output_index(directory)
+    keys = {Path(original_name(video)).stem, Path(video).stem}
+    return sorted({Path(path) for key in keys for group in index.get(key, {}).values() for path in group})
 
 
 def analyze_videos_with_retries(
@@ -357,13 +530,19 @@ def analyze_videos_with_retries(
     max_retries: int,
     output_dir: Optional[str] = None,
     log_prefix: str = "",
+    expected_bodyparts=None,
+    backend=None,
 ) -> Dict[str, Dict[str, object]]:
-    """Run DLC inference, then retry failed videos individually up to max_retries."""
-    dlc = _require_deeplabcut()
+    """Run an initial DeepLabCut batch and retry failed videos individually.
 
+    Return per-video attempts, validation details, and errors. max_retries bounds
+    total attempts, including the initial batch.
+    """
     if not videos:
         print("No videos found to analyze.")
         return {}
+    _validate_video_names(videos)
+    dlc = backend if backend is not None else _require_deeplabcut()
 
     resolved_output_dir = os.path.abspath(output_dir) if output_dir else None
 
@@ -385,16 +564,21 @@ def analyze_videos_with_retries(
     except Exception as e:
         print(f"{log_prefix}Initial analyze_videos() raised: {e}", file=sys.stderr)
 
-    # Track status
     video_status: Dict[str, Dict[str, object]] = {}
-    for v in videos:
-        video_status[v] = {"attempts": 1, "success": check_dlc_outputs(v, output_dir=resolved_output_dir)}
+    indexes = {}
+    for v in progress(videos, desc='DLC checking video outputs'):
+        directory = resolved_output_dir or str(Path(v).parent)
+        if directory not in indexes:
+            indexes[directory] = build_dlc_output_index(directory)
+        valid, reason, details = inspect_dlc_outputs(v, output_dir=directory,
+            expected_bodyparts=expected_bodyparts, output_index=indexes[directory])
+        video_status[v] = {'attempts':1, 'success':valid, 'details':details, 'error':reason if not valid else None}
 
     attempt = 1
     while attempt < max_retries:
         failed_videos = [v for v, s in video_status.items() if not s["success"]]
         if not failed_videos:
-            print(f"{log_prefix}All videos analyzed successfully!")
+            print(f"{log_prefix}Analysis finished; final output checks follow.")
             break
 
         attempt += 1
@@ -403,6 +587,9 @@ def analyze_videos_with_retries(
         # Retry individually so one bad file can't block the rest.
         for v in failed_videos:
             try:
+                directory=resolved_output_dir or str(Path(v).parent)
+                for path in _matching_dlc_files(v,directory):
+                    preserve_previous(path)
                 _call_dlc_func(
                     dlc.analyze_videos,
                     config_path,
@@ -416,7 +603,10 @@ def analyze_videos_with_retries(
                 print(f"{log_prefix}Retry analyze_videos() failed for {v}: {e}", file=sys.stderr)
 
             video_status[v]["attempts"] = int(video_status[v]["attempts"]) + 1
-            video_status[v]["success"] = check_dlc_outputs(v, output_dir=resolved_output_dir)
+            indexes[directory] = build_dlc_output_index(directory)
+            valid, reason, details = inspect_dlc_outputs(v, output_dir=directory,
+                expected_bodyparts=expected_bodyparts, output_index=indexes[directory])
+            video_status[v].update(success=valid, details=details, error=reason if not valid else None)
 
     return video_status
 
@@ -439,13 +629,21 @@ def create_labeled_movies(
     overwrite: bool = True,
     output_dir: Optional[str] = None,
     log_prefix: str = "",
-) -> None:
-    """Create DLC labeled videos (source video + keypoint dots)."""
-    dlc = _require_deeplabcut()
+    backend=None,
+    analyzed_outputs=None,
+    scratch_dir=None,
+) -> Dict[str, str]:
+    """Render and verify overlays using native DLC names in owned scratch.
+
+    Published prediction files can have portable names that DLC cannot resolve.
+    Restore its video/scorer naming only in scratch, leaving published data and
+    model files untouched.
+    """
+    dlc = backend if backend is not None else _require_deeplabcut()
 
     if not videos:
         print(f"{log_prefix}No videos to label.")
-        return
+        return {}
 
     displayed_bodyparts: object = "all"
     bodyparts = load_config_bodyparts(config_path)
@@ -458,7 +656,6 @@ def create_labeled_movies(
             if displayed_bodyparts != "all":
                 print(f"{log_prefix}Displaying {len(displayed_bodyparts)}/{len(bodyparts)} bodyparts")
 
-    # Build kwargs for create_labeled_video.
     kwargs = dict(
         videotype=videotype,
         shuffle=shuffle,
@@ -470,45 +667,98 @@ def create_labeled_movies(
         codec=codec,
         overwrite=overwrite,
         keypoints_only=False,
-        destfolder=output_dir,
         # plotting controls
         dotsize=dotsize,
         pcutoff=pcutoff,
         colormap=colormap,
     )
 
-    # If this DLC build doesn't accept dotsize/pcutoff/colormap kwargs, fall back
-    # to a temporary config copy that sets them as top-level config keys.
-    try:
-        sig = inspect.signature(dlc.create_labeled_video)
-        accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        accepted = set(sig.parameters.keys())
-    except Exception:
-        accepts_var_kwargs = True
-        accepted = set()
+    from autobehaver.preinf.autocropper.contract import video_shape
+    import pandas as pd
 
-    need_temp_config = False
-    updates_for_temp_cfg: Dict[str, object] = {}
-    for k, v in (("dotsize", dotsize), ("pcutoff", pcutoff), ("colormap", colormap)):
-        if not accepts_var_kwargs and k not in accepted:
-            need_temp_config = True
-            updates_for_temp_cfg[k] = v
-
-    cfg_to_use = config_path
-    tmpdir_obj = None
-    if need_temp_config:
-        print(
-            f"{log_prefix}Your DLC version doesn't accept some plotting kwargs directly; "
-            f"using a temporary config copy for dotsize/pcutoff/colormap."
-        )
-        tmpdir_obj = tempfile.TemporaryDirectory(prefix="dlc_cfg_tmp_")
-        cfg_to_use = _write_temp_config(config_path, updates_for_temp_cfg, tmpdir_obj.name)
-
-    print(f"{log_prefix}Creating labeled videos for {len(videos)} video(s)...")
-    _call_dlc_func(dlc.create_labeled_video, cfg_to_use, list(videos), **kwargs)
-
-    if tmpdir_obj is not None:
-        tmpdir_obj.cleanup()
+    with scratch_workspace('dlc_labels', scratch_dir) as staging:
+        # DLC 2.3.9 reads these settings from config even when its signature
+        # accepts plotting keywords. Keep the config beside linked models.
+        cfg_to_use = _write_temp_config(config_path, {
+            'dotsize': dotsize, 'pcutoff': pcutoff, 'colormap': colormap,
+        }, str(staging / 'model'))
+        with open(cfg_to_use, encoding='utf-8') as stream:
+            render_config = yaml.safe_load(stream)
+        suffix = ('_id' if color_by == 'individual' else '_bp') if render_config.get('multianimalproject') else ''
+        plans = []
+        seen = set()
+        published = {}
+        for video in videos:
+            details = (analyzed_outputs or {}).get(video)
+            if details is None:
+                valid, reason, details = inspect_dlc_outputs(video, output_dir=output_dir)
+                if not valid:
+                    raise RuntimeError(f'Cannot label {video}: {reason}')
+            header = pd.read_csv(details['csv'], header=[0, 1, 2], index_col=0, nrows=0)
+            scorers = set(header.columns.get_level_values(0))
+            if len(scorers) != 1:
+                raise ValueError(f'Expected one DLC scorer for labeled video: {video}')
+            scorer = str(next(iter(scorers)))
+            if not scorer or Path(scorer).name != scorer or '\\' in scorer:
+                raise ValueError(f'Invalid DLC scorer filename component: {scorer}')
+            native_stem = Path(video).stem + scorer
+            if native_stem in seen:
+                raise ValueError(f'Labeled video staging name collision: {native_stem}')
+            seen.add(native_stem)
+            logical_stem = Path(original_name(video)).stem
+            scorer_token = hashlib.sha256(scorer.encode()).hexdigest()[:12]
+            target_dir = Path(output_dir) if output_dir else Path(video).parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = generated_path(target_dir, logical_stem + 'DLC' + scorer_token + suffix + '_labeled.mp4',
+                                    original=logical_stem + scorer + suffix + '_labeled.mp4')
+            shape = video_shape(video)
+            from autobehaver.completion import request_identity
+            render_request = request_identity('dlc-label-v1',
+                [video, details['h5'], details['csv'], details['metadata']],
+                {'config': {k: v for k, v in render_config.items()
+                            if k not in ('project_path', 'video_sets', 'video_sets_original')},
+                 'render': {k: v for k, v in kwargs.items() if k != 'overwrite'}}, [__file__])
+            if target.exists() and not overwrite:
+                if video_shape(target) != shape or not receipt_matches(target, render_request):
+                    raise RuntimeError(f'Existing labeled video does not match current tracking/render settings '
+                                       f'and overwrite is disabled: {target}')
+                published[video] = str(target)
+                continue
+            for key, extension in (('h5', '.h5'), ('csv', '.csv'), ('metadata', '_meta.pickle')):
+                source = Path(details[key]).resolve()
+                link = staging / (native_stem + extension)
+                try:
+                    link.symlink_to(source)
+                except OSError:
+                    if os.name != 'nt':
+                        raise
+                    _copy_verified(source, link)
+            plans.append((video, staging / (native_stem + suffix + '_labeled.mp4'), target, shape, render_request))
+        if plans:
+            print(f"{log_prefix}Creating labeled videos for {len(plans)} video(s)...")
+            _call_dlc_func(dlc.create_labeled_video, cfg_to_use,
+                           [item[0] for item in plans], destfolder=str(staging), **kwargs)
+        # Native DLC may return False without raising. Require a complete,
+        # readable overlay for every request before publishing any new movie.
+        for video, rendered, target, shape, _request in plans:
+            try:
+                if video_shape(rendered) != shape:
+                    raise ValueError('frame count or dimensions differ from the source')
+            except Exception as exc:
+                raise RuntimeError(f'Labeled video generation failed for {video}; scratch retained at {staging}: {exc}') from exc
+        for video, rendered, target, _shape, render_request in plans:
+            temporary = target.parent / ('.dlc-label-' + uuid.uuid4().hex[:12] + '.tmp')
+            try:
+                digest = _copy_verified(rendered, temporary)
+                if target.exists():
+                    preserve_previous(target)
+                os.replace(temporary, target)
+                remember_verified_digest(target, digest)
+                write_receipt(target, render_request)
+            finally:
+                temporary.unlink(missing_ok=True)
+            published[video] = str(target)
+        return published
 
 
 def write_summary_log(
@@ -555,23 +805,31 @@ def write_summary_log(
         f.write(f"   Labeled videos requested: {'yes' if made_movies else 'no'}\n")
 
 
-# ---------------------------
 # Orchestration
-# ---------------------------
 
 
+def _monitor_h5_signature(details):
+    """Return the unique HDF5 path, size, and modification time when available."""
+    path = details.get("h5")
+    if not path:
+        candidates = details.get("candidates", {}).get("h5", [])
+        path = candidates[0] if len(candidates) == 1 else None
+    if not path:
+        return None
+    try:
+        metadata = Path(path).stat()
+        return str(path), metadata.st_size, metadata.st_mtime_ns
+    except OSError:
+        return None
+
+
+@reported_stage("DLC", exit_code=True)
+@verified_run
 def run_dlc(cfg: DLCInferencerConfig) -> int:
-    """Run DLC inference according to the provided config.
+    """Run DeepLabCut inference with the supplied runtime options.
 
-    Returns an exit code (0 = all successful, 1 = some failed, 2 = no videos).
+    Return 0 when validation succeeds, 1 when it fails, or 2 when no videos match.
     """
-    # Make sure DLC is importable early so failures are obvious.
-    _require_deeplabcut()
-
-    setup_gpu()
-
-    runtime_config_path = _prepare_portable_dlc_config(cfg.dlc_config)
-
     input_dir = os.path.abspath(cfg.input_dir)
 
     output_dir = os.path.abspath(cfg.output_dir) if cfg.output_dir else None
@@ -579,13 +837,11 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
         os.makedirs(output_dir, exist_ok=True)
     log_dir = output_dir or input_dir
 
-    # -------------------------
     # Resolve videos to process
-    # -------------------------
     # Priority:
-    #   1) explicit --videos
-    #   2) registry (if enabled)
-    #   3) filesystem scan of input_dir
+    # explicit --videos
+    # registry (if enabled)
+    # filesystem scan of input_dir
     used_registry = False
 
     if cfg.videos:
@@ -616,7 +872,7 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
             project_root = reg_path.parent
 
             try:
-                from autobehaver.registry import read_registry  # lazy import; pulls in pandas
+                from autobehaver.registry import read_registry, resolve_registry_path  # lazy import; pulls in pandas
             except Exception as e:
                 raise RuntimeError(
                     "Failed to import registry helpers (pandas required). "
@@ -627,7 +883,7 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
 
             vids: List[str] = []
             if not df.empty and "cropped_movie_relpath" in df.columns:
-                # pandas is optional here; used only for isna convenience.
+                # Handle null active flags without changing compatibility defaults.
                 try:
                     import pandas as pd  # type: ignore
                 except Exception:  # pragma: no cover
@@ -649,7 +905,7 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
                         return False
                     if s in {"1", "true", "yes", "y", "on"}:
                         return True
-                    # Default: treat unknown as active
+                    # Preserve the legacy active default for unrecognized values.
                     return True
 
                 try:
@@ -663,21 +919,11 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
                     except Exception:
                         pass
 
-                rels = [
-                    str(x).replace("\\", "/")
-                    for x in df2["cropped_movie_relpath"].tolist()
-                    if str(x).strip() != ""
-                ]
-
-                for rel in rels:
-                    p = (project_root / rel).resolve()
-                    if not p.exists():
-                        # Fallback: registry may have been created on a different mirror.
-                        cand = Path(input_dir) / Path(rel).name
-                        if cand.exists():
-                            p = cand.resolve()
-                    if not p.exists():
+                for _, registry_row in df2.iterrows():
+                    rel = str(registry_row["cropped_movie_relpath"]).replace("\\", "/")
+                    if not rel.strip():
                         continue
+                    p = resolve_registry_path(project_root, registry_row, "cropped_movie_relpath")
                     if cfg.videotype and not str(p).lower().endswith(str(cfg.videotype).lower()):
                         continue
                     vids.append(str(p))
@@ -688,7 +934,7 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
             # Optional glob filtering (applies to basenames)
             if videos and cfg.video_glob:
                 pat = str(cfg.video_glob)
-                videos = [v for v in videos if fnmatch.fnmatch(Path(v).name, pat)]
+                videos = [v for v in videos if fnmatch.fnmatch(original_name(v), pat)]
         else:
             videos = resolve_videos(
                 input_dir=input_dir,
@@ -701,12 +947,36 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
     if cfg.file_filter:
         before = len(videos)
         needle = cfg.file_filter.lower()
-        videos = [v for v in videos if needle in Path(v).name.lower()]
+        videos = [v for v in videos if needle in original_name(v).lower()]
         print(f"Applied file_filter='{cfg.file_filter}': {len(videos)}/{before} videos selected")
 
+    source_directories = {Path(input_dir), *(Path(video).parent for video in videos)}
+    if output_dir:
+        propagate_selection(source_directories, output_dir)
+    selected_before_exclusions = len(videos)
+    videos = filter_included_paths(videos)
+    from autobehaver.batch_inputs import select_batch_inputs
+    videos = select_batch_inputs(videos, getattr(cfg, "file_list", None))
+
+    if len(videos) != selected_before_exclusions:
+        print(f"Excluded {selected_before_exclusions - len(videos)} previously cropped chamber(s) according to current crop selection.")
+
     if not videos:
+        completion_details(status="nothing to process", output=output_dir or input_dir)
         print(f"No videos matched in: {input_dir}")
         return 2
+
+    missing = [v for v in videos if not Path(v).is_file()]
+    if missing:
+        raise FileNotFoundError(f'Selected cropped movies are missing at their declared paths: {missing[:25]}')
+    _validate_video_names(videos)
+    if cfg.dlc_python:
+        from .backend import SubprocessDLC
+        dlc = SubprocessDLC(cfg.dlc_python)
+    else:
+        dlc = _require_deeplabcut()
+        setup_gpu()
+    runtime_config_path = _prepare_portable_dlc_config(cfg.dlc_config)
 
     print(f"Found {len(videos)} video(s) to process under: {input_dir}")
     for v in videos[:10]:
@@ -715,7 +985,31 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
         print(f"  ... and {len(videos)-10} more")
 
     # Build a baseline status map from existing outputs.
-    existing_ok: Dict[str, bool] = {v: check_dlc_outputs(v, output_dir=output_dir) for v in videos}
+    from autobehaver.resource_monitor import current_monitor, record_work
+
+    before_h5 = {}
+    requested_model = model_identity(runtime_config_path, cfg.shuffle)
+    prepare_model = getattr(dlc, "prepare_model", None)
+    if callable(prepare_model):
+        prepare_model(runtime_config_path, cfg.shuffle)
+    requests = {v:dlc_request(v,requested_model) for v in videos}
+    source_signatures = {v:file_signature(v) for v in videos}
+    existing_ok = {}
+    existing_indexes = {}
+    validated_outputs = {}
+    for video in videos:
+        directory = output_dir or str(Path(video).parent)
+        if directory not in existing_indexes:
+            existing_indexes[directory] = build_dlc_output_index(directory)
+        valid, _, details = inspect_dlc_outputs(video, output_dir=output_dir,
+                                              expected_bodyparts=requested_model['settings'].get('bodyparts'),
+                                              output_index=existing_indexes[directory])
+        paths = [details[k] for k in ('h5','csv','metadata')] if valid else []
+        existing_ok[video] = bool(valid and receipt_matches(details['csv'],requests[video],paths))
+        if existing_ok[video]:
+            validated_outputs[video] = (details, [file_signature(p) for p in paths], file_signature(video))
+        if current_monitor() is not None:
+            before_h5[video] = _monitor_h5_signature(details)
     video_status: Dict[str, Dict[str, object]] = {
         v: {"attempts": 0, "success": bool(existing_ok[v])} for v in videos
     }
@@ -730,15 +1024,74 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
                 print(f"Skipping {skipped_existing} video(s) with existing DLC outputs.")
 
         if videos_to_process:
-            processed = analyze_videos_with_retries(
-                config_path=runtime_config_path,
-                videos=videos_to_process,
-                videotype=cfg.videotype,
-                shuffle=cfg.shuffle,
-                save_as_csv=True,
-                max_retries=cfg.max_retries,
-                output_dir=cfg.output_dir,
-            )
+            processed = {}
+            # Keep DLC away from old files: its own internal skip logic otherwise
+            # prevents genuine regeneration even when Autobehaver requests it.
+            destination = Path(output_dir) if output_dir else Path(videos_to_process[0]).parent
+            destination.mkdir(parents=True,exist_ok=True)
+            try:
+                with scratch_workspace('dlc', getattr(cfg, 'scratch_dir', None)) as staging:
+                    processed = analyze_videos_with_retries(
+                        config_path=runtime_config_path, videos=videos_to_process,
+                        videotype=cfg.videotype, shuffle=cfg.shuffle, save_as_csv=True,
+                        max_retries=cfg.max_retries, output_dir=str(staging),
+                        expected_bodyparts=requested_model['settings'].get('bodyparts'), backend=dlc)
+                    for video, status in processed.items():
+                        valid, reason, details = bool(status.get('success')), status.get('error'), status.get('details', {})
+                        if valid and not details:
+                            valid, reason, details = inspect_dlc_outputs(video, output_dir=str(staging),
+                                expected_bodyparts=requested_model['settings'].get('bodyparts'))
+                        if not valid:
+                            status['success'] = False
+                            status['error'] = reason
+                            continue
+                        if file_signature(video) != source_signatures[video]:
+                            status.update(success=False, error='Source video changed during DLC processing')
+                            continue
+                        target = Path(output_dir) if output_dir else Path(video).parent
+                        # Existing output candidates are preserved only after the new
+                        # complete set has passed validation.
+                        original_stem=Path(original_name(video)).stem
+                        scorer_suffix=Path(details['h5']).stem[len(Path(video).stem):]
+                        scorer_token=hashlib.sha256(scorer_suffix.encode()).hexdigest()[:12]
+                        pending=[]
+                        published=[]
+                        temporary_paths = []
+                        try:
+                            for key,suffix in [('h5','.h5'),('csv','.csv'),('metadata','_meta.pickle')]:
+                                source=Path(details[key])
+                                output=generated_path(target,original_stem+'DLC'+scorer_token+suffix,
+                                                      original=original_stem+scorer_suffix+suffix)
+                                temporary=target/('.dlc-'+uuid.uuid4().hex[:12]+'.tmp')
+                                temporary_paths.append(temporary)
+                                digest = _copy_verified(source, temporary)
+                                pending.append((temporary,output,digest))
+                                published.append(str(output))
+                            index = existing_indexes.get(str(target), {})
+                            previous = {Path(p) for stem in {original_stem, Path(video).stem}
+                                        for group in index.get(stem, {}).values() for p in group}
+                            for path in sorted(previous):
+                                preserve_previous(path)
+                            for temporary,output,digest in pending:
+                                os.replace(temporary,output)
+                                remember_verified_digest(output, digest)
+                            write_receipt(published[1],requests[video],published,rows=details['rows'])
+                            final_details = {**details, **dict(zip(('h5','csv','metadata'), published))}
+                            validated_outputs[video] = (final_details, [file_signature(p) for p in published], file_signature(video))
+                        except Exception as exc:
+                            status.update(success=False, error=f'DLC publication failed: {exc}')
+                            validated_outputs.pop(video, None)
+                        finally:
+                            for temporary in temporary_paths:
+                                temporary.unlink(missing_ok=True)
+                    if any(not status.get('success') for status in processed.values()):
+                        raise _RetainDLCScratch(f'DLC failed outputs retained in {staging}')
+            except _RetainDLCScratch as exc:
+                print(str(exc), file=sys.stderr)
+            except Exception as exc:
+                for video in videos_to_process:
+                    if video not in validated_outputs:
+                        processed.setdefault(video, {}).update(success=False, error=f'DLC processing failed: {exc}')
             # Merge results back into the full status map.
             for v, s in processed.items():
                 video_status[v] = s
@@ -761,29 +1114,38 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
             if not s.get("success"):
                 print(f"    - {_safe_relpath(v, input_dir)} (attempts: {s.get('attempts')})")
 
+    labeled_outputs = {}
+    labeled_error = None
     if cfg.make_movie:
         # Only label the successful ones (need .h5/.csv/_meta.pickle).
         label_videos = [v for v, s in video_status.items() if s.get("success")]
         if not label_videos:
             print("No successful analyses found; skipping labeled video creation.")
         else:
-            create_labeled_movies(
-                config_path=runtime_config_path,
-                videos=label_videos,
-                videotype=cfg.videotype,
-                shuffle=cfg.shuffle,
-                dotsize=cfg.dotsize,
-                pcutoff=cfg.pcutoff,
-                colormap=cfg.colormap,
-                exclude_bodyparts=cfg.exclude_bodyparts,
-                color_by=cfg.color_by,
-                draw_skeleton=False,
-                trailpoints=cfg.trailpoints,
-                fastmode=cfg.fastmode,
-                codec=cfg.codec,
-                overwrite=cfg.overwrite,
-                output_dir=cfg.output_dir,
-            )
+            try:
+                labeled_outputs = create_labeled_movies(
+                    config_path=runtime_config_path,
+                    videos=label_videos,
+                    videotype=cfg.videotype,
+                    shuffle=cfg.shuffle,
+                    dotsize=cfg.dotsize,
+                    pcutoff=cfg.pcutoff,
+                    colormap=cfg.colormap,
+                    exclude_bodyparts=cfg.exclude_bodyparts,
+                    color_by=cfg.color_by,
+                    draw_skeleton=False,
+                    trailpoints=cfg.trailpoints,
+                    fastmode=cfg.fastmode,
+                    codec=cfg.codec,
+                    overwrite=cfg.overwrite,
+                    output_dir=cfg.output_dir,
+                    backend=dlc,
+                    analyzed_outputs={v: validated_outputs[v][0] for v in label_videos if v in validated_outputs},
+                    scratch_dir=cfg.scratch_dir,
+                )
+            except Exception as exc:
+                labeled_error = str(exc)
+                print(f'Labeled video generation failed: {exc}', file=sys.stderr)
 
     # Optional: strip a user-provided DLC tag from CSV filenames.
     if (not getattr(cfg, "keep_dlc_tag", False)) and cfg.dlc_tag_to_remove and cfg.dlc_tag_to_remove.strip():
@@ -791,10 +1153,15 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
         n = strip_dlc_tag_from_csvs(rename_dir, cfg.dlc_tag_to_remove)
         if n:
             print(f"Stripped DLC tag from {n} CSV file(s) in: {rename_dir}")
+        for video in videos:
+            valid,_,details=inspect_dlc_outputs(video,output_dir=output_dir)
+            if valid and video_status[video].get('success'):
+                paths=[details[k] for k in ('h5','csv','metadata')]
+                write_receipt(details['csv'],requests[video],paths,rows=details['rows'])
 
-    # -------------------------
+
     # Registry update (optional)
-    # -------------------------
+    registry_error: str | None = None
     if bool(getattr(cfg, "registry_enabled", False)):
         try:
             reg_csv = cfg.resolved_registry_csv()  # type: ignore[attr-defined]
@@ -810,14 +1177,16 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
                     update_registry_from_dlc_outputs(
                         registry_csv=reg_path,
                         project_root=reg_path.parent,
-                        videos=[Path(v) for v in videos],
+                        videos=[Path(v) for v in videos if video_status[v].get("success")],
                         output_dir=Path(output_dir) if output_dir else None,
                         lock_timeout_sec=int(getattr(cfg, "registry_lock_timeout_sec", 120)),
                         lock_stale_sec=int(getattr(cfg, "registry_lock_stale_sec", 60 * 60)),
                     )
                 except Exception as e:
+                    registry_error = str(e)
                     print(f"WARNING: Registry update skipped/failed for DLC stage: {e}", file=sys.stderr)
             else:
+                registry_error = f"registry CSV not found: {reg_path}"
                 print(
                     f"WARNING: Registry enabled but CSV not found (skipping registry update): {reg_path}",
                     file=sys.stderr,
@@ -828,9 +1197,80 @@ def run_dlc(cfg: DLCInferencerConfig) -> int:
         log_dir,
         input_dir=input_dir,
         video_status=video_status,
-        made_movies=bool(cfg.make_movie),
+        made_movies=bool(labeled_outputs),
         skipped_existing=skipped_existing,
         file_filter=cfg.file_filter,
     )
 
-    return 0 if bad == 0 else 1
+    validation = StageValidationReport.for_items(
+        "dlc",
+        videos,
+        metadata={"output_directory": str(log_dir), "make_labeled_movies": bool(cfg.make_movie),
+                  "labeled_movies": labeled_outputs},
+    )
+    if labeled_error is not None:
+        validation.add_issue('labeled_video_failed', 'error',
+                             'Requested labeled videos were not generated and verified.',
+                             details={'error': labeled_error})
+    output_stems = [Path(video).stem for video in videos]
+    duplicate_stems = sorted(
+        stem for stem, count in Counter(output_stems).items() if count > 1
+    )
+    if duplicate_stems:
+        validation.add_issue(
+            "output_path_collision",
+            "error",
+            "Selected videos share output stems and would overwrite one another.",
+            details={"stems": duplicate_stems[:25]},
+        )
+    for video in videos:
+        checked = validated_outputs.get(video)
+        try:
+            unchanged = checked is not None and checked[1] == [file_signature(checked[0][key]) for key in ('h5','csv','metadata')]
+            unchanged = unchanged and checked[2] == file_signature(video)
+        except OSError:
+            unchanged = False
+        if unchanged:
+            ok_output, reason, details = True, 'ok', checked[0]
+        else:
+            ok_output, reason, details = inspect_dlc_outputs(video, output_dir=output_dir)
+        if not video_status[video].get("success"):
+            ok_output = False
+            reason = str(video_status[video].get("error") or
+                         "No successful analysis or verified existing output for the current request")
+        elif ok_output and not receipt_matches(details['csv'], requests[video],
+                                               [details[key] for key in ('h5', 'csv', 'metadata')]):
+            ok_output = False
+            reason = "DLC output does not match the requested input/model or its published content"
+        if current_monitor() is not None:
+            attempted = int(video_status[video].get("attempts", 0)) > 0
+            unchanged = before_h5.get(video) is not None and before_h5[video] == _monitor_h5_signature(details)
+            if not attempted or (ok_output and unchanged):
+                record_work("dlc_videos", skipped=1)
+            elif not ok_output:
+                record_work("dlc_videos", failed=1)
+            else:
+                record_work("dlc_videos", completed=1)
+                record_work("dlc_output_frames", completed=int(details["rows"]))
+        if not ok_output:
+            validation.add_outcome(video, "failed", reason=reason, details=details)
+        elif existing_ok.get(video, False) and (not cfg.clobber or cfg.skip_analysis):
+            validation.add_outcome(
+                video,
+                "reused",
+                reason="existing DLC output set passed integrity checks",
+                details=details,
+            )
+        else:
+            validation.add_outcome(video, "succeeded", details=details)
+    if registry_error is not None:
+        validation.add_issue(
+            "registry_update_failed",
+            "error",
+            "DLC outputs were produced, but the project registry could not be updated.",
+            details={"error": registry_error},
+        )
+    validation.write_run_reports(Path(log_dir) / "DLC_VALIDATION.json")
+
+    validation_details(validation, unit="Videos", output=output_dir or input_dir)
+    return 0 if validation.status != "failed" else 1

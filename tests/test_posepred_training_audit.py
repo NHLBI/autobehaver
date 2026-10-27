@@ -174,13 +174,15 @@ def test_save_checkpoint_persists_training_runtime_state(tmp_path: Path) -> None
         pose_pred=True,
         orient_pred=False,
         recon=False,
-        split_filenames={"train_filenames": ["a.h5"], "val_filenames": ["b.h5"]},
+        split_filenames={"train_filenames": ["a.h5"], "val_filenames": ["b.h5"],
+                         "training_data_identity": {"schema":"autobehaver.training_inputs.v1", "files":[]}},
         training_runtime_state=runtime_state,
     )
 
     ckpt = torch.load(ckpt_dir / "demo_model_epoch_4.pth", map_location="cpu")
     assert ckpt["training_runtime_state"]["best_pose_macro_f1"] == 0.77
     assert ckpt["training_runtime_state"]["epochs_since_improvement"] == 2
+    assert ckpt["training_data_identity"]["schema"] == "autobehaver.training_inputs.v1"
 
 
 def test_orientation_only_primary_metric_uses_orient_macro_f1() -> None:
@@ -205,19 +207,13 @@ def test_resume_runtime_state_defaults_are_safe() -> None:
     assert restored["epochs_since_improvement"] == 0
 
 
-def test_records_headers_include_weighted_train_recon_loss() -> None:
-    from tempfile import TemporaryDirectory
-    with TemporaryDirectory() as td:
-        path = Path(td) / "records.csv"
-        file, writer, headers = setup_records_file(
-            str(path),
-            start_epoch=0,
-            pose_pred=False,
-            orient_pred=False,
-            recon=True,
-            pretrain_mode=False,
-        )
-        try:
-            assert "Weighted Train Recon Loss Avg" in headers
-        finally:
-            file.close()
+def test_records_headers_include_weighted_train_recon_loss(tmp_path: Path) -> None:
+    path = tmp_path / "records.csv"
+    file, writer, headers = setup_records_file(
+        str(path), start_epoch=0, pose_pred=False, orient_pred=False,
+        recon=True, pretrain_mode=False,
+    )
+    try:
+        assert "Weighted Train Recon Loss Avg" in headers
+    finally:
+        file.close()

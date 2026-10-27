@@ -1,17 +1,7 @@
-"""Per-subset SHAP task artifacts for staged FeatureImp weighted aggregation.
+"""Store and reduce subset-level SHAP sums from FeatureImp shards.
 
-This module supports a faster staged merge path for SHAP aggregation.
-Instead of reopening every saved XGBoost model during the final merge just to
-recompute SHAP values, shard jobs can persist per-subset SHAP sums while the
-model and explainer are already in memory. Merge then only needs to apply
-subset weights and aggregate those saved subset-local tensors.
-
-Two use cases are supported:
-
-* Real committee weighted SHAP
-  - needs OOF, in-sample, and all-groups per-subset SHAP sums
-* Permuted weighted baseline
-  - only needs OOF per-subset SHAP sums
+Real runs support out-of-fold, in-sample, and all-groups views; permutation baselines
+can use out-of-fold SHAP alone.
 """
 
 from __future__ import annotations
@@ -20,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from .integrity import strict_bool
 
 
 REAL_SHAP_TASKS_FILENAME = "REAL_SHAP_TASKS.npz"
@@ -85,21 +76,13 @@ def save_shap_task_archive(
 
 
 def load_shap_task_archive(path: str) -> Dict[str, np.ndarray]:
+    """Load and validate required subset SHAP arrays from a task archive."""
     if not path:
         raise ValueError("SHAP task archive path is empty.")
-    out: Dict[str, np.ndarray] = {}
-    with np.load(path, allow_pickle=False) as data:
-        for key in _REQUIRED_ARCHIVE_KEYS:
-            if key not in data.files:
-                raise ValueError(f"SHAP task archive missing required key '{key}': {path}")
-            out[key] = np.asarray(data[key])
-        for key in ("insample_shap_flat", "all_groups_shap_flat"):
-            if key in data.files:
-                out[key] = np.asarray(data[key])
-        for key in ("meta__n_train", "meta__n_all", "meta__include_insample", "meta__include_all_groups"):
-            if key in data.files:
-                out[key] = np.asarray(data[key])
-    return out
+    from .archive_io import load_npz_arrays
+    return load_npz_arrays(path, _REQUIRED_ARCHIVE_KEYS,
+        ('insample_shap_flat', 'all_groups_shap_flat', 'meta__n_train', 'meta__n_all',
+         'meta__include_insample', 'meta__include_all_groups'))
 
 
 def _iter_relevant_model_records(
@@ -108,11 +91,12 @@ def _iter_relevant_model_records(
     include_permuted: bool = False,
     permutation_idx: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """Select real models or the requested permutation models from performance records."""
     out: List[Dict[str, Any]] = []
     for rec in performance_records:
         if not isinstance(rec, Mapping):
             continue
-        is_perm = bool(rec.get("is_permuted", False))
+        is_perm = strict_bool(rec.get("is_permuted", False))
         if include_permuted:
             if not is_perm:
                 continue
@@ -136,6 +120,7 @@ def _load_task_records_from_archives(
     n_train: int,
     n_all: int,
 ) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Read unique subset SHAP records and validate their sample dimensions."""
     task_map: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for path in archive_paths:
         if not path:
@@ -209,6 +194,7 @@ def compute_weighted_shap_from_task_archives(
     require_full: bool = True,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], np.ndarray, Dict[str, Any]]:
+    """Aggregate checked subset SHAP arrays with feature-specific weight denominators."""
     if n_splits < 2:
         raise ValueError(f"n_splits must be >= 2, got {n_splits}")
     if not archive_paths:
@@ -226,7 +212,10 @@ def compute_weighted_shap_from_task_archives(
             fold_idx = int(rec.get("fold_idx"))
         except Exception:
             continue
-        subsets.setdefault((h_hit, subset_idx), {})[fold_idx] = dict(rec)
+        fold_map = subsets.setdefault((h_hit, subset_idx), {})
+        if fold_idx in fold_map:
+            raise ValueError("Duplicate task fold identity")
+        fold_map[fold_idx] = dict(rec)
     task_map = _load_task_records_from_archives(archive_paths, n_train=int(n_train), n_all=int(n_all))
     n_features = int(len(all_feature_names))
     oof_sum = np.zeros((int(n_train), n_features), dtype=np.float32)
@@ -241,10 +230,11 @@ def compute_weighted_shap_from_task_archives(
     total_weight_sum = 0.0
     for (h_hit, subset_idx), fold_map in sorted(subsets.items()):
         if len(fold_map) != int(n_splits) or any(i not in fold_map for i in range(int(n_splits))):
-            n_subsets_skipped_incomplete += 1
-            continue
+            raise ValueError("SHAP task archive subset lacks its complete fold identities")
         w = float(subset_weights.get((int(h_hit), int(subset_idx)), 0.0))
-        if not np.isfinite(w) or w <= 0.0:
+        if not np.isfinite(w) or w < 0:
+            raise ValueError("Subset weights must be nonnegative finite")
+        if w == 0.0:
             n_subsets_skipped_zero_w += 1
             continue
         task = task_map.get((int(h_hit), int(subset_idx)))
@@ -252,6 +242,14 @@ def compute_weighted_shap_from_task_archives(
             n_subsets_skipped_missing_archive += 1
             continue
         feat_idxs = np.asarray(task["feature_indices"], dtype=np.int64)
+        if feat_idxs.ndim != 1 or len(feat_idxs) == 0 or len(set(feat_idxs.tolist())) != len(feat_idxs) or np.any(feat_idxs < 0) or np.any(feat_idxs >= n_features):
+            raise ValueError("SHAP task feature indices are duplicate/outside the feature schema")
+        for value_key, rows in (("oof_shap_sum", n_train), ("insample_shap_sum", n_train), ("all_groups_shap_sum", n_all)):
+            if value_key in task:
+                value_array = np.asarray(task[value_key])
+                if value_array.shape != (int(rows), len(feat_idxs)) or not np.isfinite(value_array).all():
+                    raise ValueError("SHAP task values are nonfinite or misaligned")
+
         oof_sum[:, feat_idxs] += np.float32(w) * np.asarray(task["oof_shap_sum"], dtype=np.float32)
         if require_full:
             if "insample_shap_sum" not in task or "all_groups_shap_sum" not in task:
@@ -341,7 +339,10 @@ def reduce_weighted_shap_task_archives_to_partial(
             fold_idx = int(rec.get("fold_idx"))
         except Exception:
             continue
-        subsets.setdefault((h_hit, subset_idx), {})[fold_idx] = dict(rec)
+        fold_map = subsets.setdefault((h_hit, subset_idx), {})
+        if fold_idx in fold_map:
+            raise ValueError("Duplicate task fold identity")
+        fold_map[fold_idx] = dict(rec)
 
     task_map = _load_task_records_from_archives(archive_paths, n_train=int(n_train), n_all=int(n_all))
     n_features = int(len(all_feature_names))
@@ -358,10 +359,11 @@ def reduce_weighted_shap_task_archives_to_partial(
 
     for (h_hit, subset_idx), fold_map in sorted(subsets.items()):
         if len(fold_map) != int(n_splits) or any(i not in fold_map for i in range(int(n_splits))):
-            n_subsets_skipped_incomplete += 1
-            continue
+            raise ValueError("SHAP task archive subset lacks its complete fold identities")
         w = float(subset_weights.get((int(h_hit), int(subset_idx)), 0.0))
-        if not np.isfinite(w) or w <= 0.0:
+        if not np.isfinite(w) or w < 0:
+            raise ValueError("Subset weights must be nonnegative finite")
+        if w == 0.0:
             n_subsets_skipped_zero_w += 1
             continue
         task = task_map.get((int(h_hit), int(subset_idx)))
@@ -370,6 +372,14 @@ def reduce_weighted_shap_task_archives_to_partial(
             continue
 
         feat_idxs = np.asarray(task["feature_indices"], dtype=np.int64)
+        if feat_idxs.ndim != 1 or len(feat_idxs) == 0 or len(set(feat_idxs.tolist())) != len(feat_idxs) or np.any(feat_idxs < 0) or np.any(feat_idxs >= n_features):
+            raise ValueError("SHAP task feature indices are duplicate/outside the feature schema")
+        for value_key, rows in (("oof_shap_sum", n_train), ("insample_shap_sum", n_train), ("all_groups_shap_sum", n_all)):
+            if value_key in task:
+                value_array = np.asarray(task[value_key])
+                if value_array.shape != (int(rows), len(feat_idxs)) or not np.isfinite(value_array).all():
+                    raise ValueError("SHAP task values are nonfinite or misaligned")
+
         oof_sum[:, feat_idxs] += np.float32(w) * np.asarray(task["oof_shap_sum"], dtype=np.float32)
         if require_full:
             if "insample_shap_sum" not in task or "all_groups_shap_sum" not in task:
@@ -417,6 +427,7 @@ def merge_weighted_shap_partials(
     *,
     require_full: bool,
 ) -> Dict[str, np.ndarray]:
+    """Add compatible weighted-SHAP partials for the requested output views."""
     if not paths:
         raise ValueError("No weighted SHAP partial paths were provided for merge.")
     required = ["oof_shap_num", "feature_weight_den", "total_weight_sum"]
@@ -448,7 +459,24 @@ def finalize_weighted_shap_partial(
     n_splits: int,
     require_full: bool,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], np.ndarray, Dict[str, Any]]:
+    """Normalize merged SHAP numerators by per-feature support.
+
+    Reject unsupported features in a positive-weight ensemble and retain the defined
+    all-zero-weight fallback.
+    """
     feature_weight_sums = np.asarray(partial["feature_weight_den"], dtype=np.float32)
+    if feature_weight_sums.ndim != 1 or not np.isfinite(feature_weight_sums).all() or np.any(feature_weight_sums < 0):
+        raise ValueError("SHAP feature support must be a nonnegative finite vector")
+    if int(n_splits) < 2:
+        raise ValueError("SHAP reduction requires at least two folds")
+    unsupported = feature_weight_sums == 0
+    required = ['oof_shap_num'] + (['insample_shap_num', 'all_shap_num'] if require_full else [])
+    for key in required:
+        array = np.asarray(partial[key])
+        if array.ndim != 2 or array.shape[1] != len(feature_weight_sums) or not np.isfinite(array).all():
+            raise ValueError(f"Invalid SHAP numerator: {key}")
+        if np.any(array[:, unsupported] != 0):
+            raise ValueError(f"Nonzero SHAP numerator without feature support: {key}")
     denom_safe = np.where(feature_weight_sums > 0, feature_weight_sums, 1.0).astype(np.float32)
     oof_avg = np.asarray(partial["oof_shap_num"], dtype=np.float32) / denom_safe[None, :]
     insample_avg: Optional[np.ndarray] = None
@@ -456,7 +484,7 @@ def finalize_weighted_shap_partial(
     if require_full:
         insample_avg = np.asarray(partial["insample_shap_num"], dtype=np.float32) / (denom_safe * np.float32(max(int(n_splits) - 1, 1)))[None, :]
         all_avg = np.asarray(partial["all_shap_num"], dtype=np.float32) / denom_safe[None, :]
-    zero_cols = denom_safe <= 0
+    zero_cols = feature_weight_sums <= 0
     if np.any(zero_cols):
         oof_avg[:, zero_cols] = 0.0
         if insample_avg is not None:
@@ -466,6 +494,7 @@ def finalize_weighted_shap_partial(
     diagnostics = {
         "n_features": int(feature_weight_sums.shape[0]),
         "n_features_with_zero_weight": int(np.sum(feature_weight_sums <= 0)),
+        "unsupported_feature_indices": np.flatnonzero(unsupported).tolist(),
         "total_weight_sum": float(np.asarray(partial.get("total_weight_sum", 0.0)).reshape(())),
         "source": "weighted_shap_partials",
         "require_full": bool(require_full),

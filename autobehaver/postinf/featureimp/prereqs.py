@@ -1,18 +1,7 @@
-"""autobehaver.postinf.featureimp.prereqs
+"""Check native SHAP, NumPy, and XGBoost runtime compatibility before committee workers
+start.
 
-Runtime prerequisite checks for the feature importance pipeline.
-
-Why this exists
----------------
-Some environments can import :mod:`shap` successfully but still fail at runtime
-when constructing a TreeExplainer (e.g., due to incompatible NumPy versions).
-Those failures otherwise occur deep inside multiprocessing workers, making them
-hard to diagnose.
-
-These checks are intentionally:
-  - fast (tiny synthetic dataset),
-  - deterministic, and
-  - executed before the expensive committee training begins.
+Use a tiny deterministic model to expose explainer failures early.
 """
 
 from __future__ import annotations

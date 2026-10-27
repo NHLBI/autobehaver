@@ -1,22 +1,25 @@
-# Core Autobehaver dependencies for pip-based environments.
-# Prefer environment/environment.yml for the recommended Conda setup.
-# Install PyTorch separately with the CPU/GPU build appropriate for your machine
-# if you are not using the Conda environment file.
-numpy>=1.23.5,<1.24
-pandas>=1.5,<2.3
-scipy>=1.9
-scikit-learn>=1.2
-statsmodels>=0.14
-matplotlib>=3.7
-seaborn>=0.12
-opencv-python>=4.8
-imageio-ffmpeg>=0.4
-h5py>=3.8
-PyYAML>=6
-tqdm>=4.65
-joblib>=1.2
-openpyxl>=3.1
-xgboost>=1.7
-shap>=0.42
-gseapy>=1.0
-wandb>=0.16
+# Canonical, exactly pinned scientific stack for Autobehaver installations.
+# PyTorch and OpenCV are listed in the environment-specific files because their CPU/GPU
+# and interactive/headless builds intentionally differ while versions stay equal.
+numpy==2.0.0
+pandas==2.2.3
+scipy==1.14.1
+scikit-learn==1.7.2
+statsmodels==0.14.5
+matplotlib==3.10.6
+seaborn==0.13.2
+imageio==2.36.1
+imageio-ffmpeg==0.6.0
+h5py==3.14.0
+tables==3.10.2
+PyYAML==6.0.3
+tqdm==4.67.1
+joblib==1.5.2
+openpyxl==3.1.5
+xgboost-cpu==3.0.5; platform_system == "Linux"
+xgboost==3.0.5; platform_system != "Linux"
+shap==0.48.0
+gseapy==1.3.1
+pillow==12.3.0
+scikit-image==0.24.0
+wandb==0.30.0

@@ -1,7 +1,4 @@
-"""Package-wide constants.
-
-These are hard-coded on purpose (no CLI flags) to keep runs consistent.
-"""
+"""Fixed memory-cleanup and Transformer initialization settings."""
 
 # Periodically release cached CUDA/Python memory.
 MEMORY_CLEANUP_EVERY_EPOCHS: int = 50

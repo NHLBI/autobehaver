@@ -1,14 +1,8 @@
-"""Subset-level weighting utilities for FeatureImp specialist committees.
+"""Weight FeatureImp subsets by out-of-fold log-loss improvement over a fold-aware
+constant baseline.
 
-Subset weights are based on out-of-fold (OOF) subset skill.
-
-Design goals:
-  - Weight at the *subset* level (h_hit, subset_idx), not per fold-model.
-  - Use a proper scoring rule by default: OOF log-loss improvement vs a
-    fold-aware constant baseline.
-  - Use permutation runs (if available) to set a dead-zone threshold `tau`.
-
-This module is intentionally lightweight (no xgboost/shap imports).
+When available, permuted subset skills set the dead-zone threshold; incomplete subsets
+receive zero weight.
 """
 
 from __future__ import annotations
@@ -21,6 +15,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from .integrity import strict_bool
+from autobehaver.atomic_io import atomic_write_dataframe_csv, atomic_write_json
 
 
 @dataclass(frozen=True)
@@ -38,7 +34,7 @@ def _utc_now_iso() -> str:
 
 
 def _effective_ensemble_size(weights: np.ndarray) -> float:
-    """Effective ensemble size N_eff = (sum w)^2 / sum(w^2)."""
+    """Return effective ensemble size as (sum w)^2 / sum(w^2)."""
 
     w = np.asarray(weights, dtype=np.float64)
     w = w[np.isfinite(w)]
@@ -80,19 +76,13 @@ def compute_tau_from_permuted(
 
     df = permuted_df.copy()
     if complete_col in df.columns:
-        df = df[df[complete_col].astype(bool)]
+        df = df[df[complete_col].map(strict_bool)]
 
     vals = pd.to_numeric(df[metric], errors="coerce").to_numpy(dtype=np.float64)
     vals = vals[np.isfinite(vals)]
 
     if vals.size == 0:
-        return 0.0, {
-            "tau_source": "permutation_quantile",
-            "tau_quantile": cfg.tau_quantile,
-            "tau": 0.0,
-            "n_values": 0,
-            "note": "No finite delta_norm values in permuted subset performance; tau forced to 0.",
-        }
+        raise ValueError("Requested permutation threshold has no finite complete metrics")
 
     q = float(cfg.tau_quantile)
     if not (0.0 < q < 1.0):
@@ -131,6 +121,8 @@ def compute_subset_weights(
     metric = cfg.metric_col
     complete_col = cfg.subset_complete_col
     gamma = float(cfg.gamma)
+    if not np.isfinite(gamma) or gamma <= 0 or not np.isfinite(tau) or tau < 0:
+        raise ValueError("gamma must be positive finite and tau nonnegative finite")
 
     if metric not in real_df.columns:
         raise KeyError(f"Real subset performance missing column: {metric}")
@@ -140,7 +132,11 @@ def compute_subset_weights(
     if complete_col not in df.columns:
         df[complete_col] = True
 
-    is_complete = df[complete_col].astype(bool).to_numpy()
+    df[complete_col] = df[complete_col].map(strict_bool)
+    is_complete = df[complete_col].to_numpy(dtype=bool)
+    identity = [c for c in ('permutation_idx', 'h_hit', 'subset_idx') if c in df.columns]
+    if identity and df.duplicated(subset=identity).any():
+        raise ValueError("Duplicate subset identities in performance input")
     vals = pd.to_numeric(df[metric], errors="coerce").to_numpy(dtype=np.float64)
     vals_ok = np.isfinite(vals)
 
@@ -170,19 +166,16 @@ def compute_and_write_subset_weights(
     cfg: SubsetWeightingConfig,
     verbose: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Compute subset weights and write outputs.
+    """Calculate subset weights and publish their table and manifest.
 
-    Compute and write weights/manifest files.
-
-    Returns manifest dict on success; None if required inputs are missing.
+    Return the manifest; raise if real metrics or explicitly requested permutation
+    metrics are missing.
     """
 
     analysis_folder = str(analysis_folder or ".")
     real_perf_path = os.path.join(analysis_folder, "COMMITTEE_SUBSETS", "SUBSET_PERFORMANCE_REAL.csv")
     if not os.path.exists(real_perf_path):
-        if verbose:
-            print(f"WARNING: Real subset performance CSV not found; cannot compute weights: {real_perf_path}")
-        return None
+        raise FileNotFoundError(real_perf_path)
 
     real_df = _load_subset_performance_csv(real_perf_path)
 
@@ -200,24 +193,17 @@ def compute_and_write_subset_weights(
         candidate = os.path.join(permuted_base_folder, "COMMITTEE_SUBSETS", "SUBSET_PERFORMANCE_PERMUTED_ALL.csv")
         if os.path.exists(candidate):
             perm_perf_path = candidate
-            try:
-                perm_df = _load_subset_performance_csv(candidate)
-                tau, tau_stats = compute_tau_from_permuted(perm_df, cfg)
-            except Exception as e:
-                tau = 0.0
-                tau_stats = {
-                    "tau_source": "permutation_quantile",
-                    "tau_quantile": cfg.tau_quantile,
-                    "tau": 0.0,
-                    "note": f"Failed to compute tau from permuted subset performance ({e}); tau forced to 0.",
-                }
+            perm_df = _load_subset_performance_csv(candidate)
+            tau, tau_stats = compute_tau_from_permuted(perm_df, cfg)
+        else:
+            raise FileNotFoundError(f"Requested permutation metrics missing: {candidate}")
 
     weights_df = compute_subset_weights(real_df, tau=tau, cfg=cfg)
 
     out_dir = os.path.join(analysis_folder, "COMMITTEE_SUBSETS")
     os.makedirs(out_dir, exist_ok=True)
     weights_path = os.path.join(out_dir, "SUBSET_WEIGHTS_REAL.csv")
-    weights_df.to_csv(weights_path, index=False)
+    atomic_write_dataframe_csv(weights_df, weights_path, index=False)
 
     w = pd.to_numeric(weights_df["subset_weight"], errors="coerce").to_numpy(dtype=np.float64)
     w = w[np.isfinite(w)]
@@ -259,8 +245,7 @@ def compute_and_write_subset_weights(
     }
 
     manifest_path = os.path.join(out_dir, "WEIGHTING_MANIFEST.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    atomic_write_json(manifest, manifest_path)
 
     if verbose:
         print("\n" + "=" * 80)

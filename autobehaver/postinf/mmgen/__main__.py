@@ -1,8 +1,4 @@
-"""Module entrypoint for mmgen.
-
-Allows running master matrix generation via:
-
-    python -m autobehaver.postinf.mmgen ..."""
+"""Run the MMGen command-line interface."""
 
 from .cli import main
 

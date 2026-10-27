@@ -1,10 +1,4 @@
-"""Shared numbered-folder layout helpers for stage CLIs.
-
-This module provides a lightweight convenience layer for the standardized
-project-root layout used across the analysis pipeline. It is intentionally
-small so CLI entrypoints can import it without pulling in heavy stage
-dependencies.
-"""
+"""Resolve numbered pipeline folders and the project registry for stage CLIs."""
 
 from __future__ import annotations
 
@@ -54,14 +48,10 @@ _STAGE_LAYOUT: dict[str, dict[str, str]] = {
 
 
 def stage_paths_for_main_dir(stage: str, main_dir: str) -> Dict[str, str]:
-    """Return derived stage paths for a standardized project root.
+    """Return stage paths under the numbered-folder project root.
 
-    Parameters
-    ----------
-    stage:
-        Canonical stage key, e.g. ``"keyprenorm"``.
-    main_dir:
-        Project root containing numbered pipeline folders.
+    ``stage`` is a canonical key such as ``keyprenorm``; unknown keys raise
+    KeyError. Explicit CLI overrides are handled separately.
     """
 
     stage_key = str(stage or "").strip().lower()
@@ -88,42 +78,10 @@ def _is_missing_pathlike(value: Any) -> bool:
         return False
 
 
-def config_main_dir_default(data: Any, base_dir: str | Path) -> str | None:
-    """Return a resolved project root from a global pipeline YAML mapping.
-
-    A config may define either::
-
-        main_dir: ./example_data/smoke_project
-
-    or::
-
-        project:
-          main_dir: ./example_data/smoke_project
-
-    Stage-specific ``main_dir`` values still override this fallback inside each
-    stage loader. Relative paths are resolved relative to the YAML file.
-    """
-
-    if not isinstance(data, dict):
-        return None
-
-    value = data.get("main_dir", None)
-    if (value is None or str(value).strip() == "") and isinstance(data.get("project", None), dict):
-        value = data.get("project", {}).get("main_dir", None)
-
-    if value is None or str(value).strip() == "":
-        return None
-
-    p = Path(str(value).strip())
-    if not p.is_absolute():
-        p = Path(base_dir) / p
-    return str(p.expanduser().resolve())
-
-
 def apply_main_dir_overrides(namespace: Any, *, stage: str) -> Any:
     """Fill missing CLI namespace paths from ``main_dir``.
 
-    Explicit CLI/config values win because only empty / unset destinations are
+    Explicit CLI values win because only empty / unset destinations are
     populated. If registry integration is enabled and ``registry_csv`` is not
     provided, it defaults to ``<main_dir>/registry.csv``.
     """
@@ -147,6 +105,5 @@ def apply_main_dir_overrides(namespace: Any, *, stage: str) -> Any:
 __all__ = [
     "stage_paths_for_main_dir",
     "registry_csv_for_main_dir",
-    "config_main_dir_default",
     "apply_main_dir_overrides",
 ]

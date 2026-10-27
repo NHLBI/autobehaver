@@ -1,10 +1,5 @@
-"""Shared helpers for the staged FeatureImp core workflow.
-
-This module contains the small IO / merge helpers that are genuinely shared by
-the final merge path.
-
-It exists so the staged core path has one shared implementation for common
-merge-time bookkeeping.
+"""Shared artifact loading, verification, reduction, and export helpers for FeatureImp
+merging.
 """
 
 from __future__ import annotations
@@ -38,6 +33,8 @@ from .shard_runner import (
     _jsonl_load,
     _load_featureimp_context,
     _load_settings_snapshot,
+    _validate_completed_shard,
+    _validate_planned_artifact_hashes,
 )
 
 MERGE_DIRNAME = "_featureimp_merge"
@@ -89,6 +86,7 @@ def _concat_csvs(paths: Sequence[str]) -> pd.DataFrame:
 
 
 def _merge_partial_npz_paths(paths: Sequence[str]) -> Dict[str, np.ndarray]:
+    """Sum partial arrays only when their keys and shapes agree."""
     merged: Optional[Dict[str, np.ndarray]] = None
     for path in paths:
         partial = _load_partial_npz(path)
@@ -151,6 +149,7 @@ def _safe_relpath(path: Optional[str], start: str) -> Optional[str]:
 
 
 def _load_task_manifest(analysis_folder_path: str) -> List[Dict[str, Any]]:
+    """Load typed real/permutation assignments from the frozen task manifest."""
     from .plan import PLAN_DIRNAME, TASK_MANIFEST_FILENAME
 
     task_manifest_path = os.path.join(analysis_folder_path, PLAN_DIRNAME, TASK_MANIFEST_FILENAME)
@@ -183,7 +182,9 @@ def _discover_completed_shards(
     analysis_folder_path: str,
     manifest: Mapping[str, Any],
 ) -> Tuple[List[Tuple[int, str, str, Dict[str, Any]]], List[str]]:
+    """Verify exact planned task coverage and collect completed shard artifacts."""
     active_num_shards = int(manifest.get("active_num_shards", 1) or 1)
+    _validate_planned_artifact_hashes(analysis_folder_path, manifest)
     task_rows = _load_task_manifest(analysis_folder_path)
     planned_task_count = int(len(task_rows))
 
@@ -199,7 +200,8 @@ def _discover_completed_shards(
         running_path = os.path.join(shard_dir, SHARD_RUNNING_FILENAME)
         lock_dir = os.path.join(shard_dir, SHARD_LOCK_DIRNAME)
 
-        if os.path.exists(running_path) or os.path.isdir(lock_dir):
+        from autobehaver.file_locks import file_lock_active
+        if os.path.isdir(lock_dir) or file_lock_active(lock_dir):
             errors.append(f"Shard {shard_label} still appears to be running (running file or lock present).")
             continue
         if os.path.exists(failed_path):
@@ -210,6 +212,14 @@ def _discover_completed_shards(
             continue
 
         done = _json_load(done_path)
+        from .plan import PLAN_DIRNAME, PLAN_MANIFEST_FILENAME
+        valid, reason = _validate_completed_shard(
+            done_path, analysis_folder_path=analysis_folder_path,
+            plan_manifest_path=os.path.join(analysis_folder_path, PLAN_DIRNAME, PLAN_MANIFEST_FILENAME),
+        )
+        if not valid:
+            errors.append(f"Shard {shard_label} failed artifact validation: {reason}")
+            continue
         if not isinstance(done, dict) or str(done.get("status", "")).strip().lower() != "completed":
             errors.append(f"Shard {shard_label} completion marker is not valid: {done_path}")
             continue
@@ -219,6 +229,23 @@ def _discover_completed_shards(
             errors.append(
                 f"Shard {shard_label} task_count mismatch: done={done.get('task_count')} expected={len(planned_tasks_for_shard)}"
             )
+            continue
+        try:
+            from .integrity import safe_artifact
+            for family, artifact in [('real', 'subset_performance_real_csv'), ('perm', 'subset_performance_perm_csv')]:
+                frame = pd.read_csv(safe_artifact(analysis_folder_path, done['artifacts'][artifact]))
+                expected = {(int(r['h_hit']), int(r['subset_idx']), None if family == 'real' else int(r['permutation_idx'])) for r in planned_tasks_for_shard if r['family'] == family}
+                observed = [(int(r['h_hit']), int(r['subset_idx']), None if family == 'real' else int(r['permutation_idx'])) for r in frame.to_dict('records')]
+                if len(observed) != len(set(observed)) or set(observed) != expected:
+                    raise ValueError(f'{family} subset identities differ from the exact planned tasks')
+                perf_artifact = 'performance_records_real_jsonl' if family == 'real' else 'performance_records_perm_jsonl'
+                performance = _jsonl_load(str(safe_artifact(analysis_folder_path, done['artifacts'][perf_artifact])))
+                observed_folds = [(int(r['h_hit']), int(r['subset_idx']), None if family == 'real' else int(r['permutation_idx']), int(r['fold_idx'])) for r in performance]
+                expected_folds = {(*task, fold) for task in expected for fold in range(int(manifest['n_splits']))}
+                if len(observed_folds) != len(set(observed_folds)) or set(observed_folds) != expected_folds:
+                    raise ValueError(f'{family} fold identities differ from the exact planned models')
+        except Exception as exc:
+            errors.append(f'Shard {shard_label} semantic inventory validation failed: {exc}')
             continue
         observed_task_count += len(planned_tasks_for_shard)
         done_entries.append((shard_index, shard_label, shard_dir, done))
@@ -240,6 +267,7 @@ def _validate_merged_counts(
     real_perf_rows: Sequence[Mapping[str, Any]],
     perm_perf_rows: Sequence[Mapping[str, Any]],
 ) -> None:
+    """Reject missing or duplicate subset and fold records after merging."""
     planned_family_counts = dict(manifest.get("planned_family_counts") or {})
     expected_real_tasks = int(planned_family_counts.get("real", 0) or 0)
     expected_perm_tasks = int(planned_family_counts.get("perm", 0) or 0)
@@ -277,6 +305,7 @@ def _validate_merged_counts(
 
 
 def _finalize_partial_averages(*, partial: Mapping[str, Any], n_splits: int) -> Dict[str, np.ndarray | int]:
+    """Normalize merged SHAP and prediction sums by their contributing counts."""
     insample_probas_sum = np.asarray(partial["insample_probas_sum"], dtype=np.float32)
     oof_probas_sum = np.asarray(partial["oof_probas_sum"], dtype=np.float32)
     insample_shap_sum = np.asarray(partial["insample_shap_sum"], dtype=np.float32)
@@ -335,6 +364,7 @@ def _build_hybrid_shap_views(
     all_groups_avg_shap_values_unweighted: Optional[np.ndarray] = None,
     weighted_feature_usage_fraction: Optional[np.ndarray] = None,
 ) -> Tuple[List[str], Optional[Dict[str, str]], np.ndarray, Optional[Dict[str, np.ndarray]]]:
+    """Construct all-group SHAP views with out-of-fold values in training rows."""
     n_all, n_features = all_groups_avg_shap_values.shape
     hybrid = np.zeros((n_all, n_features), dtype=np.float32)
     hybrid[:n_train, :] = np.asarray(oof_shap_values, dtype=np.float32)
@@ -368,6 +398,9 @@ def _build_predictions_export(
     le: FixedBinaryLabelEncoder,
     export_label: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Assemble animal predictions with out-of-fold training values and group
+    separators.
+    """
     num_classes = len(le.classes_)
     prob_cols = [f"Prob_{le.classes_[c]}" for c in range(num_classes)]
     base_info_df = df_for_training[["individual", "group"]].reset_index(drop=True)
@@ -416,6 +449,7 @@ def _build_predictions_export(
 
 
 def _compute_binary_metrics_from_prob_matrix(y_true: np.ndarray, probas: np.ndarray) -> Dict[str, float]:
+    """Calculate binary metrics from class-0/class-1 probability columns."""
     from sklearn.metrics import accuracy_score, balanced_accuracy_score, brier_score_loss, f1_score, log_loss, roc_auc_score
 
     y = np.asarray(y_true, dtype=np.int32)
@@ -451,6 +485,7 @@ def _write_committee_pooled_performance(
     H_hits_per_feature: int,
     aggregated_performance_results: Sequence[Mapping[str, Any]],
 ) -> str:
+    """Write pooled training and out-of-fold committee metrics."""
     unique_specialists = set()
     for perf in aggregated_performance_results:
         if bool(perf.get("is_permuted", False)):
@@ -484,6 +519,7 @@ def _write_ensemble_metrics(
     H_hits_per_feature: int,
     aggregated_performance_results: Sequence[Mapping[str, Any]],
 ) -> None:
+    """Write binary ensemble metrics and specialist-count metadata."""
     unique_specialists = set()
     for perf in aggregated_performance_results:
         if bool(perf.get("is_permuted", False)):

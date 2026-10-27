@@ -1,17 +1,7 @@
-"""Plain XGBoost comparison baseline for staged FeatureImp.
+"""Train full-feature XGBoost comparison models using FeatureImp fold plans.
 
-This optional postanalysis deliberately strips away the specialist-committee
-architecture while preserving the standard FeatureImp evaluation/reporting style:
-- one ordinary full-feature XGBoost model per planned fold;
-- reuse of the frozen h-hit fold plan from the main FeatureImp run;
-- pooled out-of-fold vs in-sample averaged predictions in logit space;
-- pooled Tree SHAP summaries on the margin scale; and
-- optional FSEA execution inside ``PLAIN_XGBOOST_BASELINE/``.
-
-Recent comparison-oriented additions:
-- permutation-subtracted global importance, analogous to the committee path;
-- across-repeat SHAP stability summaries;
-- per-individual and male-vs-female SHAP workbooks; and
+Aggregate predictions in logit space and report margin-scale SHAP, permutation
+baselines, repeat stability, and optional FSEA.
 """
 
 from __future__ import annotations
@@ -27,6 +17,7 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .integrity import strict_bool
 import numpy as np
 import pandas as pd
 
@@ -99,6 +90,7 @@ def _fit_plain_xgboost_model(
     random_state: int,
     n_jobs: int,
 ) -> Any:
+    """Fit one full-feature binary XGBoost classifier with the supplied model settings."""
     import xgboost as xgb
 
     model = xgb.XGBClassifier(
@@ -164,6 +156,7 @@ def _compute_across_repeat_shap_stability(
     repeat_group_signed: Mapping[str, Sequence[np.ndarray]],
     repeat_group_abs: Mapping[str, Sequence[np.ndarray]],
 ) -> pd.DataFrame:
+    """Summarize mean, deviation, and stability of global and group SHAP across repeats."""
     rows: Dict[str, Any] = {"feature_name": list(feature_names)}
     if repeat_global_abs:
         global_matrix = np.vstack([np.asarray(v, dtype=np.float64).reshape(1, -1) for v in repeat_global_abs])
@@ -223,6 +216,7 @@ def _cleanup_stale_permutation_outputs(out_dir: str) -> None:
 
 
 def _finalize_global_importance_columns(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and cumulatively sum global importance after ordering features."""
     if summary_df is None or summary_df.empty or "Global_Importance" not in summary_df.columns:
         return summary_df
     out = summary_df.copy()
@@ -240,6 +234,7 @@ def _finalize_global_importance_columns(summary_df: pd.DataFrame) -> pd.DataFram
 
 
 def _write_global_importance_ranking(*, out_dir: str, summary_df: pd.DataFrame) -> str:
+    """Export the ordered global-importance ranking and retained diagnostic columns."""
     if summary_df is None or summary_df.empty:
         ranking_df = pd.DataFrame(columns=["rank", "feature_name", "Global_Importance"])
     else:
@@ -277,27 +272,25 @@ def _run_optional_plain_xgboost_fsea(
     le: Any,
     num_classes: int,
 ) -> None:
+    """Run baseline enrichment using its resolved settings and SHAP arrays."""
     from .fsea_runner import _perform_fsea_analysis
 
     settings = FSEARuntimeSettings.from_mapping(settings_snapshot or {})
-    try:
-        _perform_fsea_analysis(
-            oof_shap_values=np.asarray(oof_shap_values, dtype=np.float64),
-            df_for_training=df_for_training,
-            all_feature_names=list(feature_names),
-            training_group_a=str(training_group_a),
-            training_group_b=str(training_group_b),
-            df_for_shap_and_agg=df_for_shap_and_agg,
-            paths={"analysis_folder": str(out_dir)},
-            le=le,
-            num_classes=int(num_classes),
-            all_groups_avg_shap_values=np.asarray(all_groups_avg_shap_values, dtype=np.float64),
-            settings=settings,
-        )
-    except ModuleNotFoundError as e:
-        if 'gseapy' not in str(e):
-            raise
-        print(f"WARNING: Skipping baseline FSEA because optional dependency is missing: {e}")
+    status = _perform_fsea_analysis(
+        oof_shap_values=np.asarray(oof_shap_values, dtype=np.float64),
+        df_for_training=df_for_training,
+        all_feature_names=list(feature_names),
+        training_group_a=str(training_group_a),
+        training_group_b=str(training_group_b),
+        df_for_shap_and_agg=df_for_shap_and_agg,
+        paths={"analysis_folder": str(out_dir)},
+        le=le,
+        num_classes=int(num_classes),
+        all_groups_avg_shap_values=np.asarray(all_groups_avg_shap_values, dtype=np.float64),
+        settings=settings,
+    )
+    if status.get("status") in {"partial", "failed"}:
+        raise RuntimeError("Required baseline FSEA incomplete: " + "; ".join(status.get("visualization_failures", [])))
 
 
 def run_plain_xgboost_baseline(
@@ -317,6 +310,12 @@ def run_plain_xgboost_baseline(
     fold_plan_records: Optional[Mapping[int, Mapping[str, Any]]] = None,
     run_fsea_analysis: Optional[bool] = None,
 ) -> str:
+    """Train full-feature XGBoost models for the frozen repeated folds and write
+    comparison outputs.
+
+    Use logit-space predictions and positive-class margin SHAP; optional permutation
+    runs shuffle only training-fold labels within sex strata.
+    """
     from .committee import FixedBinaryLabelEncoder
     from .shap_compat import make_tree_explainer
 
@@ -332,10 +331,10 @@ def run_plain_xgboost_baseline(
         )
 
     settings_map = dict(settings_snapshot or {})
-    resolved_run_fsea = bool(
+    resolved_run_fsea = strict_bool(
         run_fsea_analysis if run_fsea_analysis is not None else settings_map.get("run_fsea_analysis", False)
     )
-    run_permutation_test = bool(settings_map.get("run_permutation_test", False))
+    run_permutation_test = strict_bool(settings_map.get("run_permutation_test", False))
     n_permutations = int(settings_map.get("n_permutations", 0) or 0) if run_permutation_test else 0
     num_workers = max(1, int(settings_map.get("num_workers", 1) or 1))
 
@@ -379,10 +378,10 @@ def run_plain_xgboost_baseline(
     X_np32 = np.ascontiguousarray(np.asarray(X_np, dtype=np.float32))
     X_all_np32 = np.ascontiguousarray(np.asarray(X_all_np, dtype=np.float32))
 
-    n_estimators = int(settings_map.get("n_estimators", DEFAULT_SETTINGS.get("n_estimators", 1000)) or 1000)
-    learning_rate = float(settings_map.get("learning_rate", DEFAULT_SETTINGS.get("learning_rate", 0.01)) or 0.01)
-    max_depth = int(settings_map.get("max_depth", DEFAULT_SETTINGS.get("max_depth", 6)) or 6)
-    model_subsample = float(settings_map.get("model_subsample", DEFAULT_SETTINGS.get("model_subsample", 0.8)) or 0.8)
+    n_estimators = int(settings_map.get("n_estimators", DEFAULT_SETTINGS.get("n_estimators", 1000)))
+    learning_rate = float(settings_map.get("learning_rate", DEFAULT_SETTINGS.get("learning_rate", 0.01)))
+    max_depth = int(settings_map.get("max_depth", DEFAULT_SETTINGS.get("max_depth", 6)))
+    model_subsample = float(settings_map.get("model_subsample", DEFAULT_SETTINGS.get("model_subsample", 0.8)))
 
     _baseline_log(
         started_at,
@@ -933,6 +932,7 @@ def rerun_plain_xgboost_baseline_from_analysis_folder(
     settings_override: Optional[Mapping[str, Any]] = None,
     run_fsea_analysis: Optional[bool] = None,
 ) -> str:
+    """Restore a staged FeatureImp run and execute its full-feature XGBoost comparison."""
     from .baseline_outputs import (
         PLAIN_XGBOOST_DIRNAME,
         PLAIN_XGBOOST_STAGE_NAME,
@@ -948,7 +948,7 @@ def rerun_plain_xgboost_baseline_from_analysis_folder(
     settings_snapshot = loaded.get("settings_snapshot")
     effective_settings = dict(settings_snapshot or {})
     effective_settings.update(dict(settings_override or {}))
-    resolved_run_fsea = bool(
+    resolved_run_fsea = strict_bool(
         run_fsea_analysis
         if run_fsea_analysis is not None
         else effective_settings.get("run_fsea_analysis", True)
@@ -1027,6 +1027,7 @@ def rerun_plain_xgboost_baseline_from_analysis_folder(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the standalone comparison-baseline parser."""
     parser = argparse.ArgumentParser(
         description="Rerun the FeatureImp plain-XGBoost baseline from an existing staged analysis folder.",
     )
@@ -1042,6 +1043,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run a standalone full-feature XGBoost comparison from the command line."""
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     out_dir = rerun_plain_xgboost_baseline_from_analysis_folder(

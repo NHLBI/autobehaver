@@ -1,4 +1,4 @@
-"""Logging helpers for keypre."""
+"""Configure process-local logging for KeyPre."""
 
 from __future__ import annotations
 
@@ -7,13 +7,9 @@ import sys
 
 
 def configure_logging(log_level: str = "INFO") -> None:
-    """Configure root logging.
+    """Configure root logging, preserving existing handlers when present.
 
-    Safe to call multiple times:
-      - In the main process, it sets up handlers/format.
-      - In spawned multiprocessing workers (Windows), it sets up logging there too.
-      - In forked multiprocessing workers (Linux), it will usually detect existing handlers
-        and only update the log level.
+    Spawned workers configure their own handlers; forked workers can reuse them.
     """
 
     level_name = (log_level or "INFO").upper()

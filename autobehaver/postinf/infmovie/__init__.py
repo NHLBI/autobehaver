@@ -1,7 +1,6 @@
-"""Inference overlay movie (infmovie) utilities.
+"""InfMovie inference-overlay entry points.
 
-Imports are intentionally lazy so ``python -m autobehaver.postinf.infmovie --help``
-works without importing OpenCV-heavy rendering modules.
+Rendering imports load lazily so command-line help does not require OpenCV.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
+    """Resolve public InfMovie entry points without eager rendering imports."""
     if name in {"InfMovieConfig", "run_infmovie"}:
         from . import core
         return getattr(core, name)

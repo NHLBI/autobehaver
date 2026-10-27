@@ -1,8 +1,5 @@
-"""Paper-facing PCA reference-axis analysis for FeatureImp.
-
-This module fits PCA on the two reference training groups, projects all
-individuals, and computes on-axis/off-axis scores relative to the line between
-the two training-group centroids.
+"""Fit PCA on the two reference groups, project all individuals, and score distance
+along and away from their centroid axis.
 """
 
 from __future__ import annotations
@@ -95,6 +92,7 @@ def _quantile(series: pd.Series, q: float) -> float:
 
 
 def _summarize_axis_scores_by_group(axis_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize axis progress and orthogonal distance for each group."""
     columns = [
         "group",
         "n",
@@ -154,7 +152,10 @@ def run_pca_analysis(
     training_group_a: Optional[str] = None,
     training_group_b: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the retained PCA/on-axis/off-axis analysis."""
+    """Fit reference PCA and export individual axis scores and group summaries.
+
+    Axis progress is 0 at group B and 1 at group A.
+    """
 
     del df_train  # Parameter kept to match the caller signature.
 

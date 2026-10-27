@@ -1,4 +1,4 @@
-"""Multiprocessing-safe logging helpers for keyprenorm."""
+"""Route KeyPreNorm worker logs through a parent-process queue listener."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 
 
 def _parse_log_level(level_str: str) -> int:
+    """Resolve a logging level name or raise for an invalid name."""
     level = getattr(logging, str(level_str).upper(), None)
     if not isinstance(level, int):
         raise ValueError(f"Invalid --log_level '{level_str}'. Use DEBUG, INFO, WARNING, ERROR.")
@@ -18,14 +19,13 @@ def _parse_log_level(level_str: str) -> int:
 
 
 def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.Queue, QueueListener]:
-    """Configure multiprocessing-safe logging using a QueueListener.
+    """Start a logging queue listener and return (queue, listener).
 
-    Returns:
-        (log_queue, listener). Caller must stop the listener at shutdown.
+    The caller must stop the listener after workers and final logging finish.
     """
     level = _parse_log_level(log_level)
 
-    log_queue: mp.Queue = mp.Queue(-1)
+    log_queue: mp.Queue = mp.get_context("spawn").Queue(-1)
 
     fmt = logging.Formatter(
         fmt="%(asctime)s | %(levelname)s | %(processName)s | %(message)s",
@@ -49,13 +49,11 @@ def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.
     listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
     listener.start()
 
-    # Root logger in the main process sends to the queue
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(level)
     root.addHandler(QueueHandler(log_queue))
 
-    # Ensure our named logger propagates to root
     keyprenorm_logger = logging.getLogger("keyprenorm")
     keyprenorm_logger.propagate = True
     keyprenorm_logger.setLevel(level)
@@ -64,7 +62,7 @@ def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.
 
 
 def setup_worker_logging(log_queue: mp.Queue, log_level: str) -> None:
-    """Attach a QueueHandler in a worker process."""
+    """Route worker log records to the parent-process queue."""
     level = _parse_log_level(log_level)
     root = logging.getLogger()
     root.handlers.clear()

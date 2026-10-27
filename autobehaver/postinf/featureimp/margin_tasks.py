@@ -1,16 +1,13 @@
-"""Per-subset raw-margin artifacts for staged FeatureImp predictions.
+"""Store and reduce subset-level raw-margin sums and counts from FeatureImp shards.
 
-This module supports a faster staged merge path for prediction aggregation.
-Instead of reopening every saved XGBoost model during the final merge just to
-recompute raw margins, shard jobs can persist per-subset margin sums/counts while
-the model is already in memory. Merge then only needs to apply subset weights
-and aggregate those saved subset-local tensors.
+Final merging applies subset weights without reopening saved models.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .integrity import strict_bool
 import numpy as np
 
 from .logit_ensemble import LogitEnsemblePredictions, _sigmoid_stable
@@ -91,16 +88,11 @@ def save_margin_task_archive(
 
 
 def load_margin_task_archive(path: str) -> Dict[str, np.ndarray]:
+    """Load and validate required margin arrays from a task archive."""
     if not path:
         raise ValueError("Margin archive path is empty.")
-    out: Dict[str, np.ndarray] = {}
-    with np.load(path, allow_pickle=False) as data:
-        for key in _REQUIRED_ARCHIVE_KEYS:
-            if key not in data.files:
-                raise ValueError(f"Margin archive missing required key '{key}': {path}")
-            out[key] = np.asarray(data[key])
-    return out
-
+    from .archive_io import load_npz_arrays
+    return load_npz_arrays(path, _REQUIRED_ARCHIVE_KEYS)
 
 
 def _iter_relevant_model_records(
@@ -109,11 +101,12 @@ def _iter_relevant_model_records(
     include_permuted: bool = False,
     permutation_idx: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """Select real models or the requested permutation models from performance records."""
     out: List[Dict[str, Any]] = []
     for rec in performance_records:
         if not isinstance(rec, Mapping):
             continue
-        is_perm = bool(rec.get("is_permuted", False))
+        is_perm = strict_bool(rec.get("is_permuted", False))
         if include_permuted:
             if not is_perm:
                 continue
@@ -133,6 +126,7 @@ def _iter_relevant_model_records(
 
 
 def _load_task_records_from_archives(paths: Sequence[str]) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Read unique subset margin records from the supplied archives."""
     task_map: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for path in paths:
         if not path:
@@ -203,7 +197,9 @@ def compute_logit_ensemble_predictions_from_margin_task_archives(
         key = (h_hit, subset_idx)
         if key not in subsets:
             subsets[key] = {}
-        subsets[key].setdefault(fold_idx, dict(rec))
+        if fold_idx in subsets[key]:
+            raise ValueError("Duplicate fold identity in margin archive records")
+        subsets[key][fold_idx] = dict(rec)
 
     task_map = _load_task_records_from_archives(archive_paths)
 
@@ -229,8 +225,7 @@ def compute_logit_ensemble_predictions_from_margin_task_archives(
 
     for (h_hit, subset_idx), fold_map in sorted(subsets.items()):
         if len(fold_map) != int(n_splits) or any(i not in fold_map for i in range(int(n_splits))):
-            skipped_incomplete_subsets += 1
-            continue
+            raise ValueError("Task archive subset lacks its complete fold identities")
 
         task = task_map.get((int(h_hit), int(subset_idx)))
         if task is None:
@@ -240,6 +235,13 @@ def compute_logit_ensemble_predictions_from_margin_task_archives(
         test_count = np.asarray(task["test_pred_count"], dtype=np.int32)
         train_count = np.asarray(task["train_pred_count"], dtype=np.int32)
         all_count = int(task["all_groups_model_count"])
+        if test_count.shape != (int(n_train),) or train_count.shape != (int(n_train),) or np.any(test_count != 1) or np.any(train_count != int(n_splits)-1) or all_count != int(n_splits):
+            raise ValueError("Margin task fold contribution counts differ from complete planned folds")
+        for value_key, value_length in (("oof_margin_sum", n_train), ("insample_margin_sum", n_train), ("all_groups_margin_sum", n_all)):
+            value_array = np.asarray(task[value_key])
+            if value_array.shape != (int(value_length),) or not np.isfinite(value_array).all():
+                raise ValueError("Margin task values are nonfinite or misaligned")
+
 
         oof_margin_sum += np.asarray(task["oof_margin_sum"], dtype=np.float64)
         oof_margin_count += test_count
@@ -384,7 +386,10 @@ def reduce_weighted_margin_task_archives_to_partial(
             fold_idx = int(rec.get("fold_idx"))
         except Exception:
             continue
-        subsets.setdefault((h_hit, subset_idx), {})[fold_idx] = dict(rec)
+        fold_map = subsets.setdefault((h_hit, subset_idx), {})
+        if fold_idx in fold_map:
+            raise ValueError("Duplicate task fold identity")
+        fold_map[fold_idx] = dict(rec)
 
     task_map = _load_task_records_from_archives(archive_paths)
 
@@ -403,10 +408,11 @@ def reduce_weighted_margin_task_archives_to_partial(
 
     for (h_hit, subset_idx), fold_map in sorted(subsets.items()):
         if len(fold_map) != int(n_splits) or any(i not in fold_map for i in range(int(n_splits))):
-            skipped_incomplete_subsets += 1
-            continue
+            raise ValueError("Task archive subset lacks its complete fold identities")
         w = float(subset_weights.get((int(h_hit), int(subset_idx)), 0.0))
-        if not np.isfinite(w) or w <= 0.0:
+        if not np.isfinite(w) or w < 0:
+            raise ValueError("Subset weights must be nonnegative finite")
+        if w == 0.0:
             skipped_zero_weight_subsets += 1
             continue
         task = task_map.get((int(h_hit), int(subset_idx)))
@@ -417,6 +423,13 @@ def reduce_weighted_margin_task_archives_to_partial(
         test_count = np.asarray(task["test_pred_count"], dtype=np.int32)
         train_count = np.asarray(task["train_pred_count"], dtype=np.int32)
         all_count = int(task["all_groups_model_count"])
+        if test_count.shape != (int(n_train),) or train_count.shape != (int(n_train),) or np.any(test_count != 1) or np.any(train_count != int(n_splits)-1) or all_count != int(n_splits):
+            raise ValueError("Margin task fold contribution counts differ from complete planned folds")
+        for value_key, value_length in (("oof_margin_sum", n_train), ("insample_margin_sum", n_train), ("all_groups_margin_sum", n_all)):
+            value_array = np.asarray(task[value_key])
+            if value_array.shape != (int(value_length),) or not np.isfinite(value_array).all():
+                raise ValueError("Margin task values are nonfinite or misaligned")
+
 
         oof_margin_num += w * np.asarray(task["oof_margin_sum"], dtype=np.float64)
         oof_weight_den += w * test_count.astype(np.float64)
@@ -473,6 +486,7 @@ def reduce_weighted_margin_task_archives_to_partial(
 
 
 def merge_weighted_margin_partials(paths: Sequence[str]) -> Dict[str, np.ndarray]:
+    """Add compatible weighted-margin partials after validating their shapes."""
     if not paths:
         raise ValueError("No weighted margin partial paths were provided for merge.")
     merged: Optional[Dict[str, np.ndarray]] = None
@@ -508,6 +522,11 @@ def finalize_weighted_margin_partial(
     partial: Mapping[str, Any],
     num_classes: int,
 ) -> LogitEnsemblePredictions:
+    """Convert weighted margin numerators and denominators to binary prediction arrays.
+
+    Columns follow class 0 then class 1; missing support uses the defined zero-margin
+    fallback.
+    """
     if int(num_classes) != 2:
         raise ValueError(
             f"Weighted margin partial finalization currently supports binary classification only; got num_classes={num_classes}"
@@ -519,6 +538,11 @@ def finalize_weighted_margin_partial(
     insample_weight_den = np.asarray(partial["insample_weight_den"], dtype=np.float64)
     all_margin_num = np.asarray(partial["all_margin_num"], dtype=np.float64)
     all_weight_den_scalar = float(np.asarray(partial["all_weight_den_scalar"], dtype=np.float64).reshape(()))
+    for numerator, denominator in ((oof_margin_num, oof_weight_den), (insample_margin_num, insample_weight_den)):
+        if numerator.shape != denominator.shape or not np.isfinite(numerator).all() or not np.isfinite(denominator).all() or np.any(denominator <= 0):
+            raise ValueError("Weighted predictions require finite numerators and positive support for every animal")
+    if not np.isfinite(all_margin_num).all() or not np.isfinite(all_weight_den_scalar) or all_weight_den_scalar <= 0:
+        raise ValueError("All-group predictions have no positive finite committee support")
 
     with np.errstate(divide="ignore", invalid="ignore"):
         oof_margin_mean = np.where(oof_weight_den > 0, oof_margin_num / oof_weight_den, np.nan)

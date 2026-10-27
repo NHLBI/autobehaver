@@ -1,13 +1,5 @@
-"""autobehaver.postinf.featureimp.prep
-
-Data-preparation helpers for the Feature Importance (featureimp) step.
-
-Scope:
-  - Analysis folder naming
-  - Sex filtering helpers
-  - Feature-name parsing helpers
-  - Sparse-feature and low-variance feature filtering utilities
-
+"""Name FeatureImp runs, filter sex strata, parse feature families, and apply
+completeness and variance criteria.
 """
 
 from __future__ import annotations
@@ -77,18 +69,6 @@ def _parse_feature_name(feature_name: str) -> Dict[str, Any]:
             "smoothing": kin_match.group(3),
             "measurement": kin_match.group(4),
             "grouping_key": f"{kin_match.group(1)}_{kin_match.group(2)}_{kin_match.group(4)}",  # ignore smoothing for grouping
-        }
-
-    # Time-weighted kinematic features use KinematicTW_[Category]_[Measurement]
-    # without a separate smoothing token.
-    kin_tw_match = re.match(r"KinematicTW_(Pose\+Orient|Pose)_(.+)", feature_name)
-    if kin_tw_match:
-        return {
-            "source": "KinematicTW",
-            "category": kin_tw_match.group(1),
-            "smoothing": None,
-            "measurement": kin_tw_match.group(2),
-            "grouping_key": f"KinematicTW_{kin_tw_match.group(1)}_{kin_tw_match.group(2)}",
         }
 
     # For other features, try to extract source

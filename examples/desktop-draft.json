@@ -1,0 +1,5 @@
+{
+  "dataset": "D:/experiments/example",
+  "pipeline_name": "example_from_dlc",
+  "start_at": "features"
+}

@@ -1,4 +1,4 @@
-"""Package entry point for the DLC inference wrapper stage."""
+"""Run the DeepLabCut command-line entry point."""
 
 from .cli import main
 

@@ -1,8 +1,4 @@
-"""Unit tests for feature_selection utilities (posepred ablations).
-
-These tests are intentionally small and dependency-free.
-They validate deterministic behavior and basic matching semantics.
-"""
+"""Check deterministic PosePred feature selection and exclusion matching."""
 
 from __future__ import annotations
 
@@ -34,7 +30,7 @@ class TestFeatureSelection(unittest.TestCase):
         self.assertNotEqual(compute_schema_hash(a), compute_schema_hash(c))
 
     def test_resolve_feature_plan_default_preset_is_no_pos(self):
-        # Ensure DEFAULT_PRESET is the expected one.
+        # The frozen models use the no_pos preset.
         self.assertEqual(DEFAULT_PRESET, "no_pos")
 
     def test_resolve_feature_plan_exclude_rules(self):

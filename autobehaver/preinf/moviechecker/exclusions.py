@@ -1,10 +1,4 @@
-"""Read/write exclusions CSV for moviechecker.
-
-The exclusions file is intentionally a simple CSV so users can manually adjust
-it if file paths/names change.
-
-Each row corresponds to a *paired* full-movie unit (movie0/movie1).
-"""
+"""Read and write six-chamber exclusions for paired full-movie recordings."""
 
 from __future__ import annotations
 
@@ -31,12 +25,14 @@ EXCLUSIONS_HEADER = [
 
 @dataclass
 class ExclusionRecord:
+    """Store one movie-pair identity and six binary chamber exclusion flags."""
     pair_key: str
     reviewed_movie: str
     exclude_ch: List[int]  # length 6, values 0/1
     updated_at: float
 
     def to_row(self) -> Dict[str, str]:
+        """Serialize the record into the exclusions CSV column layout."""
         row: Dict[str, str] = {
             "pair_key": self.pair_key,
             "reviewed_movie": self.reviewed_movie,
@@ -48,12 +44,18 @@ class ExclusionRecord:
 
     @staticmethod
     def from_row(row: Dict[str, str]) -> "ExclusionRecord":
+        """Parse and validate one exclusions row."""
         pair_key = str(row.get("pair_key", "")).strip()
+        if not pair_key:
+            raise ValueError("pair_key is blank")
         reviewed_movie = str(row.get("reviewed_movie", "")).strip()
         exclude_ch: List[int] = []
         for i in range(6):
-            v = str(row.get(f"exclude_ch{i+1}", "0")).strip()
-            exclude_ch.append(1 if v in {"1", "true", "True", "YES", "yes"} else 0)
+            column = f"exclude_ch{i+1}"
+            v = str(row.get(column, "")).strip().lower()
+            if v not in {"0", "1", "0.0", "1.0", "false", "true", "no", "yes", "n", "y", "off", "on"}:
+                raise ValueError(f"{pair_key}: {column} must be 0/1, false/true or no/yes; got {row.get(column)!r}")
+            exclude_ch.append(int(v in {"1", "1.0", "true", "yes", "y", "on"}))
         try:
             updated_at = float(row.get("updated_at", "0") or 0.0)
         except Exception:
@@ -67,15 +69,11 @@ class ExclusionRecord:
 
 
 class ExclusionsStore:
-    """A small in-memory cache + CSV writer.
+    """Cache exclusions and write the complete review state to CSV.
 
-    The normal save path writes a complete temporary CSV and atomically replaces
-    ``exclusions.csv``.  Windows network drives can occasionally refuse the
-    final replace if the destination file is briefly locked by another process
-    or if the share allows writing but not rename-over-existing.  To make manual
-    review less fragile, saving now retries the replace and then falls back to a
-    direct overwrite before giving up.  If every save strategy fails, the fully
-    written temporary CSV is deliberately left behind as a recovery file.
+    Retry atomic replacement for temporary storage locks, then try direct
+    overwrite for shares that reject rename-over-existing. Preserve a complete
+    temporary recovery copy when both approaches fail.
     """
 
     def __init__(self, csv_path: str):
@@ -83,16 +81,30 @@ class ExclusionsStore:
         self.records: Dict[str, ExclusionRecord] = {}
 
     def load(self) -> None:
-        self.records = {}
+        """Load validated exclusions, rejecting conflicting duplicate pair keys."""
+        loaded: Dict[str, ExclusionRecord] = {}
         if not os.path.exists(self.csv_path):
+            self.records = loaded
             return
 
-        with open(self.csv_path, "r", newline="") as f:
+        with open(self.csv_path, "r", newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                rec = ExclusionRecord.from_row(row)
-                if rec.pair_key:
-                    self.records[rec.pair_key] = rec
+            fields = reader.fieldnames or []
+            required = ["pair_key", *(f"exclude_ch{i}" for i in range(1, 7))]
+            missing = [column for column in required if column not in fields]
+            if missing or len(fields) != len(set(fields)):
+                raise ValueError(f"{self.csv_path}: invalid exclusions header; missing columns {missing}; duplicate columns are not permitted")
+            for row_number, row in enumerate(reader, start=2):
+                try:
+                    rec = ExclusionRecord.from_row(row)
+                except ValueError as exc:
+                    raise ValueError(f"{self.csv_path}, row {row_number}: {exc}") from exc
+                previous = loaded.get(rec.pair_key)
+                if previous is not None and previous.exclude_ch != rec.exclude_ch:
+                    raise ValueError(f"{self.csv_path}, row {row_number}: conflicting exclusions for duplicate pair_key {rec.pair_key!r}")
+                if previous is None or rec.updated_at >= previous.updated_at:
+                    loaded[rec.pair_key] = rec
+        self.records = loaded
 
     def has(self, pair_key: str) -> bool:
         return pair_key in self.records
@@ -101,6 +113,7 @@ class ExclusionsStore:
         return self.records.get(pair_key)
 
     def upsert(self, pair_key: str, reviewed_movie: str, exclude_ch: List[int]) -> None:
+        """Replace the in-memory review record for one movie pair."""
         if len(exclude_ch) != 6:
             raise ValueError("exclude_ch must be length 6")
         self.records[pair_key] = ExclusionRecord(
@@ -111,6 +124,7 @@ class ExclusionsStore:
         )
 
     def _write_csv_file(self, path: str) -> None:
+        """Write the complete sorted exclusions table and flush buffered data."""
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=EXCLUSIONS_HEADER)
             writer.writeheader()
@@ -133,6 +147,10 @@ class ExclusionsStore:
         return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33}
 
     def write_atomic(self, *, attempts: int = 8, delay_s: float = 0.25) -> None:
+        """Save exclusions with atomic-replace retries and a direct-write fallback.
+
+        Retain a complete recovery copy if publication fails.
+        """
         os.makedirs(os.path.dirname(self.csv_path) or ".", exist_ok=True)
         tmp_dir = os.path.dirname(self.csv_path) or "."
         fd, tmp_path = tempfile.mkstemp(prefix="exclusions_", suffix=".csv", dir=tmp_dir)
@@ -153,10 +171,8 @@ class ExclusionsStore:
                         break
                     time.sleep(max(0.0, float(delay_s)) * (attempt + 1))
 
-            # Some Windows/SMB shares allow ordinary writes but reject atomic
-            # rename-over-existing.  This is not atomic, but it is better than
-            # crashing during manual review when the source of truth is a small
-            # user-editable CSV.
+            # Some Windows/SMB shares reject rename-over-existing but allow
+            # direct writes. Retain a recovery copy if this fallback also fails.
             try:
                 self._write_csv_file(self.csv_path)
                 return
@@ -170,9 +186,7 @@ class ExclusionsStore:
                     f"review state: {tmp_path!r}. Close any program using the CSV, "
                     "then rename/copy the recovery file to exclusions.csv if needed."
                 )
-                # Chain the direct write error, because it is the last operation
-                # attempted.  The message tells the user the replace was also
-                # retried first.
+                # Report the final publication error with the recovery path.
                 raise RuntimeError(msg) from direct_exc
         finally:
             if remove_tmp:

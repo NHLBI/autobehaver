@@ -1,8 +1,4 @@
-"""Run manifest utilities for keypre.
-
-The manifest records the feature spec, runtime settings, paths, and processing
-results so each run is self-describing.
-"""
+"""Record KeyPre feature specifications, runtime options, paths, and outcomes."""
 
 from __future__ import annotations
 
@@ -27,7 +23,7 @@ from . import spec as spec_mod
 
 
 def _jsonable(obj):
-    """Convert common containers (incl. tuples) into JSON-serializable types."""
+    """Convert nested containers to JSON-serializable values."""
 
     if isinstance(obj, tuple):
         return [_jsonable(x) for x in obj]
@@ -39,7 +35,7 @@ def _jsonable(obj):
 
 
 def _keypre_spec_snapshot() -> dict:
-    """Return a JSON-serializable snapshot of keypre settings + spec lists."""
+    """Return a serializable snapshot of KeyPre settings and ordered feature specifications."""
 
     snapshot = {
         "autobehaver_version": AUTOBEHAVER_VERSION,
@@ -68,14 +64,14 @@ def _keypre_spec_snapshot() -> dict:
 
 
 def _sha256_json(payload: dict) -> str:
-    """Return SHA256 hex digest for a dict, using stable JSON serialization."""
+    """Hash a dictionary using stable JSON serialization."""
 
     s = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def _sha256_file(path: str) -> str | None:
-    """Return SHA256 hex digest for a file, or None if unavailable."""
+    """Return the file SHA256 digest, or None when unavailable."""
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -87,7 +83,7 @@ def _sha256_file(path: str) -> str | None:
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
-    """Atomically write JSON to disk (write temp then rename)."""
+    """Write JSON to a temporary file and atomically replace the destination."""
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -104,11 +100,7 @@ def _build_run_manifest(
     start_time_iso: str,
     entrypoint: str | None = None,
 ) -> tuple[str, dict]:
-    """Build and write a run manifest JSON file.
-
-    Returns:
-        (manifest_path, manifest_dict)
-    """
+    """Write the initial run manifest and return its path and dictionary."""
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
     manifest_path = os.path.join(out_dir, f"keypre_run_manifest_{run_id}.json")
@@ -151,6 +143,7 @@ def _build_run_manifest(
             "csv_count": len(csv_files),
             "csv_pattern": os.path.join(csv_source_folder, "*.csv"),
             "example_csv_files": [os.path.basename(p) for p in csv_files[:10]],
+            "csv_files": [os.path.abspath(p) for p in csv_files],
         },
         "runtime": {
             "python_version": sys.version,

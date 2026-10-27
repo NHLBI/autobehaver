@@ -1,17 +1,9 @@
-"""Small argparse helpers used across Autobehaver CLI entrypoints.
-
-These utilities are intentionally lightweight and dependency-free.
-
-Goals
------
-- Keep one canonical spelling (underscored long options) in --help.
-- Accept hyphenated variants (e.g. --file-filter) without duplicating parser code.
-- Provide a consistent two-sided boolean style: --flag / --no_flag.
-"""
+"""Resolve long-option aliases and paired boolean CLI flags."""
 
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Optional, Sequence
 
 
@@ -28,21 +20,28 @@ def normalize_argv(
     *,
     parser: Optional[argparse.ArgumentParser] = None,
 ) -> list[str]:
-    """Normalize long options to the canonical underscored spelling.
+    """Resolve hyphen/underscore aliases to options declared by the parser.
 
-    Notes
-    -----
-    - Only rewrites tokens starting with "--".
-    - Supports "--opt=value" style.
-    - Does *not* attempt to rewrite short flags ("-i").
+    Preserve option values, short flags and tokens after ``--``.
     """
 
     known: set[str] = set()
     if parser is not None:
         known |= _collect_option_strings(parser)
 
+    aliases: dict[str, list[str]] = {}
+    for option in known:
+        if option.startswith('--'):
+            aliases.setdefault(option[2:].replace('-', '_'), []).append(option)
+
     out: list[str] = []
+    positional_only = False
     for tok in list(argv):
+        if tok == '--':
+            positional_only = True
+        if positional_only:
+            out.append(tok)
+            continue
         if not tok.startswith("--"):
             out.append(tok)
             continue
@@ -50,14 +49,21 @@ def normalize_argv(
         opt, eq, val = tok.partition("=")
         opt2 = opt
 
-        if "-" in opt2:
-            cand = opt2.replace("-", "_")
-            if cand in known:
-                opt2 = cand
+        if opt2 not in known:
+            candidates = aliases.get(opt2[2:].replace('-', '_'), [])
+            if len(candidates) == 1:
+                opt2 = candidates[0]
 
         out.append(opt2 + (eq + val if eq else ""))
 
     return out
+
+
+def parse_cli_args(parser: argparse.ArgumentParser, argv: Optional[Sequence[str]] = None):
+    """Parse one direct invocation with consistent option spellings."""
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    parser.allow_abbrev = False
+    return parser.parse_args(normalize_argv(arguments, parser=parser))
 
 
 def add_bool_pair(
@@ -68,15 +74,9 @@ def add_bool_pair(
     help: str,
     dest: Optional[str] = None,
 ) -> None:
-    """Add a two-sided boolean flag: --flag / --no_flag.
+    """Add mutually exclusive ``--flag`` and ``--no_flag`` switches.
 
-    Parameters
-    ----------
-    flag:
-        Either "flag" or "--flag".
-    default:
-        If True/False, sets a real default. If None, the destination is left as
-        tri-state (None unless explicitly set on the CLI).
+    A default of None preserves an unset value until a switch is supplied.
     """
 
     base = flag[2:] if flag.startswith("--") else flag

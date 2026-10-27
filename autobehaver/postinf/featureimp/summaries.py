@@ -1,10 +1,6 @@
-"""Feature-importance SHAP summaries and post-processing helpers.
+"""Aggregate FeatureImp SHAP values into individual and group summaries.
 
-This module contains FeatureImp SHAP summary helpers for:
-
-- Aggregating per-fold SHAP outputs into per-individual and consolidated summaries
-- Producing optional male-vs-female comparisons
-- Cleaning filenames and JSON payloads used by the summary pipeline
+Support in-sample/out-of-fold and male/female comparisons with formatted exports.
 """
 
 from __future__ import annotations
@@ -21,6 +17,9 @@ import pandas as pd
 
 from scipy.stats import spearmanr
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import shap
 
@@ -34,9 +33,7 @@ from .io_utils import _sanitize_excel_sheet_name
 # Module-level default used when callers do not pass explicit settings.
 _DEFAULT_SUMMARY_SETTINGS = SummaryRuntimeSettings.from_mapping(DEFAULT_SETTINGS)
 
-# -----------------------------------------------------------------------------
 # Binary classification convention
-# -----------------------------------------------------------------------------
 # Throughout FeatureImp we treat the "positive" class as index 1 and the
 # "negative" class as index 0. This matches FixedBinaryLabelEncoder, which
 # encodes the training groups in a fixed order (group_a -> 0, group_b -> 1).
@@ -65,13 +62,12 @@ def apply_settings(settings: Dict[str, Any]) -> None:
 
 
 def _clean_performance_dict_for_json(perf_dict):
-    """
-    Converts a performance dictionary to JSON-serializable format.
+    """Convert a performance dictionary to JSON-serializable format.
     Handles numpy types, None values, and ensures all values are basic Python types.
-    
+
     Args:
         perf_dict: Dictionary with performance metrics (may contain numpy types)
-    
+
     Returns:
         Dictionary with all values converted to JSON-serializable types
     """
@@ -114,8 +110,8 @@ def _sanitize_group_name_for_filename(group_name):
 
 def _aggregate_shap_from_files(all_shap_file_paths, all_feature_names, df_shape, num_classes, 
                                 performance_results, n_splits=5, validation_error_on_fail: Optional[bool] = None):
-    """
-    Aggregates SHAP values from multiple file paths (from specialists across all folds).
+    """Aggregate SHAP values from multiple file paths (from specialists across all
+    folds).
 
     Notes:
       - This is primarily used by older per-file SHAP aggregation helpers and
@@ -235,7 +231,7 @@ def _aggregate_shap_from_files(all_shap_file_paths, all_feature_names, df_shape,
 
         msg = "\n".join(msg_lines)
 
-        # If you want strict correctness, raise. Otherwise, warn loudly and continue with partial aggregation.
+        # Honor the configured failure policy for incomplete legacy-file aggregation.
         if settings_validation_error_on_fail:
             raise RuntimeError(msg)
         else:
@@ -256,10 +252,9 @@ def _aggregate_shap_from_files(all_shap_file_paths, all_feature_names, df_shape,
 
 
 def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths, suffix, train_groups):
-    """
-    Generates SHAP summaries for in-sample or out-of-sample data in the same format
+    """Generate SHAP summaries for in-sample or out-of-sample data in the same format
     as the main analysis, but with a suffix added to filenames.
-    
+
     Args:
         shap_values: numpy array of SHAP values (n_samples, n_features) for binary or (n_samples, n_features, n_classes) for multi
         df: DataFrame with training data (individual, group columns)
@@ -268,7 +263,7 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
         paths: dictionary of paths
         suffix: 'insample' or 'outofsample'
         train_groups: list of training group names
-    
+
     Returns:
         tuple: (individual_summary_sheets, consolidated_df)
             - individual_summary_sheets: dict of {sheet_name: DataFrame} for per-individual summary
@@ -280,7 +275,7 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
     X = df[selected_features]
     num_classes = len(le.classes_)
     
-    # --- Per-Individual Summary ---
+    # Per-Individual Summary
     feature_cols = list(X.columns)  # Convert to list to avoid pandas Index printing issues
     
     # Validate shap_values before creating DataFrame
@@ -308,7 +303,7 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
     # Note: Individual summary sheets are returned but not saved here.
     # They will be combined with the other suffix's sheets into a single file.
     
-    # --- Per-Group Summary ---
+    # Per-Group Summary
     group_summary_data = {}
     all_groups_in_data = df['group'].unique()
     
@@ -358,7 +353,7 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
             print(f"  Continuing without this plot...")
             # Continue execution - don't crash the whole analysis
     
-    # --- Global Importance Calculation ---
+    # Global Importance Calculation
     global_mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
     
     global_shap_df = pd.DataFrame({
@@ -366,7 +361,7 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
         'Global_Importance': global_mean_abs_shap
     }).sort_values(by='Global_Importance', ascending=False)
     
-    # --- Build Consolidated Summary ---
+    # Build Consolidated Summary
     consolidated_df = global_shap_df.copy()
     
     stats_pivoted = pd.DataFrame({'feature_name': []})
@@ -411,7 +406,7 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
         
         consolidated_df = pd.merge(consolidated_df, class_block_df, on='feature_name', how='left')
     
-    # --- Add Normalized Columns (Post-Aggregation) ---
+    # Add Normalized Columns (Post-Aggregation)
     # Normalize Global_Importance
     total_global_importance = consolidated_df['Global_Importance'].sum()
     if total_global_importance > 1e-10:
@@ -487,20 +482,15 @@ def _generate_kfold_shap_summaries(shap_values, df, selected_features, le, paths
     else:
         consolidated_df['Global_Importance_Cumulative'] = np.nan
 
-    # Don't save individual files - they'll be combined into INSAMPLE_VS_OUTOFSAMPLE file
-    # Only save if this is not being used for combination (e.g., if suffix is not 'insample' or 'outofsample')
-    # Actually, we'll skip saving here entirely since the combined file has everything
 
-    # Return both individual_summary_sheets and consolidated_df
     return individual_summary_sheets, consolidated_df
 
 
 def _generate_male_female_comparison(df, selected_features, all_shap_file_paths, le, paths, avg_shap_values_override=None):
-    """
-    Generates a male vs female SHAP comparison for each class.
+    """Generate a male vs female SHAP comparison for each class.
     Compares SHAP values between males and females within each class to identify
     sex-specific feature importance differences.
-    
+
     Args:
         df: DataFrame with 'individual', 'group', 'sex' columns
         selected_features: List of selected feature names
@@ -580,6 +570,9 @@ def _generate_male_female_comparison(df, selected_features, all_shap_file_paths,
     print(f"  - Training rows available for global-importance alignment: {int(np.sum(train_mask))}")
 
     def _mean_abs_shap_for_mask(mask: np.ndarray) -> Optional[np.ndarray]:
+        """Average absolute SHAP over selected rows, returning None for an empty
+        selection.
+        """
         mask = np.asarray(mask, dtype=bool)
         if mask.shape[0] != avg_shap_values.shape[0]:
             raise ValueError(
@@ -608,7 +601,7 @@ def _generate_male_female_comparison(df, selected_features, all_shap_file_paths,
         arr = np.asarray(values, dtype=np.float64)
         if np.isfinite(denom) and abs(float(denom)) > 1e-10:
             return arr / float(denom)
-        return np.zeros(arr.shape, dtype=np.float64)
+        return np.where(np.isfinite(arr), 0.0, np.nan)
     
     # For each group, calculate mean SHAP for males and females
     male_summaries = {}
@@ -704,21 +697,33 @@ def _generate_male_female_comparison(df, selected_features, all_shap_file_paths,
     if male_global_importance is None:
         male_global_importance = _mean_abs_shap_for_mask(male_all_mask)
         if male_global_importance is None:
-            male_global_importance = np.zeros(len(feature_cols_list))
-            print("  - WARNING: No male rows available for global importance. Using zeros.")
+            male_global_importance = np.full(len(feature_cols_list), np.nan)
+            print("  - WARNING: No male rows available for global importance. Marked unavailable.")
         else:
             print("  - WARNING: No male training rows found; using all male rows for Global_Importance.")
 
     if female_global_importance is None:
         female_global_importance = _mean_abs_shap_for_mask(female_all_mask)
         if female_global_importance is None:
-            female_global_importance = np.zeros(len(feature_cols_list))
-            print("  - WARNING: No female rows available for global importance. Using zeros.")
+            female_global_importance = np.full(len(feature_cols_list), np.nan)
+            print("  - WARNING: No female rows available for global importance. Marked unavailable.")
         else:
             print("  - WARNING: No female training rows found; using all female rows for Global_Importance.")
     
     male_df['Global_Importance'] = male_global_importance
     female_df['Global_Importance'] = female_global_importance
+
+    availability = {}
+    for label, reference_mask, all_mask in (
+        ("male", male_train_mask, male_all_mask),
+        ("female", female_train_mask, female_all_mask),
+    ):
+        n_reference, n_all = int(reference_mask.sum()), int(all_mask.sum())
+        availability[label] = {"training_row_count": n_reference, "all_row_count": n_all,
+            "global_importance_source": "training_rows" if n_reference else "all_rows" if n_all else "unavailable"}
+    from autobehaver.atomic_io import atomic_write_json
+    atomic_write_json(availability, os.path.join(paths["analysis_folder"],
+        f'SHAP_SEX_AVAILABILITY{paths.get("file_suffix", "")}.json'))
     
     # Validation Check: Check global importance
     print(f"  - Male global importance: min={male_global_importance.min():.6f}, max={male_global_importance.max():.6f}, non-zero={np.count_nonzero(male_global_importance)}")
@@ -751,7 +756,7 @@ def _generate_male_female_comparison(df, selected_features, all_shap_file_paths,
             female_df[f'StdSHAP_{group_name}'] = np.nan
             print(f"    WARNING: Group '{group_name}' missing from female_summaries")
     
-    # --- Add Normalized Columns (Post-Aggregation) ---
+    # Add Normalized Columns (Post-Aggregation)
     # Normalize Global_Importance for male and female separately
     total_male_global = male_df['Global_Importance'].sum()
     male_df['Global_Importance_Normalized'] = _normalized_or_zero(
@@ -873,15 +878,23 @@ def _generate_male_female_comparison(df, selected_features, all_shap_file_paths,
             if nan_count > 0:
                 print(f"    - {col}: {nan_count} NaN values")
     
-    # Now combine similar to in-sample vs out-of-sample
     _combine_male_female_summaries(male_df, female_df, paths)
 
 
+
+def _magnitude_rank_correlation(first, second):
+    """Spearman magnitude correlation with average ties; constants are undefined."""
+    a, b = np.abs(np.asarray(first, dtype=float)), np.abs(np.asarray(second, dtype=float))
+    keep = np.isfinite(a) & np.isfinite(b)
+    a, b = a[keep], b[keep]
+    if a.size < 2 or np.ptp(a) == 0 or np.ptp(b) == 0:
+        return float("nan")
+    return float(spearmanr(a, b).statistic)
+
 def _combine_male_female_summaries(male_df, female_df, paths):
-    """
-    Combines male and female consolidated summaries into a single file
+    """Combine male and female consolidated summaries into a single file
     for easier comparison. Similar structure to in-sample vs out-of-sample.
-    
+
     Args:
         male_df: DataFrame with male consolidated summary
         female_df: DataFrame with female consolidated summary
@@ -921,7 +934,6 @@ def _combine_male_female_summaries(male_df, female_df, paths):
             new_male_cols.append(f'{col}_MALE' if col != '' else col)
     male_df_labeled.columns = new_male_cols
     
-    # Create combined DataFrame
     combined_df = male_df_labeled.copy()
     
     # Calculate comparison metrics between male and female    
@@ -1023,16 +1035,14 @@ def _combine_male_female_summaries(male_df, female_df, paths):
         
         # 4. Rank_Correlation
         if len(male_clean) > 1:
-            male_ranks = np.argsort(np.argsort(-np.abs(male_clean)))
-            female_ranks = np.argsort(np.argsort(-np.abs(female_clean)))
-            corr, _ = spearmanr(male_ranks, female_ranks)
+            corr = _magnitude_rank_correlation(male_clean, female_clean)
             rank_corr_full = np.full(len(combined_df), corr)
             comparison_metrics[f'Rank_Correlation_{group_name}'] = rank_corr_full
         else:
             rank_corr_full = np.full(len(combined_df), np.nan)
             comparison_metrics[f'Rank_Correlation_{group_name}'] = rank_corr_full
     
-    # --- Reorganize columns by class/group instead of by sex ---
+    # Reorganize columns by class/group instead of by sex
     # Extract all groups/classes from column names
     all_groups = set()
     for col in mean_shap_cols_male:
@@ -1045,7 +1055,7 @@ def _combine_male_female_summaries(male_df, female_df, paths):
     comparison_metrics_df = pd.DataFrame(comparison_metrics)
     combined_with_all = pd.concat([combined_with_female, comparison_metrics_df], axis=1)
     
-    # Build new column order: feature_name, Global_Importance columns, then per-group blocks
+    # Order identifiers and global importance before per-group blocks.
     new_column_order = ['feature_name']
     
     # Add Global_Importance columns (MALE and FEMALE)
@@ -1110,10 +1120,9 @@ def _combine_male_female_summaries(male_df, female_df, paths):
 
 
 def _combine_insample_outofsample_summaries(insample_df, outofsample_df, paths):
-    """
-    Combines in-sample and out-of-sample consolidated summaries into a single file
+    """Combine in-sample and out-of-sample consolidated summaries into a single file
     for easier comparison. Features are ordered by in-sample global importance.
-    
+
     Args:
         insample_df: DataFrame with in-sample consolidated summary
         outofsample_df: DataFrame with out-of-sample consolidated summary
@@ -1247,13 +1256,8 @@ def _combine_insample_outofsample_summaries(insample_df, outofsample_df, paths):
         
         # 4. Rank_Correlation (Spearman correlation of feature importance rankings)
         if len(insample_clean) > 1:
-            # Calculate ranks (higher absolute SHAP = higher rank)
-            insample_ranks = np.argsort(np.argsort(-np.abs(insample_clean)))  # Higher abs value = lower rank number
-            outofsample_ranks = np.argsort(np.argsort(-np.abs(outofsample_clean)))
-            
-            # Calculate Spearman correlation
-            corr, p_value = spearmanr(insample_ranks, outofsample_ranks)
-            
+            corr = _magnitude_rank_correlation(insample_clean, outofsample_clean)
+
             # Store as constant value for all features (same correlation for the group)
             rank_corr_full = np.full(len(combined_df), corr)
             comparison_metrics[f'Rank_Correlation_{group_name}'] = rank_corr_full
@@ -1283,4 +1287,3 @@ def _combine_insample_outofsample_summaries(insample_df, outofsample_df, paths):
     combined_path = os.path.join(paths['analysis_folder'], f'SHAP_CONSOLIDATED_SUMMARY_INSAMPLE_VS_OUTOFSAMPLE{paths.get("file_suffix", "")}.xlsx')
     save_consolidated_summary_with_formatting(combined_df, combined_path, is_combined_insample_outofsample=True)
     print(f"Combined in-sample vs out-of-sample consolidated summary saved to {combined_path}")
-

@@ -1,7 +1,7 @@
-"""Transition analysis utilities for mmgen.
+"""Aggregate MMGen transition counts into animal probabilities and group summaries.
 
-This module aggregates per-file transition counts into the user-facing pose and
-pose+orientation transition outputs.
+Compare groups with row-aware permutation tests, preserving missing departure
+denominators.
 """
 
 from __future__ import annotations
@@ -13,6 +13,9 @@ import warnings
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from statsmodels.stats.multitest import fdrcorrection
@@ -24,17 +27,16 @@ from .naming import collapse_individual_id
 DEFAULT_RUN_TRANSITION_STATISTICS: bool = True
 
 def _is_impossible_pose_orient_transition(from_behavior, to_behavior):
-    """
-    Checks if a pose+orient transition is physically impossible.
-    
+    """Check if a pose+orient transition is physically impossible.
+
     Impossible transitions:
     - Wall-Up ↔ Wall-Down (both directions)
     - Floor → Ceiling (instant flip - but Ceiling → Floor is allowed as it could be a quick fall)
-    
+
     Args:
         from_behavior: String like "Walking + Floor" or "Standing + Wall-Up"
         to_behavior: String like "Standing + Ceiling" or "Walking + Wall-Down"
-    
+
     Returns:
         bool: True if transition is impossible, False otherwise
     """
@@ -72,11 +74,10 @@ def _run_transition_analysis_for_category(
     save_outputs: bool = True,
     run_transition_statistics: bool = DEFAULT_RUN_TRANSITION_STATISTICS,
 ):
+    """Calculate animal and group transition matrices and write requested category
+    reports.
     """
-    Internal helper that calculates transition matrices and returns them in a
-    dictionary for saving, while still saving individual heatmaps and raw data.
-    """
-    # --- Individual-Level Analysis ---
+    # Individual-Level Analysis
     individual_data_folder = None
     if save_outputs:
         if category_name == "Pose":
@@ -96,20 +97,10 @@ def _run_transition_analysis_for_category(
     if filtered_count > 0:
         print(f"  Filtered out {filtered_count} transitions with invalid behaviors (not in behavior_order)")
 
-    # Get all behaviors present in the filtered aggregated data
-    present_from = df_category['from_behavior'].unique()
-    present_to = df_category['to_behavior'].unique()
-    present_behaviors = sorted(list(set(present_from) | set(present_to)))
-
-    # Only use behaviors from behavior_order that are actually present in the data
-    # This ensures we don't include behaviors that aren't in the valid list
-    all_behaviors = [b for b in behavior_order if b in present_behaviors]
-    
-    # Add any unexpected behaviors found in data (shouldn't happen after filtering, but defensive)
-    unexpected = [b for b in present_behaviors if b not in behavior_order]
-    if unexpected:
-        print(f"  WARNING: Found {len(unexpected)} unexpected behaviors in data after filtering: {unexpected[:5]}")
-        # Don't add them to all_behaviors - they should have been filtered out
+    # A destination with no observed events is a measured zero when this animal
+    # has a nonzero departure denominator. Its column must not depend on states
+    # observed in other animals or shards. Rows without departures remain NaN.
+    all_behaviors = list(behavior_order)
 
     # Aggregate counts per individual (this collapses the per-file/movie counts)
     # First collapse individual IDs to animal IDs for consistency with other outputs
@@ -122,9 +113,10 @@ def _run_transition_analysis_for_category(
 
     individuals = ind_counts_df['individual'].unique()
     individual_matrices = {}
+    individual_departures = {}
     print(f"Calculating transition matrices for {len(individuals)} individuals from aggregated counts...")
 
-    # --- Loop through individuals to calculate probability matrices ---
+    # Loop through individuals to calculate probability matrices
     for individual in individuals:
         ind_df = ind_counts_df[ind_counts_df['individual'] == individual]
         if ind_df.empty:
@@ -143,9 +135,13 @@ def _run_transition_analysis_for_category(
         # Reindex to ensure all matrices have the same shape and order
         transition_counts = transition_counts.reindex(index=all_behaviors, columns=all_behaviors, fill_value=0)
         # Set diagonal (self-transitions) to 0 - they should already be filtered out, but ensure it here too
-        np.fill_diagonal(transition_counts.values, 0)
+        transition_values = transition_counts.to_numpy(copy=True)
+        np.fill_diagonal(transition_values, 0)
+        transition_counts = pd.DataFrame(transition_values, index=transition_counts.index,
+                                         columns=transition_counts.columns)
         # Calculate row sums (total counts outgoing from each state)
         row_sums = transition_counts.sum(axis=1)
+        individual_departures[individual] = row_sums
 
         # Calculate probabilities: prob = count / row_sum
         # Handle division by zero for rows with sum = 0 (set resulting probabilities to NaN)
@@ -179,7 +175,7 @@ def _run_transition_analysis_for_category(
     print(" - Assert Check Passed: Individual transition probability rows sum correctly to 1.0 (where calculable).")
 
 
-    # --- Group-Level Aggregation and Visualization ---
+    # Group-Level Aggregation and Visualization
     print("\nAggregating group-level statistics and generating visualizations...")
     sheets_to_save = {}
     for group, matrices_data in individual_matrices.items():
@@ -200,8 +196,8 @@ def _run_transition_analysis_for_category(
         std_df  = pd.DataFrame(std_matrix,  index=all_behaviors, columns=all_behaviors)
 
         # Add DataFrames to the dictionary for later saving
-        sheets_to_save[f'{group}_Means'] = mean_df
-        sheets_to_save[f'{group}_Stdevs'] = std_df
+        sheets_to_save[f'{group}_Means'] = mean_df.rename_axis('from_behavior').reset_index()
+        sheets_to_save[f'{group}_Stdevs'] = std_df.rename_axis('from_behavior').reset_index()
 
         # Build readable annotations; blank where mean is NaN.
         def _fmt(mu, sd, wide):
@@ -235,7 +231,7 @@ def _run_transition_analysis_for_category(
             plt.savefig(os.path.join(output_dir, f'{file_prefix}_Transition_Heatmap_{category_name}_{group}.png'), dpi=300)
             plt.close()
 
-    # --- Create Master Tidy DataFrame ---
+    # Create Master Tidy DataFrame
     all_transitions_tidy = []
     for group, indiv_data in individual_matrices.items():
         for individual_id, matrix_df in indiv_data:
@@ -245,12 +241,13 @@ def _run_transition_analysis_for_category(
             # individual_id is already collapsed from the groupby above, so use it directly
             tidy_df['individual'] = individual_id
             tidy_df['group'] = group
+            tidy_df['departure_count'] = tidy_df['from_behavior'].map(individual_departures[individual_id])
             all_transitions_tidy.append(tidy_df)
 
-    master_tidy_df = pd.DataFrame(columns=['group', 'individual', 'from_behavior', 'to_behavior', 'probability'])
+    master_tidy_df = pd.DataFrame(columns=['group', 'individual', 'from_behavior', 'to_behavior', 'probability', 'departure_count'])
     if all_transitions_tidy:
         master_tidy_df = pd.concat(all_transitions_tidy, ignore_index=True)
-        master_tidy_df = master_tidy_df[['group', 'individual', 'from_behavior', 'to_behavior', 'probability']]
+        master_tidy_df = master_tidy_df[['group', 'individual', 'from_behavior', 'to_behavior', 'probability', 'departure_count']]
 
         # Path for the CSV in the main output folder
         if save_outputs:
@@ -262,7 +259,7 @@ def _run_transition_analysis_for_category(
 
     print(f"Transition analysis for category '{category_name}' complete.")
 
-    # --- Run Comparative Statistical Analysis ---
+    # Run Comparative Statistical Analysis
     if save_outputs and run_transition_statistics and len(individual_matrices) > 1:
         print(f"\n--- Running Comparative Analysis for {category_name} ---")
 
@@ -285,43 +282,36 @@ def _run_transition_analysis_for_category(
 
         # 3. Run the analysis
         if len(mean_matrices) > 1:
-            # Assume _run_comparative_analysis is defined elsewhere
-             try:
-                 _run_comparative_analysis(
-                     individual_matrices=individual_matrices,
-                     mean_matrices=mean_matrices,
-                     behavior_order=all_behaviors,
-                     output_folder=comparison_output_folder
-                 )
-             except Exception as e:
-                  print(f"ERROR during comparative transition analysis for {category_name}: {e}")
-                  # Optionally re-raise e if you want the script to halt on error
+            try:
+                _run_comparative_analysis(
+                    individual_matrices=individual_matrices,
+                    mean_matrices=mean_matrices,
+                    behavior_order=all_behaviors,
+                    output_folder=comparison_output_folder,
+                )
+            except Exception as exc:
+                raise RuntimeError(f'Requested comparative transition analysis failed for {category_name}') from exc
 
     return {'sheets_to_save': sheets_to_save, 'tidy_df': master_tidy_df}
 
 
 def calculate_and_save_transition_analysis(aggregated_transitions_df, output_dir, *, run_transition_statistics: bool = DEFAULT_RUN_TRANSITION_STATISTICS, save_outputs: bool = True):
-    """
-    Controller function that runs transition analysis for pose and pose+orient
-    categories, saving consolidated results to separate Excel files.
-    
-    Reads from the pre-aggregated transition table for memory safety.
-    """
+    """Summarize pre-aggregated pose and combined-context transition counts."""
     print("\nStarting sequential transition analysis for both categories...")
 
-    # --- 1. Define Behavior Orders ---
-    pose_order = ['Walking', 'Standing', 'Scramble', 'Groom-FrontLegs', 'Groom-Head', 'Groom-SideLeg', 'Groom-Wings', 'Groom-Abdomen', 'Groom-BackLegs', 'Jump']
-    orient_order = ['Floor', 'Ceiling', 'Wall-Side', 'Wall-Up', 'Wall-Down']
-    # Build the combined order list, then add the special, non-oriented poses
-    pose_order_for_combo = [p for p in pose_order if p not in ['Jump', 'Scramble']]
-    combined_order = [f"{p} + {o}" for p in pose_order_for_combo for o in orient_order] + ['Jump', 'Scramble']
+    # 1. Define Behavior Orders
+    from .categories import POSE_LABELS, SUMMARY_COMBINED_LABELS
+    pose_order = list(POSE_LABELS)
+    # Native combined report scope: 24 retained oriented states plus the two
+    # orientation-independent states. Wall-Up/Down are excluded by the producer.
+    combined_order = list(SUMMARY_COMBINED_LABELS) + ['Jump', 'Scramble']
 
     transition_results = {
         'pose_tidy_df': pd.DataFrame(columns=['group', 'individual', 'from_behavior', 'to_behavior', 'probability']),
         'pose_orient_tidy_df': pd.DataFrame(columns=['group', 'individual', 'from_behavior', 'to_behavior', 'probability']),
     }
 
-    # --- 2. Run Analysis for "Pose"-only Category ---
+    # 2. Run Analysis for "Pose"-only Category
     print("\n--- Analyzing POSE-ONLY transitions ---")
     
     # Filter the aggregated DataFrame instead of the raw one
@@ -344,26 +334,15 @@ def calculate_and_save_transition_analysis(aggregated_transitions_df, output_dir
     else:
         print("No Pose-only bouts found. Skipping Pose transition analysis.")
 
-    # --- 3. Run Analysis for "Pose+Orient" Category (with Jump/Scramble) ---
+    # 3. Run Analysis for "Pose+Orient" Category (with Jump/Scramble)
     print("\n--- Analyzing POSE+ORIENT transitions (including Jump/Scramble) ---")
     
     # Filter the aggregated DataFrame for 'Pose+Orient'
     po_df = aggregated_transitions_df[aggregated_transitions_df['category'] == 'Pose+Orient'].copy()
     
-    # Collect Jump/Scramble transitions from 'Pose' category, but only where
-    # the other behavior is a valid Pose+Orient behavior (contains " + ") or is Jump/Scramble
-    # This ensures we don't include invalid transitions like "Walking" → "Jump" (both pose-only)
-    jump_scramble_transitions = pose_df[
-        ((pose_df['from_behavior'].isin(['Jump', 'Scramble'])) & 
-         ((pose_df['to_behavior'].isin(['Jump', 'Scramble'])) | 
-          (pose_df['to_behavior'].str.contains(' + ', na=False)))) |
-        ((pose_df['to_behavior'].isin(['Jump', 'Scramble'])) & 
-         ((pose_df['from_behavior'].isin(['Jump', 'Scramble'])) | 
-          (pose_df['from_behavior'].str.contains(' + ', na=False))))
-    ].copy()
-    
-    # Combine Pose+Orient transitions with Jump/Scramble transitions
-    po_plus_specials_df = pd.concat([po_df, jump_scramble_transitions]).drop_duplicates()
+    # Canonical per-recording combined counts already include bare Jump/Scramble.
+    # Copying them from independent Pose counts would duplicate those events.
+    po_plus_specials_df = po_df.copy()
     
     # Filter to only include transitions where both behaviors are valid for Pose+Orient
     # This ensures no pose-only behaviors (except Jump/Scramble) are included
@@ -378,7 +357,6 @@ def calculate_and_save_transition_analysis(aggregated_transitions_df, output_dir
         print(f"  Filtered out {filtered_count} invalid transitions (pose-only behaviors not in Pose+Orient list)")
     
     print(f"  Pose+Orient transitions: {len(po_df)}")
-    print(f"  Jump/Scramble transitions from Pose category: {len(jump_scramble_transitions)}")
     print(f"  Total valid transitions after filtering: {len(po_plus_specials_df)}")
     print(f"  Unique behaviors in final dataframe: {len(set(po_plus_specials_df['from_behavior'].unique()) | set(po_plus_specials_df['to_behavior'].unique()))}")
 
@@ -403,16 +381,15 @@ def calculate_and_save_transition_analysis(aggregated_transitions_df, output_dir
     return transition_results
 
 
-# 8 Comparative Analysis (between-group comparisons / heatmaps)
 
 
 def _run_comparative_analysis(individual_matrices, mean_matrices, behavior_order, output_folder):
-    """
-    Orchestrates the statistical comparison and visualization of transition matrices between groups.
+    """Compare group transition matrices and write corrected significance tables and
+    heatmaps.
     """
     all_pairs_stats = []
     
-    # --- Part 1: Calculate p-values for all pairs ---
+    # Part 1: Calculate p-values for all pairs
     group_names = sorted(list(individual_matrices.keys()))
     for group1, group2 in itertools.combinations(group_names, 2):
         print(f"  Comparing {group1} vs. {group2}...")
@@ -430,7 +407,7 @@ def _run_comparative_analysis(individual_matrices, mean_matrices, behavior_order
         p_value_df.columns.name = 'to_behavior'
         diff_df.columns.name = 'to_behavior'
 
-        # --- Name the index before resetting it ---
+        # Name the index before resetting it
         p_value_df.index.name = 'from_behavior' 
         diff_df.index.name = 'from_behavior'
 
@@ -446,18 +423,17 @@ def _run_comparative_analysis(individual_matrices, mean_matrices, behavior_order
         print("Not enough group pairs to run comparative analysis.")
         return
 
-    # --- Part 2: Multiple comparisons correction ---
+    # Part 2: Multiple comparisons correction
     master_stats_df = pd.concat(all_pairs_stats, ignore_index=True)
-    result = fdrcorrection(master_stats_df['p_value'], alpha=0.05, method='indep')
-    if len(result) == 4:
-        reject, pvals_corrected, _, _ = result
-    else:
-        reject, pvals_corrected = result
-    master_stats_df['p_value_corrected'] = pvals_corrected
+    finite = np.isfinite(master_stats_df['p_value'].to_numpy(dtype=float))
+    master_stats_df['p_value_corrected'] = np.nan
+    if finite.any():
+        _, adjusted = fdrcorrection(master_stats_df.loc[finite, 'p_value'], alpha=0.05, method='indep')
+        master_stats_df.loc[finite, 'p_value_corrected'] = adjusted
     master_stats_df.to_csv(os.path.join(output_folder, 'all_transition_stats.csv'), index=False)
     print(f"\nSaved comprehensive statistical results to {output_folder}")
 
-    # --- Part 3: Generate plots with a unified scale ---
+    # Part 3: Generate plots with a unified scale
     vmax = master_stats_df['difference_in_mean'].abs().max()
     
     for group1, group2 in itertools.combinations(group_names, 2):
@@ -582,9 +558,7 @@ def _calculate_p_values_for_comparison(indiv_mats1, indiv_mats2, behavior_order,
 
 
 def _generate_comparison_heatmap(diff_matrix, pval_matrix, vmax, group1, group2, output_path):
-    """
-    Generates and saves a single difference heatmap with significance annotations.
-    """
+    """Generate and saves a single difference heatmap with significance annotations."""
     # Create annotation matrix ('*' for significant, '' for non-significant)
     annot_df = pval_matrix.map(lambda p: '*' if p < 0.05 else '')
     
@@ -606,4 +580,3 @@ def _generate_comparison_heatmap(diff_matrix, pval_matrix, vmax, group1, group2,
     plt.close()
 
 
-# 9 + 10 + 11 Spatial and Geometric Analysis

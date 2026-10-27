@@ -1,9 +1,5 @@
-"""Unit conversion helpers for mmgen.
-
-This module contains small conversion helpers that transform positional_calcs
-columns from pixel-per-frame units into real units (mm/s, mm/s^2, etc.).
-
-This module infers units and emits unit manifests for the master matrix outputs.
+"""Convert KeyPre positional kinematics from pixels per frame to physical units for
+MMGen.
 """
 
 from __future__ import annotations

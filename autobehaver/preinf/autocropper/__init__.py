@@ -1,11 +1,6 @@
-"""Autocropper (auto chamber cropping).
+"""Detect the standard six-chamber layout and crop each included chamber.
 
-This stage identifies circular fly chambers in multi-chamber videos and crops each
-chamber into its own movie file.
-
-Notes:
-  - This module is intentionally tailored to the current Autobehaver lab pipeline.
-  - Heavy dependencies (OpenCV, moviepy, torch) are imported only when the stage runs.
+OpenCV and FFmpeg-facing modules are imported when Autocropper runs.
 """
 
 from .config import AutocropperConfig

@@ -1,228 +1,35 @@
+"""Command-line inference overlays with direct folder or registry discovery."""
+
 import argparse
-import sys
-from pathlib import Path
-from typing import Any, Dict, Optional
-
-import yaml
-
-from autobehaver.argparse_utils import add_bool_pair, normalize_argv
-from autobehaver.pipeline_layout import apply_main_dir_overrides, config_main_dir_default
+from dataclasses import fields
 
 
-def _load_config_defaults(config_path: str) -> Dict[str, Any]:
-    """Load the infmovie section from the global pipeline YAML config."""
+from autobehaver.argparse_utils import add_bool_pair, parse_cli_args
+from autobehaver.resource_monitor import add_monitor_arguments, monitored_cli, record_settings
+from autobehaver.pipeline_layout import apply_main_dir_overrides
 
-    cfg_path = Path(config_path).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
 
-    with cfg_path.open("r") as f:
-        data = yaml.safe_load(f) or {}
-
-    if not isinstance(data, dict):
-        raise ValueError("Pipeline config must be a YAML mapping (dict) at the top level")
-
-    section = data.get("infmovie", {})
-    if section is None:
-        section = {}
-    if not isinstance(section, dict):
-        raise ValueError("Expected 'infmovie' section in config to be a mapping (dict)")
-
-    base_dir = cfg_path.parent
-
-    resolved: Dict[str, Any] = {}
-
-    global_main_dir = config_main_dir_default(data, base_dir)
-    if global_main_dir:
-        resolved["main_dir"] = global_main_dir
-
-    # ------------------------------------------------------------------
-    # Global registry settings (project-wide)
-    # ------------------------------------------------------------------
-    reg = data.get("registry", {})
-    if reg is None:
-        reg = {}
-    if isinstance(reg, dict):
-        if "enabled" in reg:
-            resolved["registry_enabled"] = bool(reg.get("enabled"))
-        if "csv" in reg and isinstance(reg.get("csv"), str) and str(reg.get("csv")).strip() != "":
-            p = Path(str(reg.get("csv")).strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved["registry_csv"] = str(p)
-        if "lock_timeout_sec" in reg and reg.get("lock_timeout_sec") is not None:
-            try:
-                resolved["registry_lock_timeout_sec"] = int(reg.get("lock_timeout_sec"))
-            except Exception:
-                pass
-        if "lock_stale_sec" in reg and reg.get("lock_stale_sec") is not None:
-            try:
-                resolved["registry_lock_stale_sec"] = int(reg.get("lock_stale_sec"))
-            except Exception:
-                pass
-
-    def _resolve_path(v: str) -> str:
-        p = Path(str(v).strip())
-        if not p.is_absolute():
-            p = (base_dir / p).resolve()
-        return str(p)
-
-    v = section.get("main_dir")
-    if isinstance(v, str) and v.strip() != "":
-        resolved["main_dir"] = _resolve_path(v)
-
-    # ------------------------------------------------------------------
-    # infmovie section
-    # ------------------------------------------------------------------
-    if "inference_csv_dir" in section and isinstance(section.get("inference_csv_dir"), str) and section.get("inference_csv_dir").strip() != "":
-        resolved["inference_csv_dir"] = _resolve_path(section.get("inference_csv_dir"))
-
-    if "movie_dir" in section and isinstance(section.get("movie_dir"), str) and section.get("movie_dir").strip() != "":
-        resolved["movie_dir"] = _resolve_path(section.get("movie_dir"))
-
-    if "output_dir" in section and isinstance(section.get("output_dir"), str) and section.get("output_dir").strip() != "":
-        resolved["output_dir"] = _resolve_path(section.get("output_dir"))
-
-    if section.get("file_filter") is not None:
-        file_filter = str(section.get("file_filter")).strip()
-        resolved["file_filter"] = file_filter if file_filter != "" else None
-
-    # Mode
-    if "mode" in section and section.get("mode") is not None:
-        resolved["mode"] = str(section.get("mode")).strip()
-
-    # Manual mode fields
-    for k in ("recording_id",):
-        if k in section and section.get(k) is not None:
-            resolved[k] = str(section.get(k)).strip()
-
-    for k in ("start_sec", "duration_sec"):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = float(section.get(k))
-            except Exception:
-                pass
-
-    # Automated selection
-    for k in ("num_clips", "max_clips_per_recording", "random_seed"):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = int(section.get(k))
-            except Exception:
-                pass
-
-    for k in ("clip_duration_sec", "clip_padding_sec", "min_gap_sec"):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = float(section.get(k))
-            except Exception:
-                pass
-
-    if "selection_label_source" in section and section.get("selection_label_source") is not None:
-        resolved["selection_label_source"] = str(section.get("selection_label_source")).strip()
-
-    # QC thresholds
-    for k in (
-        "qc_uncertainty_threshold",
-        "qc_switch_window_sec",
-    ):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = float(section.get(k))
-            except Exception:
-                pass
-
-    for k in (
-        "qc_min_uncertainty_frames",
-        "qc_switch_min_changes",
-    ):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = int(section.get(k))
-            except Exception:
-                pass
-
-    for k in ("qc_use_uncertainty", "qc_use_switching"):
-        if k in section and section.get(k) is not None:
-            resolved[k] = bool(section.get(k))
-
-    # Interesting thresholds
-    for k in ("interesting_min_unique_labels", "interesting_min_changes"):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = int(section.get(k))
-            except Exception:
-                pass
-
-    # Rendering
-    for k in ("num_workers", "skip_first_n_frames", "timeline_height", "timestamp_decimals"):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = int(section.get(k))
-            except Exception:
-                pass
-
-    for k in ("speed_factor", "max_output_fps", "default_movie_fps"):
-        if k in section and section.get(k) is not None:
-            try:
-                resolved[k] = float(section.get(k))
-            except Exception:
-                pass
-
-    for k in (
-        "timeline",
-        "timeline_labels",
-        "timestamp_position",
-        "timestamp_reference",
-    ):
-        if k in section and section.get(k) is not None:
-            resolved[k] = str(section.get(k)).strip()
-
-    if "clobber" in section and section.get("clobber") is not None:
-        resolved["clobber"] = bool(section.get("clobber"))
-
-    for k in (
-        "timeline_compare",
-        "white_mode",
-        "show_timestamp",
-        "write_plan_csv",
-        "write_run_log",
-    ):
-        if k in section and section.get(k) is not None:
-            resolved[k] = bool(section.get(k))
-
-    return resolved
+from .config import InfMoviePipelineConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the InfMovie clip-selection and rendering argument parser."""
     parser = argparse.ArgumentParser(
         description=(
             "Generate inference overlay movies from Autobehaver inference CSVs.\n\n"
-            "Two workflows are supported:\n"
-            "  1) Pipeline config + registry: --config config.yaml\n"
-            "  2) Direct folder matching: --inference_csv_dir ... --movie_dir ..."
+            "Use --main_dir for standard folders, explicit folders, or "
+            "--registry_enabled --registry_csv for registry discovery."
         )
     )
 
-    # ------------------------------------------------------------------
-    # Pipeline/config workflow
-    # ------------------------------------------------------------------
+    # Input discovery and clip selection
     parser.add_argument(
         "--main_dir",
         type=str,
         default=None,
         help=(
-            "Optional project root containing the standardized numbered pipeline folders. "
-            "For infmovie this fills inference_csv_dir=<main_dir>/6_posepred_inference, "
-            "movie_dir=<main_dir>/2_cropped_movies, and output_dir=<main_dir>/7_infmovies."
+            'Project root for standard InfMovie input and output folders; explicit paths take precedence.'
         ),
-    )
-
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to the global pipeline YAML config (recommended).",
     )
 
     parser.add_argument(
@@ -230,10 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["manual", "qc", "interesting", "full"],
-        help="infmovie mode (overrides config): manual|qc|interesting|full",
+        help="Clip selection mode: manual|qc|interesting|full",
     )
 
-    parser.add_argument("--recording_id", type=str, default=None, help="Manual mode: registry recording_id")
+    parser.add_argument("--recording_id", type=str, default=None, help='Manual mode: recording identifier from the discovered folder or registry pairs.')
     parser.add_argument("--start_sec", type=float, default=None, help="Manual mode: clip start time (sec)")
     parser.add_argument("--duration_sec", type=float, default=None, help="Manual mode: clip duration (sec)")
 
@@ -276,18 +83,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--file_filter",
         type=str,
         default=None,
-        help="Optional substring filter applied to registry pairs (case-insensitive).",
+        help="Optional substring filter applied to discovered pairs (case-insensitive).",
     )
 
     parser.add_argument(
         "--random_seed",
         type=int,
         default=None,
-        help="Random seed for clip selection (overrides config).",
+        help="Random seed for clip selection.",
     )
 
-    # Rendering overrides
+    # Rendering
     parser.add_argument("--num_workers", type=int, default=None, help="Number of parallel workers")
+    parser.add_argument("--source_frame_offset", type=int, default=None, help='Legacy original-frame offset, when provenance is absent: 0 for untrimmed inputs or 5 when five leading rows were removed.')
     parser.add_argument("--skip_first_n_frames", type=int, default=None, help="Skip first N frames before rendering")
 
     parser.add_argument(
@@ -330,10 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timestamp_decimals", type=int, default=None, help="Timestamp decimals")
 
     add_bool_pair(parser, "clobber", default=None, help="Overwrite rendering if output already exists")
+    parser.add_argument("--default_movie_fps", type=float, help="Fallback FPS when the movie has no readable FPS.")
+    add_bool_pair(parser, "write_plan_csv", default=None, help="Save the selected-clip plan CSV")
+    add_bool_pair(parser, "write_run_log", default=None, help="Save run settings and rendered-output log")
 
-    # ------------------------------------------------------------------
+    add_bool_pair(parser, "registry_enabled", default=None, help="Discover recording pairs from --registry_csv")
+    parser.add_argument("--registry_csv", help="Project recording registry CSV used when registry discovery is enabled.")
+    parser.add_argument("--registry_lock_timeout_sec", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--registry_lock_stale_sec", type=int, help=argparse.SUPPRESS)
+
     # Direct folder workflow
-    # ------------------------------------------------------------------
     parser.add_argument(
         "--inference_csv_dir",
         type=str,
@@ -354,118 +168,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
 
-    return parser
+    runtime_defaults = InfMoviePipelineConfig()
+    parser.set_defaults(**{field.name: getattr(runtime_defaults, field.name)
+                           for field in fields(runtime_defaults)})
+    return add_monitor_arguments(parser)
 
 
+@monitored_cli("infmovie")
 def main(argv=None):
+    """Resolve InfMovie inputs and run the selected overlay plan."""
     parser = build_parser()
-
-    argv_list = list(argv) if argv is not None else sys.argv[1:]
-    argv_list = normalize_argv(argv_list, parser=parser)
-
-    args = parser.parse_args(argv_list)
+    args = parse_cli_args(parser, argv)
     apply_main_dir_overrides(args, stage="infmovie")
 
-    # ------------------------------------------------------------------
-    # Pipeline/config workflow
-    # ------------------------------------------------------------------
-    if args.config:
-        defaults = _load_config_defaults(args.config)
-        if (not getattr(args, "main_dir", None)) and isinstance(defaults.get("main_dir"), str) and str(defaults.get("main_dir")).strip() != "":
-            args.main_dir = str(defaults.get("main_dir"))
-            apply_main_dir_overrides(args, stage="infmovie")
+    if not args.output_dir:
+        parser.error("Provide --output_dir or --main_dir.")
+    if args.registry_enabled:
+        if not args.registry_csv:
+            parser.error("--registry_enabled requires --registry_csv.")
+    elif not args.inference_csv_dir or not args.movie_dir:
+        parser.error("Provide --inference_csv_dir and --movie_dir, or --main_dir.")
 
-        # CLI overrides (only those explicitly provided)
-        override_map = {
-            "inference_csv_dir": args.inference_csv_dir,
-            "movie_dir": args.movie_dir,
-            "output_dir": args.output_dir,
-            "mode": args.mode,
-            "recording_id": args.recording_id,
-            "start_sec": args.start_sec,
-            "duration_sec": args.duration_sec,
-            "num_clips": args.num_clips,
-            "clip_duration_sec": args.clip_duration_sec,
-            "clip_padding_sec": args.clip_padding_sec,
-            "min_gap_sec": args.min_gap_sec,
-            "max_clips_per_recording": args.max_clips_per_recording,
-            "selection_label_source": args.selection_label_source,
-            "qc_uncertainty_threshold": args.qc_uncertainty_threshold,
-            "qc_min_uncertainty_frames": args.qc_min_uncertainty_frames,
-            "qc_switch_window_sec": args.qc_switch_window_sec,
-            "qc_switch_min_changes": args.qc_switch_min_changes,
-            "qc_use_uncertainty": args.qc_use_uncertainty,
-            "qc_use_switching": args.qc_use_switching,
-            "interesting_min_unique_labels": args.interesting_min_unique_labels,
-            "interesting_min_changes": args.interesting_min_changes,
-            "file_filter": args.file_filter,
-            "random_seed": args.random_seed,
-            "num_workers": args.num_workers,
-            "skip_first_n_frames": args.skip_first_n_frames,
-            "timeline": args.timeline,
-            "timeline_compare": args.timeline_compare,
-            "timeline_labels": args.timeline_labels,
-            "timeline_height": args.timeline_height,
-            "white_mode": args.white_mode,
-            "speed_factor": args.speed_factor,
-            "max_output_fps": args.max_output_fps,
-            "show_timestamp": args.show_timestamp,
-            "timestamp_position": args.timestamp_position,
-            "timestamp_reference": args.timestamp_reference,
-            "timestamp_decimals": args.timestamp_decimals,
-        }
-
-        for k, v in override_map.items():
-            if v is not None:
-                defaults[k] = v
-
-        if getattr(args, "clobber", None) is not None:
-            defaults["clobber"] = bool(args.clobber)
-
-        from .config import InfMoviePipelineConfig
-        from .pipeline import run_infmovie_pipeline
-
-        # Filter to dataclass fields.
-        allowed = set(InfMoviePipelineConfig.__dataclass_fields__.keys())
-        cfg_kwargs = {k: v for k, v in defaults.items() if k in allowed}
-
-        cfg = InfMoviePipelineConfig(**cfg_kwargs)
-
-        run_infmovie_pipeline(cfg)
-        return
-
-    # ------------------------------------------------------------------
-    # Direct folder workflow
-    # ------------------------------------------------------------------
-    if not args.inference_csv_dir or not args.movie_dir or not args.output_dir:
-        parser.error(
-            "Either provide --config for the pipeline workflow, or provide "
-            "--inference_csv_dir --movie_dir --output_dir"
-        )
-
-    from .core import InfMovieConfig, run_infmovie
-
-    skip_first = args.skip_first_n_frames if args.skip_first_n_frames is not None else 5
-
-    config = InfMovieConfig(
-        inference_csv_dir=args.inference_csv_dir,
-        movie_dir=args.movie_dir,
-        output_dir=args.output_dir,
-        num_workers=8,
-        skip_first_n_frames=skip_first,
-        timeline="both",
-        timeline_compare=False,
-        timeline_labels="predicted",
-        timeline_height=18,
-        white_mode=False,
-        speed_factor=1.0,
-        max_output_fps=40.0,
-        show_timestamp=False,
-        timestamp_position="top_right",
-        timestamp_decimals=1,
-    )
-
-    run_infmovie(config)
+    cfg = InfMoviePipelineConfig(**{field.name: getattr(args, field.name)
+                                   for field in fields(InfMoviePipelineConfig)})
+    record_settings(cfg)
+    from .pipeline import run_infmovie_pipeline
+    run_infmovie_pipeline(cfg)
 
 
 if __name__ == "__main__":

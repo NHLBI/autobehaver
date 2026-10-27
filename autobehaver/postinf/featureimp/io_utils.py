@@ -1,17 +1,12 @@
-"""Feature-importance I/O utilities.
-
-This module contains functions that read/write reports (logs, Excel sheets) for the
-Feature Importance ("featureimp") post-inference analysis.
-
-It is kept separate from the staged planner/shard/finalize modules so reporting
-and spreadsheet helpers stay lightweight and reusable.
-"""
+"""Write FeatureImp settings logs, formatted tables, and verified Excel workbooks."""
 
 from __future__ import annotations
 
 import os
 import re
 import traceback
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -58,14 +53,14 @@ def write_analysis_log(analysis_folder_path,
         None
     """
     file_suffix = kwargs.get('file_suffix', '')
+    effective = dict(kwargs.get('effective_settings') or {})
     log_path = os.path.join(analysis_folder_path, f'ANALYSIS_SETTINGS_LOG{file_suffix}.txt')
     
-    with open(log_path, 'w') as f:
+    with open(log_path, 'w', encoding='utf-8') as f:
         f.write("="*80 + "\n")
         f.write("FEATURE IMPORTANCE ANALYSIS SETTINGS LOG\n")
         f.write("="*80 + "\n\n")
         
-        # Timestamp
         f.write(f"Analysis Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
         # Analysis identification
@@ -115,7 +110,7 @@ def write_analysis_log(analysis_folder_path,
         f.write("FEATURE FILTERING\n")
         f.write("-"*80 + "\n")
         f.write(f"Univariate Filtering: DISABLED (all features tested via specialist models)\n")
-        f.write(f"Univariate Baseline Output: ENABLED (training-group Welch t-test + FDR summary written separately)\n")
+        f.write("Optional baselines: run only when their separate stages are requested.\n")
         if include_feature_categories:
             f.write(f"Included Feature Categories: {', '.join(include_feature_categories)}\n")
         else:
@@ -147,7 +142,8 @@ def write_analysis_log(analysis_folder_path,
         f.write("-"*80 + "\n")
         f.write(f"Number of Folds (n_splits): {n_splits}\n")
         f.write(f"Shuffle: True\n")
-        f.write(f"Random State: 42\n")
+        f.write(f"Resolved Global Random Seed: {effective.get('GLOBAL_RANDOM_SEED', 'unavailable')}\n")
+        f.write("Fold/model seeds: frozen in _featureimp_plan manifests.\n")
         f.write(f"Stratified: True (maintains class proportions)\n\n")
         
         # Committee/Specialist Model Settings
@@ -155,8 +151,10 @@ def write_analysis_log(analysis_folder_path,
         f.write("COMMITTEE/SPECIALIST MODEL SETTINGS\n")
         f.write("-"*80 + "\n")
         f.write(f"Pipeline Design: K-Fold Committee (replaces filter-then-bootstrap)\n")
-        f.write(f"Note: Specialist model settings (H_hits_per_feature, n_features_per_model, etc.)\n")
-        f.write(f"      are defined in global settings at top of script.\n\n")
+        f.write("Effective settings: FEATUREIMP_RUN_SETTINGS.json\n")
+        for key in ("H_hits_per_feature", "n_features_per_model", "n_estimators", "max_depth", "learning_rate"):
+            f.write(f"  {key}: {effective.get(key, 'unavailable')}\n")
+        f.write("\n")
         
         # SHAP settings
         f.write("-"*80 + "\n")
@@ -170,7 +168,9 @@ def write_analysis_log(analysis_folder_path,
         f.write("-"*80 + "\n")
         f.write(f"In-Sample Predictions: Average across (n_splits - 1) = {n_splits - 1} folds\n")
         f.write(f"Out-of-Sample Predictions: Average across 1 fold (held-out)\n")
-        f.write(f"Combined Predictions: Weighted average (in-sample * {n_splits - 1} + out-of-sample) / {n_splits}\n")
+        f.write("Main training Prob_*: held-out (OOF) predictions.\n")
+        f.write("Canonical committee: weighted mean margins, transformed to probabilities.\n")
+        f.write("Unweighted comparison: separate workbook view.\n")
         f.write(f"Non-Training Groups: Average across all {n_splits} folds\n\n")
         
         # Output files
@@ -230,7 +230,7 @@ def format_summary_df(pivot_df, desired_order, id_cols=['individual', 'group']):
     
     group_summary = pd.DataFrame()
     
-    # 2. Calculate the group average. The .mean() function correctly ignores NaNs.
+    # Calculate group averages from available values.
     if group_by_cols:
         pivot_df_copy = pivot_df.copy() # De-fragment before groupby
         group_summary = pivot_df_copy.groupby(group_by_cols, as_index=False, observed=True)[numeric_cols].mean()
@@ -255,7 +255,7 @@ def format_summary_df(pivot_df, desired_order, id_cols=['individual', 'group']):
     else:
         individual_data = pivot_df # No grouping, just use the sorted df
 
-    # The final DataFrame will have NaNs, which is what we want.
+    # Preserve unavailable values as NaNs for blank spreadsheet cells.
     return pd.concat([group_summary, separator, individual_data], ignore_index=True)
 
 def _sanitize_excel_sheet_name(name, max_length=31):
@@ -277,23 +277,56 @@ def _sanitize_excel_sheet_name(name, max_length=31):
     if not name or pd.isna(name):
         return "Sheet1"
     
-    # Convert to string
     name_str = str(name)
     
-    # Remove invalid characters
     invalid_chars = [':', '\\', '/', '?', '*', '[', ']']
     for char in invalid_chars:
         name_str = name_str.replace(char, '_')
     
-    # Truncate to max length
     if len(name_str) > max_length:
         name_str = name_str[:max_length]
     
-    # Ensure not empty
     if not name_str.strip():
         name_str = "Sheet1"
     
     return name_str
+
+@contextmanager
+def _atomic_excel_writer(output_path):
+    """Write and reopen a temporary workbook before atomically replacing the
+    destination.
+    """
+    destination = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(destination), suffix='.xlsx')
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(temporary, engine='openpyxl') as writer:
+            yield writer
+        checked = load_workbook(temporary, read_only=True)
+        try:
+            if not checked.sheetnames:
+                raise ValueError('Required workbook has no sheets')
+        finally:
+            checked.close()
+        # Windows rename APIs otherwise reject a valid deeply nested workbook
+        # when the destination filename takes the total path beyond MAX_PATH.
+        native_destination = destination
+        native_temporary = temporary
+        if os.name == 'nt':
+            def extended_path(path):
+                if path.startswith('\\\\?\\'):
+                    return path
+                if path.startswith('\\\\'):
+                    return '\\\\?\\UNC\\' + path[2:]
+                return '\\\\?\\' + path
+            native_destination = extended_path(destination)
+            native_temporary = extended_path(temporary)
+        os.replace(native_temporary, native_destination)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
 
 def _write_dataframe_with_autofilter(df, output_path, sheet_name='Sheet1', index=False):
     """
@@ -305,7 +338,7 @@ def _write_dataframe_with_autofilter(df, output_path, sheet_name='Sheet1', index
         sheet_name: Name of the sheet (default: 'Sheet1')
         index: Whether to include index (default: False)
     """
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    with _atomic_excel_writer(output_path) as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=index)
         worksheet = writer.sheets[sheet_name]
         
@@ -334,7 +367,7 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
         None
     """
     # Excel limits
-    MAX_ROWS = 1048576  # Excel 2007+ limit
+    MAX_ROWS = 1048575  # One additional row is required for the column header.
     MAX_COLS = 16384    # Excel 2007+ limit
     
     try:
@@ -354,31 +387,25 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
                 sanitized = f"{base_name}_{counter}"
             sanitized_sheet_names[original_name] = sanitized
         
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        with _atomic_excel_writer(output_path) as writer:
             for original_name in sheets_to_process:
                 if original_name not in sheets_dict:
-                    continue
+                    raise ValueError(f'Required sheet absent: {original_name}')
                 
                 df = sheets_dict[original_name]
                 sanitized_name = sanitized_sheet_names[original_name]
                 
                 # Validate DataFrame
                 if df is None:
-                    print(f"  WARNING: Skipping sheet '{original_name}' - DataFrame is None")
-                    continue
+                    raise ValueError(f'Required sheet is None: {original_name}')
                 
-                if df.empty:
-                    print(f"  WARNING: Skipping sheet '{original_name}' - DataFrame is empty")
-                    continue
                 
                 # Check Excel limits
                 if len(df) > MAX_ROWS:
-                    print(f"  WARNING: Sheet '{original_name}' has {len(df)} rows (max: {MAX_ROWS}). Truncating...")
-                    df = df.head(MAX_ROWS)
+                    raise ValueError(f'Sheet exceeds Excel row limit: {original_name}')
                 
                 if len(df.columns) > MAX_COLS:
-                    print(f"  WARNING: Sheet '{original_name}' has {len(df.columns)} columns (max: {MAX_COLS}). Truncating...")
-                    df = df.iloc[:, :MAX_COLS]
+                    raise ValueError(f'Sheet exceeds Excel column limit: {original_name}')
                 
                 # Convert data types to Excel-compatible types
                 df_cleaned = df.copy()
@@ -407,8 +434,7 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
                     df_cleaned.to_excel(writer, sheet_name=sanitized_name, index=False)
                 except Exception as e:
                     print(f"  ERROR: Failed to write sheet '{original_name}' (sanitized: '{sanitized_name}'): {e}")
-                    traceback.print_exc()
-                    continue
+                    raise
         
             # Apply left alignment to headers in all sheets
             workbook = writer.book
@@ -429,14 +455,6 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
     except Exception as e:
         print(f"ERROR: Failed to save Excel file to {output_path}: {e}")
         traceback.print_exc()
-        # Try to remove corrupted file if it exists
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-                print(f"  Removed potentially corrupted file: {output_path}")
-            except:
-                pass
         raise
-
 
 

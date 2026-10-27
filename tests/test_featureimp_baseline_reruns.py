@@ -2,6 +2,7 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from tests.test_featureimp_plan_stage import _write_small_master_matrix
@@ -19,6 +20,15 @@ def _prepare_small_finalized_analysis(tmp_path: Path) -> Path:
 
     matrix_path = matrix_dir / "MASTER_FEATURE_MATRIX.csv"
     _write_small_master_matrix(matrix_path)
+    # Postanalysis tests need a genuine positive-weight committee. A null
+    # four-tree fixture cannot stand in for completed weighted results.
+    fixture = pd.read_csv(matrix_path)
+    for feature in [c for c in fixture if c.startswith(('BoutSummary_', 'StdMeasure_', 'Kinematic_', 'Spatial_'))]:
+        fixture[feature] = np.where(fixture['group'].eq('A'), -4., 4.) + np.arange(len(fixture)) * .001
+    fixture.to_csv(matrix_path,index=False)
+    copied = fixture.copy()
+    copied['individual'] = copied['individual'].astype(str) + '_repeat'
+    pd.concat([fixture,copied],ignore_index=True).to_csv(matrix_path,index=False)
 
     settings = {
         "analysis_run_name": "baseline_reruns",
@@ -29,7 +39,7 @@ def _prepare_small_finalized_analysis(tmp_path: Path) -> Path:
         "training_group_a": "A",
         "training_group_b": "B",
         "num_workers": 1,
-        "n_estimators": 4,
+        "n_estimators": 20,
         "learning_rate": 0.2,
         "max_depth": 2,
         "n_splits": 2,

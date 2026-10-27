@@ -1,8 +1,4 @@
-"""Autocropper stage entrypoint.
-
-Public API:
-  - run_autocropper(cfg=AutocropperConfig, args=argparse.Namespace)
-"""
+"""Initialize and run the Autocropper stage."""
 
 from __future__ import annotations
 
@@ -16,9 +12,6 @@ from .thread_limits import configure_native_threading
 
 def _sync_runtime_args(*, cfg: AutocropperConfig, args: Any) -> None:
     """Apply runtime configuration values to the argparse namespace."""
-
-    args.skip_validation = bool(cfg.skip_validation)
-    args.validate_chambers = not bool(cfg.skip_validation)
 
     args.require_exclusions = bool(cfg.require_exclusions)
 
@@ -39,24 +32,12 @@ def _sync_runtime_args(*, cfg: AutocropperConfig, args: Any) -> None:
     args.ffmpeg_threads = max(1, int(getattr(cfg, "ffmpeg_threads", getattr(args, "ffmpeg_threads", 1))))
     args.partial_cleanup_min_age_sec = max(0, int(getattr(cfg, "partial_cleanup_min_age_sec", getattr(args, "partial_cleanup_min_age_sec", 3600))))
 
-    # Resolve packaged resource paths if user did not provide them.
-    if getattr(args, "model_path", None) in (None, ""):
-        args.model_path = cfg.resolved_model_path()
-    if getattr(args, "norm_params_path", None) in (None, ""):
-        args.norm_params_path = cfg.resolved_norm_params_path()
-
-    # Some downstream logic expects args.crop_dim_4k to exist.
     args.crop_dim_2k = int(cfg.crop_dim_2k)
-    args.crop_dim_4k = int(cfg.crop_dim_2k) * 2
+    args.chamber_calibration_json = cfg.chamber_calibration_json
 
 
 def run_autocropper(*, cfg: AutocropperConfig, args: Any) -> None:
-    """Run the autocropper stage.
-
-    Args:
-        cfg: AutocropperConfig for runtime defaults/resources.
-        args: Parsed argparse namespace.
-    """
+    """Initialize runtime options and run chamber cropping."""
 
     _sync_runtime_args(cfg=cfg, args=args)
 
@@ -66,7 +47,7 @@ def run_autocropper(*, cfg: AutocropperConfig, args: Any) -> None:
     # Windows safety for multiprocessing.
     mp.freeze_support()
 
-    # Cap native-library threads before importing OpenCV/torch/ffmpeg-facing modules.
+    # Cap native-library threads before importing OpenCV/ffmpeg-facing modules.
     configure_native_threading(getattr(args, "native_threads", 1), overwrite=False)
 
     # Import heavy dependencies only when the stage actually runs.

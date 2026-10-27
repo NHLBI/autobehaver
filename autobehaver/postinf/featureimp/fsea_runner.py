@@ -1,10 +1,7 @@
-"""FSEA analysis runner.
+"""Run feature-set enrichment analysis on group MeanSHAP or global-importance rankings.
 
-This module contains the code to perform Feature Set Enrichment Analysis (FSEA)
-using MeanSHAP values, along with visualization utilities.
-
-It is kept separate from the staged FeatureImp orchestration modules so the
-main planning/shard/finalize flow stays readable.
+Enrichment uses the ranking metric. Signed-SHAP barcodes retain the original class
+direction; global-importance barcodes use a sequential blue magnitude scale.
 """
 
 from __future__ import annotations
@@ -12,10 +9,18 @@ from __future__ import annotations
 import os
 import re
 import traceback
+import json
+import hashlib
+from dataclasses import asdict
+from pathlib import Path
+from autobehaver.completion import code_digest, verified_run
+from .fsea_cache import cached_prerank, dependency_identity
+from autobehaver.atomic_io import atomic_write_json, sha256_file
 
 import numpy as np
 import pandas as pd
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
@@ -43,11 +48,30 @@ from .mp_utils import iter_parallel_results
 # These definitions are shared across feature-space postanalysis utilities.
 from .feature_groups import fsea_feature_groups
 
-# --------------------------------------------------------------------------------------
 # Module-level defaults used when explicit runtime settings are omitted.
-# --------------------------------------------------------------------------------------
 
 _DEFAULT_FSEA_SETTINGS = FSEARuntimeSettings.from_mapping(DEFAULT_SETTINGS)
+
+
+def _verified_fsea_artifacts(base_folder, artifacts):
+    """Verify recorded outputs only inside their declared FSEA directory."""
+    if not isinstance(artifacts, dict) or not artifacts:
+        return False
+    root = Path(base_folder).resolve()
+    try:
+        for relative, digest in artifacts.items():
+            if not isinstance(relative, str) or not isinstance(digest, str):
+                return False
+            relative_path = Path(relative)
+            if relative_path.is_absolute() or relative_path.drive or '..' in relative_path.parts:
+                return False
+            path = (root / relative_path).resolve()
+            path.relative_to(root)
+            if not path.is_file() or sha256_file(path) != digest:
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def apply_settings(settings: dict) -> None:
@@ -82,6 +106,7 @@ def _standardize_ranked_list_dataframe(
     rank_col: str,
     source_name: str,
 ) -> pd.DataFrame:
+    """Validate unique feature names and finite ranking values, then sort descending."""
     if feature_col not in ranked_df.columns:
         raise ValueError(f"{source_name} is missing required column '{feature_col}'")
     if rank_col not in ranked_df.columns:
@@ -103,12 +128,15 @@ def _standardize_ranked_list_dataframe(
         )
 
     out = out.rename(columns={feature_col: "feature_name", rank_col: "rank_value"})
-    out["rank_value"] = pd.to_numeric(out["rank_value"], errors="coerce").fillna(0.0)
+    out["rank_value"] = pd.to_numeric(out["rank_value"], errors="raise")
+    if not np.isfinite(out["rank_value"].to_numpy(dtype=float)).all():
+        raise ValueError(f"{source_name} contains nonfinite ranking values")
     out = out.sort_values("rank_value", ascending=False).reset_index(drop=True)
     return out
 
 
 def _build_combined_fsea_groups(all_feature_names):
+    """Construct all supported enrichment groups from the ordered feature list."""
     print("\nGenerating programmatic feature groups for BoutSummary/TimeBudget...")
     programmatic_groups = _generate_bout_timebudget_groups(all_feature_names)
     print(f"  Generated {len(programmatic_groups)} programmatic groups")
@@ -152,6 +180,9 @@ def _prepare_validated_fsea_groups(
     output_dir: str,
     settings: FSEARuntimeSettings,
 ):
+    """Filter enrichment groups by present features and size, then document their
+    membership.
+    """
     combined_groups = _build_combined_fsea_groups(all_feature_names)
     if len(combined_groups) == 0:
         raise ValueError("No feature groups found (neither programmatic nor manual)")
@@ -215,6 +246,8 @@ def _prepare_validated_fsea_groups(
 
 
 def _sort_fsea_results_table(results_df: pd.DataFrame) -> pd.DataFrame:
+    if 'FDR q-val' in results_df.columns:
+        return results_df.sort_values('FDR q-val', ascending=True, na_position='last')
     if 'FDR' in results_df.columns:
         return results_df.sort_values('FDR', ascending=True, na_position='last')
     if 'fdr' in results_df.columns:
@@ -224,6 +257,28 @@ def _sort_fsea_results_table(results_df: pd.DataFrame) -> pd.DataFrame:
     return results_df
 
 
+def _significant_count(results_df, threshold):
+    for column in ('FDR q-val', 'FDR', 'fdr'):
+        if column in results_df.columns:
+            return int((pd.to_numeric(results_df[column], errors='raise') < threshold).sum())
+    raise ValueError('FSEA result has no empirical FDR column')
+
+
+def _check_fsea_table(frame):
+    """Require finite enrichment scores and valid false-discovery values in a native
+    result table.
+    """
+    if not isinstance(frame, pd.DataFrame) or not any(c in frame.columns for c in ('Term', 'Feature_Set')) or 'ES' not in frame.columns:
+        raise ValueError('FSEA result lacks required term/ES columns')
+    _significant_count(frame, 0)
+    if len(frame):
+        scores = pd.to_numeric(frame['ES'], errors='raise').to_numpy(dtype=float)
+        fdr_column = next(c for c in ('FDR q-val', 'FDR', 'fdr') if c in frame.columns)
+        fdr = pd.to_numeric(frame[fdr_column], errors='raise').to_numpy(dtype=float)
+        if not np.isfinite(scores).all() or not np.isfinite(fdr).all() or np.any((fdr < 0) | (fdr > 1)):
+            raise ValueError('Required FSEA scores/FDR are nonfinite or outside their valid domain')
+
+
 def _run_single_global_preranked_fsea(
     *,
     ranked_df: pd.DataFrame,
@@ -231,7 +286,9 @@ def _run_single_global_preranked_fsea(
     output_dir: str,
     label: str,
     settings: FSEARuntimeSettings,
+    visualization_failures=None,
 ) -> str:
+    """Run one global-importance enrichment ranking and write its results and plots."""
     try:
         import gseapy as gsea  # type: ignore
     except ModuleNotFoundError as e:
@@ -246,7 +303,7 @@ def _run_single_global_preranked_fsea(
     fsea_outdir = os.path.join(output_dir, f'FSEA_{safe_label}')
     os.makedirs(fsea_outdir, exist_ok=True)
 
-    result = gsea.prerank(
+    result = cached_prerank(gsea,
         rnk=ranked_df,
         gene_sets=validated_groups,
         threads=settings.num_workers,
@@ -259,6 +316,7 @@ def _run_single_global_preranked_fsea(
         no_plot=False,
     )
 
+    _check_fsea_table(result.res2d)
     sorted_results = _sort_fsea_results_table(result.res2d)
     sorted_results = _clean_fsea_results_df(sorted_results)
 
@@ -277,13 +335,10 @@ def _run_single_global_preranked_fsea(
         else:
             print("    WARNING: No enriched terms found, skipping plots")
     except Exception as e:
+        if visualization_failures is not None: visualization_failures.append(str(e))
         print(f"    WARNING: Could not generate plots: {e}")
 
-    n_sig = 0
-    if 'FDR' in result.res2d.columns:
-        n_sig = int((result.res2d['FDR'] < settings.fsea_fdr_threshold).sum())
-    elif 'fdr' in result.res2d.columns:
-        n_sig = int((result.res2d['fdr'] < settings.fsea_fdr_threshold).sum())
+    n_sig = _significant_count(result.res2d, settings.fsea_fdr_threshold)
     print(f"    Significant groups (FDR < {settings.fsea_fdr_threshold}): {n_sig}")
 
     try:
@@ -300,6 +355,7 @@ def _run_single_global_preranked_fsea(
             settings=settings,
         )
     except Exception as e:
+        if visualization_failures is not None: visualization_failures.append(str(e))
         print(f"    WARNING: Could not generate visualizations: {e}")
 
     return output_path
@@ -311,6 +367,7 @@ def _load_global_importance_ranking_from_analysis_folder(
     all_feature_names,
     file_suffix: str = '',
 ) -> pd.DataFrame:
+    """Load and validate the saved global ranking for the selected analysis features."""
     ranking_csv_path = os.path.join(analysis_folder, f'GLOBAL_IMPORTANCE_RANKING{file_suffix}.csv')
     if os.path.exists(ranking_csv_path):
         print(f"  Loading Global_Importance from ranking CSV: {ranking_csv_path}")
@@ -365,7 +422,9 @@ def _load_global_importance_ranking_from_analysis_folder(
         'feature_name': list(all_feature_names),
         'rank_value': [global_importance_map.get(fname, 0.0) for fname in all_feature_names],
     })
-    ranked_df_global['rank_value'] = pd.to_numeric(ranked_df_global['rank_value'], errors='coerce').fillna(0.0)
+    ranked_df_global['rank_value'] = pd.to_numeric(ranked_df_global['rank_value'], errors='raise')
+    if not np.isfinite(ranked_df_global['rank_value'].to_numpy(dtype=float)).all():
+        raise ValueError('Global importance ranking contains nonfinite values')
     ranked_df_global = ranked_df_global.sort_values('rank_value', ascending=False).reset_index(drop=True)
     n_nonzero = int((ranked_df_global['rank_value'] > 0).sum())
     print(f"  Loaded Global_Importance_OUTOFSAMPLE for {n_nonzero} features")
@@ -382,6 +441,7 @@ def run_global_importance_fsea_from_file(
     label: str = '',
     settings: FSEARuntimeSettings | None = None,
 ) -> str:
+    """Validate a ranking CSV and run one global-importance enrichment analysis."""
     settings = settings or _DEFAULT_FSEA_SETTINGS
 
     ranked_list_path = str(ranked_list_path or '').strip()
@@ -420,45 +480,38 @@ def run_global_importance_fsea_from_file(
 
     label_final = str(label or '').strip() or 'GlobalImportance'
     print(f"\nRunning FSEA analysis for {label_final}...")
+    visualization_failures = []
     _run_single_global_preranked_fsea(
         ranked_df=ranked_df,
         validated_groups=validated_groups,
         output_dir=output_dir,
         label=label_final,
         settings=settings,
+        visualization_failures=visualization_failures,
     )
+    status = {"status": "partial" if visualization_failures else "completed",
+              "plots_complete": not visualization_failures,
+              "visualization_failures": visualization_failures, "settings": asdict(settings)}
+    atomic_write_json(status, os.path.join(output_dir, "FSEA_RANKING_STATUS.json"))
+    if visualization_failures:
+        raise RuntimeError("Requested FSEA plots failed: " + "; ".join(visualization_failures))
     return str(output_dir)
 
 
-def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names, 
+@verified_run
+def _perform_fsea_analysis_owned(oof_shap_values, df_for_training, all_feature_names, 
                            training_group_a, training_group_b, df_for_shap_and_agg,
                            paths, le, num_classes, all_groups_avg_shap_values=None,
                            settings: FSEARuntimeSettings | None = None):
-    """
-    Performs Gene Set Enrichment Analysis (FSEA) on out-of-sample MeanSHAP values.
-    
-    For training groups:
-    - Training Group 1: SHAP values are flipped (sign reversed), then ranked descending
-      - Identifies groups pushing toward class 0 (original negative SHAP values)
-    - Training Group 2: SHAP values ranked descending (positive at top)
-      - Identifies groups pushing toward class 1 (positive SHAP values)
-    
-    For non-training groups:
-    - Run FSEA with descending rank (positive values at top)
-    - Interpret ES sign: Positive ES = enriched at top (pushing toward class 1), 
-      Negative ES = enriched at bottom (pushing toward class 0)
-    
-    Args:
-        oof_shap_values: Out-of-sample SHAP values array (n_samples, n_features) for training groups
-        df_for_training: DataFrame with training samples (individual, group, sex columns)
-        all_feature_names: List of feature names
-        training_group_a: Name of first training group
-        training_group_b: Name of second training group
-        df_for_shap_and_agg: DataFrame with all samples (training + non-training)
-        paths: Dictionary with 'analysis_folder' key
-        le: LabelEncoder
-        num_classes: Number of classes
-        all_groups_avg_shap_values: Optional array of SHAP values for all groups (n_all_samples, n_features)
+    """Run feature-set enrichment on group MeanSHAP and global-importance rankings.
+
+    Training group A and non-training groups rank by -MeanSHAP, so positive ES points
+    toward class 0. Training group B ranks by MeanSHAP, so positive ES points toward
+    class 1. Barcode colors use the original signed SHAP values: class 0 green and class
+    1 magenta.
+
+    Use out-of-fold SHAP for training rows and all-model averaged SHAP for non-training
+    rows; arrays must follow the supplied sample and feature order.
     """
     settings = settings or _DEFAULT_FSEA_SETTINGS
 
@@ -480,6 +533,46 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
     # Create base FSEA output folder to organize all FSEA results
     fsea_base_folder = os.path.join(paths['analysis_folder'], 'FSEA')
     os.makedirs(fsea_base_folder, exist_ok=True)
+    completion_path = os.path.join(fsea_base_folder, 'FSEA_COMPLETE.json')
+    written_outputs = []
+    visualization_failures = []
+    input_digest = hashlib.sha256()
+    for values in (oof_shap_values, all_groups_avg_shap_values):
+        if values is None:
+            input_digest.update(b'none')
+            continue
+        array = np.ascontiguousarray(np.asarray(values))
+        if not np.isfinite(array).all():
+            raise ValueError('FSEA requires finite SHAP inputs')
+        input_digest.update(str((array.shape, array.dtype.str)).encode())
+        input_digest.update(memoryview(array).cast('B'))
+    for frame in (df_for_training, df_for_shap_and_agg):
+        identity_columns = [c for c in ('individual','group','sex') if c in frame]
+        input_digest.update(frame[identity_columns].to_json(orient='split').encode())
+    input_digest.update(json.dumps({'features':list(all_feature_names), 'training_groups':[training_group_a,training_group_b], 'settings':asdict(settings)},sort_keys=True,default=str).encode())
+    source_files = [Path(__file__).with_name(name) for name in ('fsea_runner.py', 'fsea_cache.py', 'fsea.py', 'feature_groups.py', 'runtime_settings.py')]
+    input_digest.update(json.dumps({'source': code_digest(source_files), 'dependency': dependency_identity(gsea),
+                                   'manual_groups': fsea_feature_groups}, sort_keys=True, default=str).encode())
+    if os.path.exists(completion_path):
+        try:
+            previous = json.loads(Path(completion_path).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        ranked = _load_global_importance_ranking_from_analysis_folder(analysis_folder=paths['analysis_folder'],
+                    all_feature_names=all_feature_names, file_suffix=paths.get('file_suffix', ''))
+        candidate_digest = input_digest.copy()
+        candidate_digest.update(pd.util.hash_pandas_object(ranked, index=True).to_numpy().tobytes())
+        artifacts = previous.get('artifact_sha256', {})
+        if (previous.get('receipt_version') == 4 and previous.get('status') == 'completed' and previous.get('plots_complete') is True and previous.get('input_sha256') == candidate_digest.hexdigest()
+                and _verified_fsea_artifacts(fsea_base_folder, artifacts)):
+            print('FSEA: reusing verified completed statistics and plots.')
+            return previous
+        print('FSEA: inputs or requested outputs changed; updating from verified numeric caches where applicable.')
+    _archive_fsea_generation(fsea_base_folder)
+
+
 
     try:
         validated_groups = _prepare_validated_fsea_groups(
@@ -488,8 +581,11 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
             settings=settings,
         )
     except ValueError as e:
-        print(f"ERROR: {e}. Skipping FSEA analysis.")
-        return
+        if str(e) not in {'No feature groups found (neither programmatic nor manual)', 'No valid feature groups after validation'}:
+            raise
+        status = {'status': 'inapplicable', 'reason': str(e)}
+        atomic_write_json(status, os.path.join(fsea_base_folder, 'FSEA_STATUS.json'))
+        return status
 
     # Calculate MeanSHAP for each group
     print("\nCalculating MeanSHAP values per group...")
@@ -549,7 +645,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
             fsea_outdir_a = os.path.join(fsea_base_folder, f'FSEA_{training_group_a}')
             os.makedirs(fsea_outdir_a, exist_ok=True)
             
-            result_a = gsea.prerank(
+            result_a = cached_prerank(gsea,
                 rnk=ranked_df_a,
                 gene_sets=validated_groups,
                 threads=settings.num_workers,
@@ -564,19 +660,14 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
             
             output_path_a = os.path.join(fsea_base_folder, 
                                         f'FSEA_RESULTS_{training_group_a}.xlsx')
-            if 'FDR' in result_a.res2d.columns:
-                sorted_results_a = result_a.res2d.sort_values('FDR', ascending=True, na_position='last')
-            elif 'fdr' in result_a.res2d.columns:
-                sorted_results_a = result_a.res2d.sort_values('fdr', ascending=True, na_position='last')
-            elif 'pval' in result_a.res2d.columns:
-                sorted_results_a = result_a.res2d.sort_values('pval', ascending=True, na_position='last')
-            else:
-                sorted_results_a = result_a.res2d
+            _check_fsea_table(result_a.res2d)
+            sorted_results_a = _sort_fsea_results_table(result_a.res2d)
             
             # Clean up column names: remove 'Name', rename 'Term' to 'Feature_Set'
             sorted_results_a = _clean_fsea_results_df(sorted_results_a)
             
             _write_dataframe_with_autofilter(sorted_results_a, output_path_a)
+            written_outputs.append(output_path_a)
             print(f"    Results saved to: {output_path_a}")
             
             try:
@@ -588,12 +679,12 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                     result_a.plot(terms=terms_to_plot, ofname=os.path.join(fsea_outdir_a, 'enrichment_plots'))
                     print(f"    Plots saved to: {fsea_outdir_a}")
             except Exception as e:
+                visualization_failures.append(str(e))
                 print(f"    WARNING: Could not generate plots: {e}")
             
-            n_sig = (sorted_results_a['FDR'] < settings.fsea_fdr_threshold).sum() if 'FDR' in sorted_results_a.columns else 0
+            n_sig = _significant_count(sorted_results_a, settings.fsea_fdr_threshold)
             print(f"    Significant groups (FDR < {settings.fsea_fdr_threshold}): {n_sig}")
             
-            # Generate visualizations
             try:
                 ranked_df_a_viz = ranked_df_a.copy()
 
@@ -615,6 +706,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                     settings=settings,
                 )
             except Exception as e:
+                visualization_failures.append(str(e))
                 print(f"    WARNING: Could not generate visualizations: {e}")
                 traceback.print_exc()
 
@@ -622,6 +714,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
         except Exception as e:
             print(f"    ERROR running FSEA for {training_group_a}: {e}")
             traceback.print_exc()
+            raise
     
     # Training Group 2: Run FSEA (single analysis, no ascending/descending split)
     if training_group_b in mean_shap_dict:
@@ -639,7 +732,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
             fsea_outdir_b = os.path.join(fsea_base_folder, f'FSEA_{training_group_b}')
             os.makedirs(fsea_outdir_b, exist_ok=True)
             
-            result_b = gsea.prerank(
+            result_b = cached_prerank(gsea,
                 rnk=ranked_df_b,
                 gene_sets=validated_groups,
                 threads=settings.num_workers,
@@ -654,19 +747,14 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
             
             output_path_b = os.path.join(fsea_base_folder, 
                                         f'FSEA_RESULTS_{training_group_b}.xlsx')
-            if 'FDR' in result_b.res2d.columns:
-                sorted_results_b = result_b.res2d.sort_values('FDR', ascending=True, na_position='last')
-            elif 'fdr' in result_b.res2d.columns:
-                sorted_results_b = result_b.res2d.sort_values('fdr', ascending=True, na_position='last')
-            elif 'pval' in result_b.res2d.columns:
-                sorted_results_b = result_b.res2d.sort_values('pval', ascending=True, na_position='last')
-            else:
-                sorted_results_b = result_b.res2d
+            _check_fsea_table(result_b.res2d)
+            sorted_results_b = _sort_fsea_results_table(result_b.res2d)
             
             # Clean up column names: remove 'Name', rename 'Term' to 'Feature_Set'
             sorted_results_b = _clean_fsea_results_df(sorted_results_b)
             
             _write_dataframe_with_autofilter(sorted_results_b, output_path_b)
+            written_outputs.append(output_path_b)
             print(f"    Results saved to: {output_path_b}")
             
             try:
@@ -678,12 +766,12 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                     result_b.plot(terms=terms_to_plot, ofname=os.path.join(fsea_outdir_b, 'enrichment_plots'))
                     print(f"    Plots saved to: {fsea_outdir_b}")
             except Exception as e:
+                visualization_failures.append(str(e))
                 print(f"    WARNING: Could not generate plots: {e}")
             
-            n_sig = (sorted_results_b['FDR'] < settings.fsea_fdr_threshold).sum() if 'FDR' in sorted_results_b.columns else 0
+            n_sig = _significant_count(sorted_results_b, settings.fsea_fdr_threshold)
             print(f"    Significant groups (FDR < {settings.fsea_fdr_threshold}): {n_sig}")
             
-            # Generate visualizations
             try:
                 ranked_df_b_viz = ranked_df_b.copy()
 
@@ -703,6 +791,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                     settings=settings,
                 )
             except Exception as e:
+                visualization_failures.append(str(e))
                 print(f"    WARNING: Could not generate visualizations: {e}")
                 traceback.print_exc()
 
@@ -710,6 +799,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
         except Exception as e:
             print(f"    ERROR running FSEA for {training_group_b}: {e}")
             traceback.print_exc()
+            raise
     
     # Run FSEA for non-training groups
     if all_groups_avg_shap_values is not None:
@@ -736,7 +826,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                                                   f'FSEA_{group_name}')
                     os.makedirs(fsea_outdir_nt, exist_ok=True)
                     
-                    result_nt = gsea.prerank(
+                    result_nt = cached_prerank(gsea,
                         rnk=ranked_df_nt,
                         gene_sets=validated_groups,
                         threads=settings.num_workers,
@@ -752,21 +842,16 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                     output_path_nt = os.path.join(fsea_base_folder, 
                                                   f'FSEA_RESULTS_{group_name}.xlsx')
                     # Sort by FDR (ascending) - most significant results first
-                    if 'FDR' in result_nt.res2d.columns:
-                        sorted_results_nt = result_nt.res2d.sort_values('FDR', ascending=True, na_position='last')
-                    elif 'fdr' in result_nt.res2d.columns:
-                        sorted_results_nt = result_nt.res2d.sort_values('fdr', ascending=True, na_position='last')
-                    elif 'pval' in result_nt.res2d.columns:
-                        sorted_results_nt = result_nt.res2d.sort_values('pval', ascending=True, na_position='last')
-                    else:
-                        sorted_results_nt = result_nt.res2d
+                    _check_fsea_table(result_nt.res2d)
+                    sorted_results_nt = _sort_fsea_results_table(result_nt.res2d)
                     
                     # Clean up column names: remove 'Name', rename 'Term' to 'Feature_Set'
                     sorted_results_nt = _clean_fsea_results_df(sorted_results_nt)
                     
                     _write_dataframe_with_autofilter(sorted_results_nt, output_path_nt)
+                    written_outputs.append(output_path_nt)
                     print(f"    Results saved to: {output_path_nt} (sorted by FDR, most significant first)")
-                    print(f"    Interpret ES sign: Positive = class 1 direction, Negative = class 0 direction")
+                    print(f'    Interpret ES sign: Positive = class 0 direction, Negative = class 1 direction')
                     
                     # Generate enrichment plots manually
                     try:
@@ -780,12 +865,12 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                         else:
                             print(f"    WARNING: No enriched terms found, skipping plots")
                     except Exception as e:
+                        visualization_failures.append(str(e))
                         print(f"    WARNING: Could not generate plots: {e}")
                     
-                    n_sig = (result_nt.res2d['FDR'] < settings.fsea_fdr_threshold).sum() if 'FDR' in result_nt.res2d.columns else 0
+                    n_sig = _significant_count(result_nt.res2d, settings.fsea_fdr_threshold)
                     print(f"    Significant groups (FDR < {settings.fsea_fdr_threshold}): {n_sig}")
                     
-                    # Generate visualizations
                     try:
                         ranked_df_nt_viz = ranked_df_nt.copy()
 
@@ -806,11 +891,13 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
                             settings=settings,
                         )
                     except Exception as e:
+                        visualization_failures.append(str(e))
                         print(f"    WARNING: Could not generate visualizations: {e}")
 
                         
                 except Exception as e:
                     print(f"    ERROR running FSEA for {group_name}: {e}")
+                    raise
     
     # Run FSEA for Global Importance (non-genotype-specific) - prefer ranking CSV
     print("\nRunning FSEA analysis for Global Importance (OUT-OF-SAMPLE)...")
@@ -826,7 +913,7 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
     except Exception as e:
         print(f"    ERROR loading global-importance ranking for FSEA: {e}")
         traceback.print_exc()
-        return
+        raise
 
     try:
         _run_single_global_preranked_fsea(
@@ -834,25 +921,71 @@ def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
             validated_groups=validated_groups,
             output_dir=fsea_base_folder,
             label="GlobalImportance_OutOfSample",
-            settings=settings,
+            settings=settings, visualization_failures=visualization_failures,
         )
     except Exception as e:
         print(f"    ERROR running FSEA for Global Importance (OUT-OF-SAMPLE): {e}")
         traceback.print_exc()
+        raise
+    written_outputs.append(os.path.join(fsea_base_folder, 'FSEA_RESULTS_GlobalImportance_OutOfSample.xlsx'))
+    input_digest.update(pd.util.hash_pandas_object(ranked_df_global, index=True).to_numpy().tobytes())
+    artifact_sha256 = {p.relative_to(Path(fsea_base_folder)).as_posix(): sha256_file(p)
+                       for p in sorted(Path(fsea_base_folder).rglob('*')) if p.is_file() and p != Path(completion_path)}
+    status = {'status': 'partial' if visualization_failures else 'completed', 'receipt_version':4, 'input_sha256':input_digest.hexdigest(),
+              'artifact_sha256': artifact_sha256, 'plots_complete': not visualization_failures,
+              'visualization_failures': visualization_failures,
+              'settings':asdict(settings), 'artifact_paths':list(written_outputs),
+              'artifacts': {os.path.basename(p): sha256_file(p) for p in written_outputs}}
+    atomic_write_json(status, completion_path)
+    return status
 
 
-# ============================================================================
+
+def _archive_fsea_generation(base_folder):
+    """Preserve an old output generation; reuse only self-verified numerical caches."""
+    import shutil
+    from uuid import uuid4
+    root = Path(base_folder).resolve()
+    if not root.is_dir() or not any(root.iterdir()):
+        return
+    history = root.parent / "_featureimp_history"
+    history.mkdir(exist_ok=True)
+    archived = history / ("FSEA_" + uuid4().hex)
+    # Both absolute paths are constrained to this analysis folder before the move.
+    if not archived.resolve().is_relative_to(root.parent) or root.name != "FSEA":
+        raise ValueError("Unsafe FSEA history destination")
+    root.rename(archived)
+    root.mkdir()
+    for cache in archived.rglob(".numeric_cache"):
+        if not cache.is_dir():
+            continue
+        target = root / cache.relative_to(archived)
+        shutil.copytree(cache, target)
+    return str(archived)
+
+
+def _perform_fsea_analysis(oof_shap_values, df_for_training, all_feature_names,
+                           training_group_a, training_group_b, df_for_shap_and_agg,
+                           paths, le, num_classes, all_groups_avg_shap_values=None,
+                           settings: FSEARuntimeSettings | None = None):
+    """Own a complete output generation while retaining the public call contract."""
+    from autobehaver.file_locks import FileLock
+    root = Path(paths["analysis_folder"])
+    root.mkdir(parents=True, exist_ok=True)
+    with FileLock(root / "_featureimp_fsea.lock"):
+        return _perform_fsea_analysis_owned(
+            oof_shap_values, df_for_training, all_feature_names, training_group_a,
+            training_group_b, df_for_shap_and_agg, paths, le, num_classes,
+            all_groups_avg_shap_values=all_groups_avg_shap_values, settings=settings)
+
+
 # FSEA VISUALIZATION FUNCTIONS
-# ============================================================================
 
 def _calculate_running_enrichment_score(ranked_df, feature_list, score_col='rank_value', weight=1.0):
-    """
-    Calculates a GSEA-style weighted running enrichment score (ES) curve for a feature set
-    against a preranked list.
+    """Calculate a weighted running enrichment curve from the ranking metric.
 
-    Notes:
-      - ES is computed from `score_col` (default: 'rank_value'), NOT from the barcode colors.
-      - `weight` behaves like gseapy.prerank's weighting (default: 1.0).
+    Use absolute score raised to weight for hits and a uniform miss penalty; barcode
+    colors do not affect enrichment.
     """
     if feature_list is None or len(feature_list) == 0:
         return None
@@ -892,15 +1025,11 @@ def _calculate_running_enrichment_score(ranked_df, feature_list, score_col='rank
 
 
 def _generate_fsea_barcode_plot(args):
-    """
-    Worker function for generating a single barcode + mountain plot.
-    Designed to be called by multiprocessing.Pool.
+    """Render one barcode and optional enrichment curve from a worker payload.
 
-    Args:
-        args: Tuple of (ranked_df, feature_list, output_path, title, figsize, dpi, add_mountain_plot)
-
-    Returns:
-        output_path if successful, None if error
+    The tuple contains ranked data, feature membership, output path, title, figure size,
+    DPI, curve toggle, and color percentile. Return the output path on success or None
+    on a plotting error.
     """
     (ranked_df, feature_list, output_path, title, figsize, dpi, add_mountain_plot, color_percentile) = args
 
@@ -932,9 +1061,7 @@ def _generate_fsea_barcode_plot(args):
             fig, ax_barcode = plt.subplots(figsize=figsize, dpi=dpi)
             ax_mountain = None
 
-        # ------------------------------------------------------------------
         # Barcode colors
-        # ------------------------------------------------------------------
         abs_values = np.abs(shap_values)
 
         # Single-scale color range (no separate "clipped" output folder).
@@ -993,9 +1120,7 @@ def _generate_fsea_barcode_plot(args):
             spine.set_linewidth(0.5)
             spine.set_color('black')
 
-        # ------------------------------------------------------------------
         # Mountain plot (proper weighted running ES, oriented so bulge is right)
-        # ------------------------------------------------------------------
         if ax_mountain is not None:
             # ES computed from the *ranking metric*, not from barcode colors.
             es_curve = _calculate_running_enrichment_score(ranked_df, feature_list, score_col='rank_value', weight=1.0)
@@ -1017,7 +1142,7 @@ def _generate_fsea_barcode_plot(args):
 
                 ax_mountain.set_ylim(n_features, 0)
                 ax_mountain.set_yticks([])
-                ax_mountain.set_xlabel("Running ES (oriented →)")
+                ax_mountain.set_xlabel("Running ES (oriented â†’)")
 
                 # Small label preserving the original ES sign
                 ax_mountain.text(
@@ -1062,14 +1187,10 @@ def _generate_fsea_barcode_plot(args):
 def _orchestrate_fsea_visualization(ranked_df, fsea_results_df,
                                    output_dir, group_name="", top_n=10, validated_groups=None,
                                    settings: FSEARuntimeSettings | None = None):
-    """
-    Orchestrates the generation of FSEA barcode visualizations (single orientation, single color scale).
+    """Render selected enrichment barcodes using one orientation and color scale.
 
-    This version intentionally:
-      - Generates ONE set of plots (no Normal vs Clipped variants)
-      - Generates ONE orientation (no Asc/Desc duplicates)
-      - Uses fixed direction colors: A=green, B=magenta (handled in _generate_fsea_barcode_plot)
-      - Uses a proper weighted running ES curve (handled in _calculate_running_enrichment_score)
+    Signed SHAP uses green for class 0 and magenta for class 1; global importance uses a
+    sequential blue palette.
     """
     settings = settings or _DEFAULT_FSEA_SETTINGS
 
@@ -1086,8 +1207,6 @@ def _orchestrate_fsea_visualization(ranked_df, fsea_results_df,
             fsea_results_df['FDR q-val'] = fsea_results_df['FDR']
         elif 'fdr' in fsea_results_df.columns:
             fsea_results_df['FDR q-val'] = fsea_results_df['fdr']
-        elif 'pval' in fsea_results_df.columns:
-            fsea_results_df['FDR q-val'] = fsea_results_df['pval']
         else:
             print(f"    WARNING: Cannot find FDR/fdr/pval column in FSEA results. Skipping visualization.")
             return
@@ -1173,10 +1292,9 @@ def _orchestrate_fsea_visualization(ranked_df, fsea_results_df,
 
     successful = sum(1 for r in results if r is not None)
     print(f"    Generated {successful}/{len(plot_args)} barcode plots for '{group_name}'.")
+    if successful != len(plot_args):
+        raise RuntimeError(f'FSEA barcode plotting failed for {len(plot_args)-successful} requested plot(s)')
 
 
 
-# ============================================================================
 # RESULTS VALIDATION
-# ============================================================================
-

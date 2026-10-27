@@ -1,4 +1,4 @@
-"""Module entry point for `python -m autobehaver.preinf.keypre`."""
+"""Run the KeyPre command-line entry point."""
 
 from .cli import main
 

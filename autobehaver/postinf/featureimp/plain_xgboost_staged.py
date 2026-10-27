@@ -1,17 +1,6 @@
-"""Optional staged plain-XGBoost baseline execution.
+"""Plan, process, and merge sharded full-feature XGBoost comparison runs.
 
-This module adds a sharded execution layout for the plain-XGBoost comparison
-baseline without changing the underlying model/explainer method. The work unit
-is one frozen ``h_hit`` repeat (and one ``(perm_idx, h_hit)`` task for
-permutations), which makes the baseline naturally parallel across cluster jobs.
-
-Workflow
---------
-- ``plain_xgboost_baseline_plan``: create a baseline-specific task manifest.
-- ``plain_xgboost_baseline_process_shard``: run only the assigned repeat tasks
-  and write merge-friendly partials.
-- ``plain_xgboost_baseline_merge_shards``: merge partials and write the normal
-  ``PLAIN_XGBOOST_BASELINE`` outputs.
+Each task processes one frozen coverage round or one permutation of that round.
 """
 
 from __future__ import annotations
@@ -19,12 +8,15 @@ from __future__ import annotations
 import csv
 import json
 import os
+from pathlib import Path
 import shutil
 import time
 import traceback
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+from .integrity import strict_bool, seal_baseline_receipt, validate_baseline_receipt, baseline_inputs
+from autobehaver.atomic_io import atomic_write_json
 import numpy as np
 import pandas as pd
 
@@ -80,7 +72,7 @@ from .plain_xgboost_baseline import (
 from .postanalysis_logging import append_postanalysis_error_log
 from .reporting import create_formatted_predictions_for_graphpad, save_predictions_with_formatting
 from .shap_compat import make_tree_explainer
-from .shard_runner import _get_runtime_num_workers, _json_dump
+from .shard_runner import _get_runtime_num_workers, _directory_lock
 
 STAGED_PLAN_DIRNAME = "_STAGED_PLAN"
 STAGED_SHARDS_DIRNAME = "_STAGED_SHARDS"
@@ -99,6 +91,44 @@ REAL_STABILITY_FILENAME = "REAL_STABILITY.npz"
 PERM_PARTIALS_FILENAME_TEMPLATE = "PERM_PARTIALS_perm{perm_idx:03d}.npz"
 PERM_FOLD_ROWS_FILENAME_TEMPLATE = "PERM_FOLD_ROWS_perm{perm_idx:03d}.jsonl"
 MERGE_DONE_FILENAME = "PLAIN_XGBOOST_STAGED_MERGE_DONE.json"
+
+
+def _json_dump(obj: Any, path: str) -> None:
+    if os.path.basename(path) in {SHARD_DONE_FILENAME, MERGE_DONE_FILENAME}:
+        obj = seal_baseline_receipt(obj, path)
+    atomic_write_json(obj, path)
+
+
+def _required_shard_artifacts(analysis_dir: str, shard_dir: str, tasks: Sequence[Mapping[str, Any]]) -> List[str]:
+    """List the artifacts required by the assigned real and permutation tasks."""
+    names = [REAL_PARTIALS_FILENAME, REAL_FOLD_ROWS_FILENAME, REAL_REPEAT_ROWS_FILENAME, REAL_STABILITY_FILENAME]
+    permutations = sorted({int(t["permutation_idx"]) for t in tasks if str(t["family"]).lower() == "perm"})
+    for index in permutations:
+        names.extend([PERM_PARTIALS_FILENAME_TEMPLATE.format(perm_idx=index), PERM_FOLD_ROWS_FILENAME_TEMPLATE.format(perm_idx=index)])
+    return [os.path.relpath(os.path.join(shard_dir, name), analysis_dir) for name in names]
+
+
+def _validate_shard_tasks(shard_dir: str, tasks: Sequence[Mapping[str, Any]], receipt: Mapping[str, Any]) -> None:
+    """Check identities of completed folds, rather than accepting counts alone."""
+    if int(receipt.get("task_count", -1)) != len(tasks):
+        raise ValueError("Baseline shard task count differs from its frozen plan")
+    expected = {}
+    for task in tasks:
+        family = str(task["family"]).lower()
+        permutation = int(task["permutation_idx"]) if family == "perm" else -1
+        key = (family, permutation)
+        folds = expected.setdefault(key, [])
+        folds.extend((int(task["h_hit"]), i) for i in range(1, int(task["n_splits"]) + 1))
+    expected.setdefault(("real", -1), [])
+    for (family, permutation), planned in expected.items():
+        filename = REAL_FOLD_ROWS_FILENAME if family == "real" else PERM_FOLD_ROWS_FILENAME_TEMPLATE.format(perm_idx=permutation)
+        rows = _read_jsonl(os.path.join(shard_dir, filename))
+        observed = [(int(row["h_hit"]), int(row["fold_idx"])) for row in rows]
+        if sorted(observed) != sorted(planned) or len(set(observed)) != len(observed):
+            raise ValueError("Baseline shard fold identities differ from its frozen tasks")
+    repeats = _read_jsonl(os.path.join(shard_dir, REAL_REPEAT_ROWS_FILENAME))
+    if sorted(int(row["h_hit"]) for row in repeats) != sorted(int(t["h_hit"]) for t in tasks if str(t["family"]).lower() == "real"):
+        raise ValueError("Baseline completed repeat identities differ from its frozen tasks")
 
 
 def _analysis_dir(path: str) -> str:
@@ -168,6 +198,7 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
 
 
 def _write_task_rows(path: str, task_rows: Sequence[Mapping[str, Any]]) -> None:
+    """Write typed repeat assignments in the baseline task manifest."""
     fieldnames = [
         "task_id",
         "task_key",
@@ -233,22 +264,25 @@ def _collect_baseline_settings(
     *,
     settings_override: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Resolve baseline settings from frozen context and explicit overrides."""
     saved_snapshot = dict(loaded.get("settings_snapshot") or {})
     explicit = _iter_explicit_settings(settings_override)
     effective = dict(saved_snapshot)
     effective.update(explicit)
     return {
-        "GLOBAL_RANDOM_SEED": int(effective.get("GLOBAL_RANDOM_SEED", loaded.get("global_random_seed", DEFAULT_SETTINGS.get("GLOBAL_RANDOM_SEED", 7)) or 7)),
-        "n_estimators": int(effective.get("n_estimators", DEFAULT_SETTINGS.get("n_estimators", 1000)) or 1000),
-        "learning_rate": float(effective.get("learning_rate", DEFAULT_SETTINGS.get("learning_rate", 0.01)) or 0.01),
-        "max_depth": int(effective.get("max_depth", DEFAULT_SETTINGS.get("max_depth", 6)) or 6),
-        "model_subsample": float(effective.get("model_subsample", DEFAULT_SETTINGS.get("model_subsample", 0.8)) or 0.8),
-        "run_permutation_test": bool(effective.get("run_permutation_test", False)),
-        "n_permutations": int(effective.get("n_permutations", 0) or 0) if bool(effective.get("run_permutation_test", False)) else 0,
+        **effective,
+        "GLOBAL_RANDOM_SEED": int(effective.get("GLOBAL_RANDOM_SEED", loaded.get("global_random_seed", DEFAULT_SETTINGS.get("GLOBAL_RANDOM_SEED", 7)))),
+        "n_estimators": int(effective.get("n_estimators", DEFAULT_SETTINGS.get("n_estimators", 1000))),
+        "learning_rate": float(effective.get("learning_rate", DEFAULT_SETTINGS.get("learning_rate", 0.01))),
+        "max_depth": int(effective.get("max_depth", DEFAULT_SETTINGS.get("max_depth", 6))),
+        "model_subsample": float(effective.get("model_subsample", DEFAULT_SETTINGS.get("model_subsample", 0.8))),
+        "run_permutation_test": strict_bool(effective.get("run_permutation_test", False)),
+        "n_permutations": int(effective.get("n_permutations", 0) or 0) if strict_bool(effective.get("run_permutation_test", False)) else 0,
     }
 
 
 def _build_plan_tasks(*, h_hits: Sequence[int], n_splits: int, n_permutations: int) -> List[Dict[str, Any]]:
+    """Create one task per real coverage round and requested permutation round."""
     task_rows: List[Dict[str, Any]] = []
     task_id = 0
     for repeat_zero_idx, h_hit in enumerate(h_hits):
@@ -284,6 +318,7 @@ def _build_plan_tasks(*, h_hits: Sequence[int], n_splits: int, n_permutations: i
 
 
 def _assign_tasks_to_shards(task_rows: Sequence[Mapping[str, Any]], num_shards: int) -> Tuple[List[Dict[str, Any]], int]:
+    """Distribute planned repeat tasks across no more shards than tasks."""
     requested = max(1, int(num_shards))
     task_count = int(len(task_rows))
     active_num_shards = max(1, min(requested, task_count if task_count > 0 else 1))
@@ -304,6 +339,7 @@ def _prepare_context(
     runtime_num_workers: int,
     run_fsea_analysis: Optional[bool],
 ) -> Dict[str, Any]:
+    """Validate ordered rows and features and prepare binary baseline arrays."""
     context_loaded = dict(loaded["context"])
     training_group_a = str(loaded["training_group_a"])
     training_group_b = str(loaded["training_group_b"])
@@ -376,6 +412,7 @@ def _prepare_context(
 
 
 def _init_real_partial(context: Mapping[str, Any]) -> Dict[str, Any]:
+    """Allocate real-repeat prediction and SHAP accumulators with frozen dimensions."""
     n_train = int(context["n_train"])
     n_all = int(context["n_all"])
     n_feats = int(context["n_feats"])
@@ -399,6 +436,7 @@ def _init_real_partial(context: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _init_perm_partial(context: Mapping[str, Any], *, permutation_idx: int) -> Dict[str, Any]:
+    """Allocate prediction and SHAP accumulators for one permutation."""
     n_train = int(context["n_train"])
     n_all = int(context["n_all"])
     n_feats = int(context["n_feats"])
@@ -419,6 +457,7 @@ def _init_perm_partial(context: Mapping[str, Any], *, permutation_idx: int) -> D
 
 
 def _merge_real_partial(total: MutableMapping[str, Any], part: Mapping[str, Any]) -> None:
+    """Accumulate compatible real-repeat sums, counts, and performance records."""
     for key in [
         "oof_margin_sum",
         "oof_count",
@@ -448,6 +487,7 @@ def _merge_real_partial(total: MutableMapping[str, Any], part: Mapping[str, Any]
 
 
 def _merge_perm_partial(total: MutableMapping[str, Any], part: Mapping[str, Any]) -> None:
+    """Accumulate compatible permutation sums, counts, and performance records."""
     for key in [
         "oof_margin_sum",
         "oof_count",
@@ -479,6 +519,7 @@ def _run_real_repeat_task(
     started_at: float,
     log_prefix: str,
 ) -> Dict[str, Any]:
+    """Train every frozen fold in one real repeat and collect numerical partials."""
     fold_plan_records = dict(context["fold_plan_records"])
     fold_indices_round = _build_real_fold_indices_local(fold_plan_records[int(h_hit)])
     n_splits = int(context["n_splits"])
@@ -637,6 +678,7 @@ def _run_permuted_repeat_task(
     started_at: float,
     log_prefix: str,
 ) -> Dict[str, Any]:
+    """Train one permutation repeat and collect results in the original label frame."""
     fold_plan_records = dict(context["fold_plan_records"])
     fold_indices_round = _build_real_fold_indices_local(fold_plan_records[int(h_hit)])
     n_splits = int(context["n_splits"])
@@ -728,6 +770,7 @@ def _run_permuted_repeat_task(
 
 
 def _write_real_partial_files(shard_dir: str, partial: Mapping[str, Any], ordered_groups: Sequence[str], n_feats: int) -> None:
+    """Persist real-repeat sums, counts, stability arrays, and performance records."""
     np.savez_compressed(
         os.path.join(shard_dir, REAL_PARTIALS_FILENAME),
         oof_margin_sum=np.asarray(partial["oof_margin_sum"], dtype=np.float64),
@@ -769,6 +812,7 @@ def _write_real_partial_files(shard_dir: str, partial: Mapping[str, Any], ordere
 
 
 def _load_real_partial_files(shard_dir: str, ordered_groups: Sequence[str]) -> Dict[str, Any]:
+    """Load real-repeat numerical partials and ordered group stability arrays."""
     npz = np.load(os.path.join(shard_dir, REAL_PARTIALS_FILENAME), allow_pickle=True)
     payload = {
         "oof_margin_sum": np.asarray(npz["oof_margin_sum"], dtype=np.float64),
@@ -800,6 +844,7 @@ def _load_real_partial_files(shard_dir: str, ordered_groups: Sequence[str]) -> D
 
 
 def _write_perm_partial_files(shard_dir: str, partial: Mapping[str, Any]) -> None:
+    """Persist one permutation's numerical partials and fold-performance records."""
     perm_idx = int(partial["permutation_idx"])
     np.savez_compressed(
         os.path.join(shard_dir, PERM_PARTIALS_FILENAME_TEMPLATE.format(perm_idx=perm_idx)),
@@ -819,6 +864,7 @@ def _write_perm_partial_files(shard_dir: str, partial: Mapping[str, Any]) -> Non
 
 
 def _load_perm_partial_files(shard_dir: str, perm_idx: int) -> Dict[str, Any]:
+    """Load one permutation's numerical partials and fold-performance records."""
     npz = np.load(os.path.join(shard_dir, PERM_PARTIALS_FILENAME_TEMPLATE.format(perm_idx=perm_idx)), allow_pickle=True)
     return {
         "permutation_idx": int(np.asarray(npz["permutation_idx"]).reshape(-1)[0]),
@@ -844,6 +890,9 @@ def _finalize_outputs_from_aggregates(
     run_fsea_analysis: bool,
     started_at: float,
 ) -> str:
+    """Convert merged repeat partials into baseline predictions, SHAP reports, and
+    optional FSEA.
+    """
     out_dir = str(context["out_dir"])
     os.makedirs(out_dir, exist_ok=True)
     _cleanup_stale_permutation_outputs(out_dir)
@@ -1179,12 +1228,13 @@ def _finalize_outputs_from_aggregates(
     return out_dir
 
 
-def plan_plain_xgboost_baseline_shards(
+def _plan_plain_xgboost_baseline_shards(
     *,
     analysis_folder_path: str,
     num_shards: Optional[int] = None,
     settings_override: Optional[Mapping[str, Any]] = None,
 ) -> str:
+    """Freeze the comparison-baseline settings and repeat assignments."""
     analysis_dir = _analysis_dir(analysis_folder_path)
     loaded = load_featureimp_baseline_context(analysis_dir)
     baseline_settings = _collect_baseline_settings(loaded, settings_override=settings_override)
@@ -1204,8 +1254,10 @@ def plan_plain_xgboost_baseline_shards(
     out_dir = _plain_xgb_root(analysis_dir)
     plan_dir = _plan_root(analysis_dir)
     shards_root = _shards_root(analysis_dir)
-    shutil.rmtree(plan_dir, ignore_errors=True)
-    shutil.rmtree(shards_root, ignore_errors=True)
+    if os.path.exists(_plan_manifest_path(analysis_dir)):
+        raise FileExistsError("Baseline plans are immutable; use a new analysis folder.")
+    if os.path.exists(plan_dir) and any(Path(plan_dir).iterdir()):
+        raise FileExistsError("Incomplete baseline plan retained; use a new analysis folder.")
     os.makedirs(plan_dir, exist_ok=True)
     os.makedirs(shards_root, exist_ok=True)
 
@@ -1273,11 +1325,14 @@ def _load_staged_manifest(analysis_folder_path: str) -> Dict[str, Any]:
     return payload
 
 
-def process_plain_xgboost_baseline_shard(
+def _process_plain_xgboost_baseline_shard(
     *,
     analysis_folder_path: str,
     shard_index: Optional[int] = None,
 ) -> str:
+    """Verify and process the assigned baseline repeat tasks, then publish a completion
+    receipt.
+    """
     analysis_dir = _analysis_dir(analysis_folder_path)
     manifest = _load_staged_manifest(analysis_dir)
     active_num_shards = int(manifest.get("active_num_shards", 1) or 1)
@@ -1287,9 +1342,16 @@ def process_plain_xgboost_baseline_shard(
             f"plain_xgboost_baseline_process_shard received shard_index={resolved_shard_index}, but active_num_shards={active_num_shards}."
         )
 
+    shard_dir = _shard_output_dir(analysis_dir, resolved_shard_index, active_num_shards)
+    done_path = os.path.join(shard_dir, SHARD_DONE_FILENAME)
+    if os.path.exists(done_path):
+        validate_baseline_receipt(done_path, analysis_dir)
+        return shard_dir
+
     shard_plan_dir = _shard_plan_dir(analysis_dir, resolved_shard_index, active_num_shards)
     shard_tasks_path = os.path.join(shard_plan_dir, SHARD_TASKS_FILENAME)
     task_rows = _read_task_rows(shard_tasks_path)
+    frozen_inputs = baseline_inputs(analysis_dir, include_shards=False)
 
     loaded = load_featureimp_baseline_context(analysis_dir)
     baseline_settings = dict(manifest.get("settings") or {})
@@ -1301,8 +1363,11 @@ def process_plain_xgboost_baseline_shard(
         run_fsea_analysis=False,
     )
 
-    shard_dir = _shard_output_dir(analysis_dir, resolved_shard_index, active_num_shards)
-    shutil.rmtree(shard_dir, ignore_errors=True)
+    if os.path.isdir(shard_dir):
+        from uuid import uuid4
+        attempts = os.path.join(_shards_root(analysis_dir), "_attempts")
+        os.makedirs(attempts, exist_ok=True)
+        os.replace(shard_dir, os.path.join(attempts, os.path.basename(shard_dir) + "_" + uuid4().hex))
     os.makedirs(shard_dir, exist_ok=True)
 
     started_at = float(time.time())
@@ -1351,7 +1416,9 @@ def process_plain_xgboost_baseline_shard(
                     started_at=started_at,
                     log_prefix=f"shard {resolved_shard_index}",
                 )
-                target = perm_partials.setdefault(int(perm_idx), _init_perm_partial(context, permutation_idx=int(perm_idx)))
+                if int(perm_idx) not in perm_partials:
+                    perm_partials[int(perm_idx)] = _init_perm_partial(context, permutation_idx=int(perm_idx))
+                target = perm_partials[int(perm_idx)]
                 _merge_perm_partial(target, payload)
             else:
                 raise ValueError(f"Unsupported plain XGBoost staged task family: {family!r}")
@@ -1359,6 +1426,9 @@ def process_plain_xgboost_baseline_shard(
         _write_real_partial_files(shard_dir, real_partial, list(context["ordered_stability_groups"]), int(context["n_feats"]))
         for perm_idx, perm_partial in sorted(perm_partials.items()):
             _write_perm_partial_files(shard_dir, perm_partial)
+
+        if baseline_inputs(analysis_dir, include_shards=False) != frozen_inputs:
+            raise RuntimeError("Baseline inputs or code changed while processing")
 
         _json_dump(
             {
@@ -1369,6 +1439,7 @@ def process_plain_xgboost_baseline_shard(
                 "shard_index": int(resolved_shard_index),
                 "active_num_shards": int(active_num_shards),
                 "task_count": int(len(task_rows)),
+                "artifacts": _required_shard_artifacts(analysis_dir, shard_dir, task_rows),
                 "real_task_count": int(sum(1 for row in task_rows if str(row.get("family", "")).strip().lower() == "real")),
                 "perm_task_counts": {
                     str(perm_idx): int(sum(1 for row in task_rows if str(row.get("family", "")).strip().lower() == "perm" and int(row.get("permutation_idx", 0) or 0) == int(perm_idx)))
@@ -1404,12 +1475,13 @@ def process_plain_xgboost_baseline_shard(
         raise
 
 
-def merge_plain_xgboost_baseline_shards(
+def _merge_plain_xgboost_baseline_shards(
     *,
     analysis_folder_path: str,
     settings_override: Optional[Mapping[str, Any]] = None,
     run_fsea_analysis: Optional[bool] = None,
 ) -> str:
+    """Verify exact fold coverage and combine completed baseline shards."""
     analysis_dir = _analysis_dir(analysis_folder_path)
     manifest = _load_staged_manifest(analysis_dir)
     active_num_shards = int(manifest.get("active_num_shards", 1) or 1)
@@ -1417,9 +1489,14 @@ def merge_plain_xgboost_baseline_shards(
     loaded = load_featureimp_baseline_context(analysis_dir)
     baseline_settings = dict(manifest.get("settings") or {})
     explicit = _iter_explicit_settings(settings_override)
+    # Model settings remain frozen by the baseline plan. Postanalysis settings
+    # may be explicitly requested at merge, and must reach FSEA unchanged.
+    for name, value in explicit.items():
+        if name.startswith("fsea_") or name == "run_fsea_analysis":
+            baseline_settings[name] = value
     runtime_num_workers = _get_runtime_num_workers()
-    resolved_run_fsea = bool(
-        run_fsea_analysis if run_fsea_analysis is not None else explicit.get("run_fsea_analysis", True)
+    resolved_run_fsea = strict_bool(
+        run_fsea_analysis if run_fsea_analysis is not None else explicit.get("run_fsea_analysis", baseline_settings.get("run_fsea_analysis", True))
     )
     context = _prepare_context(
         loaded=loaded,
@@ -1431,7 +1508,7 @@ def merge_plain_xgboost_baseline_shards(
     started_at = float(time.time())
     real_total = _init_real_partial(context)
     perm_totals: Dict[int, Dict[str, Any]] = {}
-    expected_perm_count = int(manifest.get("n_permutations", 0) or 0) if bool(manifest.get("run_permutation_test", False)) else 0
+    expected_perm_count = int(manifest.get("n_permutations", 0) or 0) if strict_bool(manifest.get("run_permutation_test", False)) else 0
 
     for shard_index in range(int(active_num_shards)):
         shard_dir = _shard_output_dir(analysis_dir, shard_index, active_num_shards)
@@ -1446,7 +1523,9 @@ def merge_plain_xgboost_baseline_shards(
             raise RuntimeError(
                 f"Plain XGBoost staged merge expected shard completion marker but did not find it: {done_path}"
             )
-        done_payload = _json_load(done_path)
+        done_payload = validate_baseline_receipt(done_path, analysis_dir)
+        tasks = _read_task_rows(os.path.join(_shard_plan_dir(analysis_dir, shard_index, active_num_shards), SHARD_TASKS_FILENAME))
+        _validate_shard_tasks(shard_dir, tasks, done_payload)
         real_part = _load_real_partial_files(shard_dir, list(context["ordered_stability_groups"]))
         _merge_real_partial(real_total, real_part)
         perm_task_counts = dict(done_payload.get("perm_task_counts") or {})
@@ -1463,6 +1542,7 @@ def merge_plain_xgboost_baseline_shards(
             target = perm_totals.setdefault(int(perm_idx), _init_perm_partial(context, permutation_idx=int(perm_idx)))
             _merge_perm_partial(target, perm_part)
 
+    frozen_inputs = baseline_inputs(analysis_dir, include_shards=True)
     out_dir = _finalize_outputs_from_aggregates(
         context=context,
         real_partial=real_total,
@@ -1471,7 +1551,14 @@ def merge_plain_xgboost_baseline_shards(
         started_at=started_at,
     )
 
+    if baseline_inputs(analysis_dir, include_shards=True) != frozen_inputs:
+        raise RuntimeError("Baseline inputs or code changed during merge")
     merge_done_path = os.path.join(_plan_root(analysis_dir), MERGE_DONE_FILENAME)
+    artifact_paths = collect_plain_xgboost_artifact_paths(analysis_dir)
+    required_files = [path for path in artifact_paths if os.path.isfile(path)]
+    for path in artifact_paths:
+        if not os.path.exists(path):
+            raise RuntimeError(f"Required baseline output missing: {path}")
     _json_dump(
         {
             "status": "completed",
@@ -1480,6 +1567,7 @@ def merge_plain_xgboost_baseline_shards(
             "output_dir": os.path.relpath(out_dir, analysis_dir),
             "active_num_shards": int(active_num_shards),
             "run_fsea_analysis": bool(resolved_run_fsea),
+            "artifacts": [os.path.relpath(path, analysis_dir) for path in required_files],
         },
         merge_done_path,
     )
@@ -1507,6 +1595,51 @@ def merge_plain_xgboost_baseline_shards(
     upsert_postanalysis_stage_record(analysis_dir, stage_record)
     write_baseline_outputs_summary(analysis_dir, settings_snapshot=context["settings_map"])
     return out_dir
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def _baseline_lifecycle_lock(analysis_dir: str, operation: str, index=None):
+    """Serialize lifecycle admission while allowing distinct shards to run together."""
+    from autobehaver.file_locks import FileLock, file_lock_active
+    admission = Path(analysis_dir) / "_plain_xgboost_admission.lock"
+    own = Path(analysis_dir) / (f"_plain_xgboost_shard_{index}.lock" if operation == "shard"
+                       else f"_plain_xgboost_{operation}.lock")
+    owner = None
+    with _directory_lock(str(admission)):
+        candidates = list(Path(analysis_dir).glob("_plain_xgboost_*.lock"))
+        conflicts = [p for p in candidates if p != admission and
+                     (operation != "shard" or "_shard_" not in p.name or p == own)]
+        if any(p.is_dir() or file_lock_active(p) for p in conflicts):
+            raise RuntimeError("Conflicting baseline lifecycle operation is active")
+        if os.path.isdir(own):
+            raise RuntimeError(f"Legacy baseline lock requires verified recovery: {own}")
+        owner = FileLock(own)
+        owner.acquire(metadata={"stage": "featureimp_baseline", "operation": operation, "shard": index})
+    try:
+        yield
+    finally:
+        owner.release()
+
+
+def plan_plain_xgboost_baseline_shards(*, analysis_folder_path: str, **kwargs) -> str:
+    """Create an immutable baseline plan, excluding live shards and merge."""
+    with _baseline_lifecycle_lock(_analysis_dir(analysis_folder_path), "plan"):
+        return _plan_plain_xgboost_baseline_shards(analysis_folder_path=analysis_folder_path, **kwargs)
+
+
+def process_plain_xgboost_baseline_shard(*, analysis_folder_path: str, shard_index: Optional[int] = None) -> str:
+    """Own one shard while allowing other independently owned shards to run."""
+    index = _current_shard_index(shard_index)
+    with _baseline_lifecycle_lock(_analysis_dir(analysis_folder_path), "shard", index):
+        return _process_plain_xgboost_baseline_shard(analysis_folder_path=analysis_folder_path, shard_index=index)
+
+
+def merge_plain_xgboost_baseline_shards(*, analysis_folder_path: str, **kwargs) -> str:
+    """Merge only when no baseline shard or plan mutation is active."""
+    with _baseline_lifecycle_lock(_analysis_dir(analysis_folder_path), "merge"):
+        return _merge_plain_xgboost_baseline_shards(analysis_folder_path=analysis_folder_path, **kwargs)
 
 
 __all__ = [

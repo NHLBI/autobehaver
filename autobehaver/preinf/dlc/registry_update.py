@@ -1,22 +1,12 @@
-"""Project-registry update for the DLC stage.
+"""Record DeepLabCut CSV outputs in the project registry.
 
-The DLC stage consumes *cropped chamber movies* and produces DLC outputs.
-In the Autobehaver pipeline, we record the primary output CSV path for each
-animal in the **project registry** (a single CSV at project root).
-
-Why only the CSV?
------------------
-Downstream stages (keypre) primarily consume the DLC CSV files. DeepLabCut also
-creates an .h5 and *_meta.pickle per video; those filenames often retain DLC's
-long scorer/model tag. We intentionally avoid renaming those by default.
-
-This helper updates the registry **once per DLC run** in the parent process to
-avoid multiprocessing contention.
+Update once in the parent process; KeyPre consumes the recorded CSV path.
 """
 
 from __future__ import annotations
 
 import logging
+from autobehaver.portable_paths import original_name
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -24,39 +14,19 @@ from typing import Any, Iterable
 from autobehaver.registry import read_registry, relpath_str, upsert_registry_rows
 
 
-def _best_csv_for_video(*, video_path: Path, search_dir: Path) -> Path | None:
-    """Return the best matching DLC CSV for a video.
+def _best_csv_for_video(*, video_path: Path, search_dir: Path, output_index=None) -> Path | None:
+    """Return the unique indexed DeepLabCut CSV for a video, rejecting ambiguity."""
 
-    We look for files in ``search_dir`` whose filename starts with the video
-    stem.
-
-    Preference order:
-      1) <stem>.csv (preferred after tag-stripping)
-      2) shortest filename (heuristic: tag-stripped is shorter)
-      3) newest mtime
-    """
-
-    stem = video_path.stem
+    stem = Path(original_name(video_path)).stem
     if not search_dir.exists():
         return None
-
-    cands = [p for p in search_dir.glob(f"{stem}*.csv") if p.is_file() and p.name.startswith(stem)]
-    if not cands:
-        return None
-
-    exact = search_dir / f"{stem}.csv"
-    if exact.exists():
-        return exact
-
-    def sort_key(p: Path) -> tuple[int, float]:
-        try:
-            mtime = p.stat().st_mtime
-        except Exception:
-            mtime = 0.0
-        return (len(p.name), -mtime)
-
-    cands.sort(key=sort_key)
-    return cands[0]
+    from .core import build_dlc_output_index
+    if output_index is None:
+        output_index = build_dlc_output_index(search_dir)
+    candidates = [Path(p) for p in output_index.get(stem, {}).get('csv', [])]
+    if len(candidates)>1:
+        raise ValueError(f'Ambiguous DLC CSV artifacts for {video_path}')
+    return candidates[0] if candidates else None
 
 
 def update_registry_from_dlc_outputs(
@@ -68,7 +38,7 @@ def update_registry_from_dlc_outputs(
     lock_timeout_sec: int = 120,
     lock_stale_sec: int = 3600,
 ) -> None:
-    """Upsert DLC CSV relpaths for the provided video list into the registry."""
+    """Upsert DeepLabCut CSV paths for the supplied videos."""
 
     registry_csv = Path(registry_csv).expanduser().resolve()
     project_root = Path(project_root).expanduser().resolve()
@@ -92,6 +62,7 @@ def update_registry_from_dlc_outputs(
 
     now = datetime.now().isoformat(timespec="seconds")
     rows: list[dict[str, Any]] = []
+    indexes = {}
 
     for v in videos:
         try:
@@ -114,7 +85,10 @@ def update_registry_from_dlc_outputs(
             continue
 
         search_dir = output_dir if output_dir is not None else vp.parent
-        csv_path = _best_csv_for_video(video_path=vp, search_dir=search_dir)
+        if search_dir not in indexes:
+            from .core import build_dlc_output_index
+            indexes[search_dir] = build_dlc_output_index(search_dir)
+        csv_path = _best_csv_for_video(video_path=vp, search_dir=search_dir, output_index=indexes[search_dir])
         if csv_path is None:
             continue
 

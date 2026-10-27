@@ -14,7 +14,8 @@ def _prepare_small_planned_analysis(tmp_path: Path, *, h_hits: int = 2, run_perm
 
     matrix_dir = tmp_path / "matrix"
     results_dir = tmp_path / "results"
-    analysis_dir = results_dir / "FEATURE_ANALYSIS_plain_xgb_staged"
+    # Keep the native Windows baseline-permutation fixture below MAX_PATH.
+    analysis_dir = results_dir / "FI"
     matrix_dir.mkdir(parents=True, exist_ok=True)
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -193,7 +194,7 @@ def test_featureimp_cli_routes_plain_xgboost_staged_stages(monkeypatch, tmp_path
     assert seen[2][1]["analysis_folder_path"] == str(analysis_dir)
 
 
-def test_plain_xgboost_staged_permutation_smoke(tmp_path: Path) -> None:
+def test_plain_xgboost_staged_permutation_integration(tmp_path: Path) -> None:
     from autobehaver.postinf.featureimp import core
 
     analysis_dir = _prepare_small_planned_analysis(tmp_path, h_hits=1, run_permutation_test=True, n_permutations=1, num_shards=2)

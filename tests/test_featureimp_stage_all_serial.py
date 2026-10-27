@@ -19,6 +19,11 @@ def test_featureimp_stage_all_runs_serial_staged_wrapper(tmp_path: Path, monkeyp
 
     matrix_path = matrix_dir / "MASTER_FEATURE_MATRIX.csv"
     _write_small_master_matrix(matrix_path)
+    # Enough synthetic observations per fold for supported tree leaves.
+    fixture = pd.read_csv(matrix_path)
+    fixture = pd.concat([fixture] * 4, ignore_index=True)
+    fixture["individual"] = [f"fly{i}" for i in range(len(fixture))]
+    fixture.to_csv(matrix_path, index=False)
 
     settings = {
         "analysis_run_name": "all_serial",
@@ -29,7 +34,7 @@ def test_featureimp_stage_all_runs_serial_staged_wrapper(tmp_path: Path, monkeyp
         "training_group_a": "A",
         "training_group_b": "B",
         "num_workers": 1,
-        "n_estimators": 4,
+        "n_estimators": 12,
         "learning_rate": 0.2,
         "max_depth": 2,
         "n_splits": 2,
@@ -143,7 +148,8 @@ def test_featureimp_stage_all_accepts_programmatic_runtime_flags(tmp_path: Path,
     assert called["process"] == {"analysis_folder_path": str(analysis_dir), "shard_index": 0}
     assert called["merge_shards"] == {"analysis_folder_path": str(analysis_dir)}
 
-    settings = json.loads((analysis_dir / "FEATUREIMP_RUN_SETTINGS.json").read_text())
+    # Planning is mocked: inspect its effective input snapshot before persistence.
+    settings = core.build_settings_snapshot_payload(analysis_folder_path=str(analysis_dir))
     assert settings["analysis_run_name"] == "programmatic_flags"
     assert settings["control_group_tag"] == "A"
     assert settings["run_fsea_analysis"] is False

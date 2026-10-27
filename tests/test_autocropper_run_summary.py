@@ -34,7 +34,6 @@ def test_process_single_movie_marks_incomplete_when_required_crops_are_missing(
     ac_pipeline.run_dir = run_dir
     ac_pipeline.crop_output_dir = output_dir
     ac_pipeline.recording_db_path = None
-    ac_pipeline.chamber_validator = None
 
     monkeypatch.setattr(ac_pipeline, "ensure_user_permissions", lambda *a, **k: None)
     monkeypatch.setattr(ac_pipeline, "_excluded_set_for_movie", lambda _movie: set())
@@ -46,17 +45,12 @@ def test_process_single_movie_marks_incomplete_when_required_crops_are_missing(
     monkeypatch.setattr(
         ac_pipeline,
         "all_cropped_movies_exist",
-        lambda _movie, _output_dir, excluded_chambers=None: False,
+        lambda _movie, _output_dir, excluded_chambers=None, resolutions=None: False,
     )
     monkeypatch.setattr(
         ac_pipeline,
         "detect_and_match_chambers",
         lambda _movie, _args: ({"chamber1": (10, 20)}, object(), [], 100),
-    )
-    monkeypatch.setattr(
-        ac_pipeline,
-        "run_chamber_validation",
-        lambda _movie, allowed_coords, _validator, _crop_dim: (allowed_coords, {}),
     )
     monkeypatch.setattr(ac_pipeline, "draw_circles", lambda *a, **k: None)
     monkeypatch.setattr(ac_pipeline, "save_chamber_coordinates_image", lambda *a, **k: None)

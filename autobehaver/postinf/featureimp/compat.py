@@ -1,11 +1,5 @@
-"""autobehaver.postinf.featureimp.compat
-
-Delegation layer for the Feature Importance (featureimp) pipeline.
-
-This module contains thin wrappers that route stable helper entry points to the
-modular implementations in prep/committee/PCA/FSEA/reporting/summaries/
-permutation/matrix. The wrappers are intentionally lightweight and should not
-contain business logic.
+"""Preserve FeatureImp helper entry points by delegating to the analysis and reporting
+modules.
 """
 
 from __future__ import annotations
@@ -55,12 +49,12 @@ def apply_settings(settings_dict: dict) -> None:
 
 
 def _clean_performance_dict_for_json(*args, **kwargs):
-    """Delegation wrapper (implementation moved to `featureimp.summaries`)."""
+    """Convert performance metrics to JSON-compatible values."""
     from . import summaries as _summaries
     return _summaries._clean_performance_dict_for_json(*args, **kwargs)
 
 def validate_feature_matrix(matrix_path, required_id_cols=['individual', 'group', 'sex']):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.matrix.validate_feature_matrix`."""
+    """Validate the feature matrix through the canonical matrix helper."""
     return _validate_feature_matrix(matrix_path, required_id_cols=required_id_cols)
 
 def normalize_feature_matrix(
@@ -69,7 +63,9 @@ def normalize_feature_matrix(
     skip_if_normalized_exists=False,
     analysis_folder_path=None,
 ):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.matrix.normalize_feature_matrix`."""
+    """Normalize the selected matrix through the canonical FeatureImp preprocessing
+    helper.
+    """
     return _normalize_feature_matrix(
         results_dir=results_dir,
         raw_matrix_path=raw_matrix_path,
@@ -81,23 +77,23 @@ def normalize_feature_matrix(
     )
 
 def get_analysis_folder_name(analysis_run_name='', sex_stratum=None):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.prep.get_analysis_folder_name`."""
+    """Resolve the analysis folder name from the run name and sex stratum."""
     from . import prep as _prep
     return _prep.get_analysis_folder_name(analysis_run_name=analysis_run_name, sex_stratum=sex_stratum)
 
 def filter_data_by_sex(df, sex_value):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.prep.filter_data_by_sex`."""
+    """Select the requested sex stratum for analysis."""
     from . import prep as _prep
     return _prep.filter_data_by_sex(df=df, sex_value=sex_value)
 
 def _parse_feature_name(feature_name):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.prep._parse_feature_name`."""
+    """Parse a feature's source, category, smoothing, and measurement tokens."""
     from . import prep as _prep
     return _prep._parse_feature_name(feature_name)
 
 def _filter_sparse_features_by_group(df, training_group_a, training_group_b, 
                                      min_completeness, feature_cols):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.prep._filter_sparse_features_by_group`."""
+    """Retain features meeting completeness criteria in both training groups."""
     from . import prep as _prep
     return _prep._filter_sparse_features_by_group(
         df=df,
@@ -109,7 +105,7 @@ def _filter_sparse_features_by_group(df, training_group_a, training_group_b,
 
 def _filter_low_variance_features(X_train_full, y_train, training_group_a, training_group_b, 
                                   feature_cols, min_variance_threshold=1e-6):
-    """Delegation wrapper for :func:`autobehaver.postinf.featureimp.prep._filter_low_variance_features`."""
+    """Remove constant and near-constant imputed training features."""
     from . import prep as _prep
     return _prep._filter_low_variance_features(
         X_train_full=X_train_full,
@@ -121,10 +117,12 @@ def _filter_low_variance_features(X_train_full, y_train, training_group_a, train
     )
 
 def _init_pool_worker(*args, **kwargs):
+    """Initialize read-only matrices and labels in a committee worker."""
     from . import committee as _committee
     return _committee._init_pool_worker(*args, **kwargs)
 
 def _train_subset_fold_worker(*args, **kwargs):
+    """Train one specialist fold through the committee implementation."""
     from . import committee as _committee
     return _committee._train_subset_fold_worker(*args, **kwargs)
 
@@ -136,7 +134,7 @@ def _generate_sex_class_stratified_permutation(
     test_indices,
     permutation_seed=None,
 ):
-    """Wrapper for permutation helper (moved to featureimp.permutation)."""
+    """Shuffle training-fold labels within sex strata."""
     
     from . import permutation as _permutation
     return _permutation._generate_sex_class_stratified_permutation(
@@ -148,7 +146,7 @@ def _generate_sex_class_stratified_permutation(
     )
 
 def _flip_probabilities_for_permuted_samples(probas, y_original_full, y_permuted_full, train_indices):
-    """Wrapper for probability flipping helper (moved to featureimp.permutation)."""
+    """Restore permuted training predictions to the original class frame."""
     
     from . import permutation as _permutation
     return _permutation._flip_probabilities_for_permuted_samples(
@@ -160,7 +158,7 @@ def _flip_probabilities_for_permuted_samples(probas, y_original_full, y_permuted
 
 
 def _sanitize_group_name_for_filename(*args, **kwargs):
-    """Delegation wrapper (implementation moved to `featureimp.summaries`)."""
+    """Return a portable filename token for a group label."""
     from . import summaries as _summaries
     return _summaries._sanitize_group_name_for_filename(*args, **kwargs)
 
@@ -202,102 +200,109 @@ def _create_group_only_plot(x_data, y_data, color, ax_limits, ax_position, figsi
     return fig
 
 def _generate_bout_timebudget_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._generate_bout_timebudget_groups`."""
+    """Construct broad bout-summary and time-budget enrichment groups."""
     from . import fsea as _fsea
     return _fsea._generate_bout_timebudget_groups(*args, **kwargs)
 
 def _generate_kinematic_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._generate_kinematic_groups`."""
+    """Construct supported behavior and body-part kinematic enrichment groups."""
     from . import fsea as _fsea
     return _fsea._generate_kinematic_groups(*args, **kwargs)
 
 def _generate_transition_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._generate_transition_groups`."""
+    """Construct transition enrichment groups with the declared direction rules."""
     from . import fsea as _fsea
     return _fsea._generate_transition_groups(*args, **kwargs)
 
 def _generate_postural_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._generate_postural_groups`."""
+    """Group postural features by orientation for enrichment."""
     from . import fsea as _fsea
     return _fsea._generate_postural_groups(*args, **kwargs)
 
 def _generate_spatial_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._generate_spatial_groups`."""
+    """Construct radial-distance, relative-angle, and occupancy-fraction groups."""
     from . import fsea as _fsea
     return _fsea._generate_spatial_groups(*args, **kwargs)
 
 def _generate_sleep_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._generate_sleep_groups`."""
+    """Collect sleep features in the declared enrichment group."""
     from . import fsea as _fsea
     return _fsea._generate_sleep_groups(*args, **kwargs)
 
 def _write_fsea_group_documentation(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._write_fsea_group_documentation`."""
+    """Write enrichment membership and group-validation documentation."""
     from . import fsea as _fsea
     return _fsea._write_fsea_group_documentation(*args, **kwargs)
 
 
 def _identify_ungrouped_features(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._identify_ungrouped_features`."""
+    """Report features outside the theoretical enrichment groups."""
     from . import fsea as _fsea
     return _fsea._identify_ungrouped_features(*args, **kwargs)
 
 def _compare_theoretical_vs_actual_groups(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._compare_theoretical_vs_actual_groups`."""
+    """Report theoretical and validated group membership differences."""
     from . import fsea as _fsea
     return _fsea._compare_theoretical_vs_actual_groups(*args, **kwargs)
 
 def _clean_fsea_results_df(*args, **kwargs):
-    """Wrapper for :func:`autobehaver.postinf.featureimp.fsea._clean_fsea_results_df`."""
+    """Remove the native Name column and rename Term to Feature_Set."""
     from . import fsea as _fsea
     return _fsea._clean_fsea_results_df(*args, **kwargs)
 
 def _print_validation_summary(*args, **kwargs):
+    """Display the analysis-validation summary."""
     from . import reporting as _reporting
     return _reporting._print_validation_summary(*args, **kwargs)
 
 def _save_validation_report(*args, **kwargs):
+    """Write the detailed analysis-validation report."""
     from . import reporting as _reporting
     return _reporting._save_validation_report(*args, **kwargs)
 
 def save_consolidated_summary_with_formatting(*args, **kwargs):
+    """Write one formatted consolidated SHAP workbook."""
     from . import reporting as _reporting
     return _reporting.save_consolidated_summary_with_formatting(*args, **kwargs)
 
 
 def save_consolidated_summary_sheets_with_formatting(*args, **kwargs):
+    """Write formatted consolidated SHAP views in one workbook."""
     from . import reporting as _reporting
     return _reporting.save_consolidated_summary_sheets_with_formatting(*args, **kwargs)
 
 def save_predictions_with_formatting(*args, **kwargs):
+    """Write formatted weighted and optional unweighted prediction sheets."""
     from . import reporting as _reporting
     return _reporting.save_predictions_with_formatting(*args, **kwargs)
 
 def create_formatted_predictions_for_graphpad(*args, **kwargs):
+    """Write group-wise probability columns for GraphPad Prism."""
     from . import reporting as _reporting
     return _reporting.create_formatted_predictions_for_graphpad(*args, **kwargs)
 
 def calculate_ensemble_metrics(*args, **kwargs):
+    """Calculate in-sample and out-of-fold binary ensemble metrics."""
     from . import reporting as _reporting
     return _reporting.calculate_ensemble_metrics(*args, **kwargs)
 
 def _generate_kfold_shap_summaries(*args, **kwargs):
-    """Delegation wrapper (implementation in autobehaver.postinf.featureimp.summaries)."""
+    """Summarize one in-sample or out-of-fold SHAP view."""
     from . import summaries as _summaries
     return _summaries._generate_kfold_shap_summaries(*args, **kwargs)
 
 def _combine_insample_outofsample_summaries(*args, **kwargs):
-    """Delegation wrapper (implementation in autobehaver.postinf.featureimp.summaries)."""
+    """Combine matched in-sample and out-of-fold SHAP summaries."""
     from . import summaries as _summaries
     return _summaries._combine_insample_outofsample_summaries(*args, **kwargs)
 
 def _aggregate_shap_from_files(*args, **kwargs):
-    """Delegation wrapper (implementation in autobehaver.postinf.featureimp.summaries)."""
+    """Aggregate compatible legacy SHAP files using per-feature contribution counts."""
     from . import summaries as _summaries
     return _summaries._aggregate_shap_from_files(*args, **kwargs)
 
 def _generate_male_female_comparison(*args, **kwargs):
-    """Delegation wrapper (implementation in autobehaver.postinf.featureimp.summaries)."""
+    """Compare male and female SHAP summaries within groups."""
     from . import summaries as _summaries
     return _summaries._generate_male_female_comparison(*args, **kwargs)
 

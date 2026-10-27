@@ -1,4 +1,4 @@
-"""Core pose + coordinate features for keypre."""
+"""Derive centroid position, body bearing, and frame-centered polar features."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ include_position = settings.include_position
 
 
 def calculate_centroid(dataframe):
+    """Calculate the centroid from the derived Front and Back points."""
     front_x = dataframe["Front_x"]
     front_y = dataframe["Front_y"]
     back_x = dataframe["Back_x"]
@@ -30,6 +31,10 @@ def calculate_centroid(dataframe):
 
 def calculate_angle(dataframe):
     # Back -> Front vector in image coordinates (+y is down)
+    """Calculate the Back-to-Front bearing: 0 north, 90 east, 180 south, 270 west.
+
+    Use image coordinates with +x right and +y down.
+    """
     dx = dataframe["Front_x"] - dataframe["Back_x"]
     dy = dataframe["Front_y"] - dataframe["Back_y"]
 
@@ -42,22 +47,11 @@ def calculate_angle(dataframe):
 
 
 def calculate_polar_coordinates(dataframe, movie_dim):
-    """Calculates polar coordinate features relative to the arena center.
+    """Normalize centroid radius by the square frame half-width (movie_dim - 1)/2.
 
-    Assumptions:
-      - The arena is centered in a square frame of width/height = movie_dim pixels.
-      - DLC pixel coordinates behave like indices ~[0 .. movie_dim-1], so the center is
-        at (movie_dim - 1) / 2 in both x and y.
-
-    Coordinate conventions used here:
-      - Image coordinates: +x right, +y down.
-      - Navigational/bearing angles: 0 = North (up), 90 = East (right),
-        180 = South (down), 270 = West (left).
-
-    Returns:
-      - radial_position: normalized distance from arena center (0 at center, ~1 at arena edge)
-      - radial_angle_*: bearing from arena center -> fly centroid (sin/cos)
-      - relative_angle_*: (fly_angle_nav - radial_bearing_nav) (sin/cos)
+    Place the frame center at that coordinate in both axes; +x is right and +y
+    is down. Use bearings 0 north, 90 east, 180 south, and 270 west. Return radius
+    and sine/cosine columns for radial bearing and body bearing minus radial bearing.
     """
 
     # DLC coordinates are in pixel units with indices ~[0 .. movie_dim-1],
@@ -74,7 +68,6 @@ def calculate_polar_coordinates(dataframe, movie_dim):
     dx = fly_x - arena_center_x
     dy = fly_y - arena_center_y
 
-    # Normalized radial distance
     dist = np.sqrt(dx**2 + dy**2)
     radial_position = dist / arena_radius
 
@@ -83,7 +76,7 @@ def calculate_polar_coordinates(dataframe, movie_dim):
     theta_img_deg = np.degrees(np.arctan2(dy, dx))
     radial_bearing_nav = (theta_img_deg + 90) % 360
 
-    # Relative angle (signed, [-180, 180])
+    # Wrap body bearing relative to radial bearing to [-180, 180).
     relative_angle = (fly_angle_nav - radial_bearing_nav + 180) % 360 - 180
 
     radial_angle_rad = np.radians(radial_bearing_nav)
@@ -99,10 +92,7 @@ def calculate_polar_coordinates(dataframe, movie_dim):
 
 
 def add_pose_features(input_df, poscorr_dict):
-    """Compute centroid + angle (always, because downstream depends on them).
-
-    Store position/polar features to poscorr_dict.
-    """
+    """Calculate centroid and body bearing, then add position and polar features to the mapping."""
 
     input_df["centroid_x"], input_df["centroid_y"] = calculate_centroid(input_df)
     input_df["angle"] = calculate_angle(input_df)

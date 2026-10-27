@@ -1,4 +1,4 @@
-"""Filesystem + logging helpers for autocropper."""
+"""Provide filesystem, validation, and logging helpers for Autocropper."""
 
 from __future__ import annotations
 
@@ -6,11 +6,14 @@ import json
 import logging
 import os
 import time
+import hashlib
 from pathlib import Path
 from typing import Any, Iterable
 
 import cv2
 import numpy as np
+
+from .thread_limits import open_video_capture
 
 
 def setup_logging(log_directory: Path, log_level: str = "INFO") -> None:
@@ -46,7 +49,7 @@ def find_processing_log(search_dir: Path) -> Path | None:
 
 
 def ensure_user_permissions(path: Path) -> None:
-    """Ensure standard user rwx permissions on Windows."""
+    """Set user permission bits when running on Windows."""
     if os.name == "nt":
         import stat
 
@@ -59,9 +62,9 @@ def get_movie_files(search_dir: Path) -> list[Path]:
 
 
 def is_video_file_valid(video_path: Path) -> bool:
-    """Quick check to see if a video file is valid and readable by OpenCV."""
+    """Check that OpenCV can open the movie and decode its first frame."""
     try:
-        cap = cv2.VideoCapture(str(video_path))
+        cap = open_video_capture(video_path)
         if not cap.isOpened():
             logging.warning(f"Validation failed: Could not open video file {video_path}.")
             cap.release()
@@ -83,6 +86,7 @@ def is_video_file_valid(video_path: Path) -> bool:
 
 
 def save_chamber_coordinates_image(run_dir: Path, movie: Path, image: np.ndarray) -> None:
+    """Write the annotated chamber-detection image for one movie."""
     chamber_images_dir = Path(run_dir) / "chamber_images"
     chamber_images_dir.mkdir(parents=True, exist_ok=True)
     ensure_user_permissions(chamber_images_dir)
@@ -92,6 +96,7 @@ def save_chamber_coordinates_image(run_dir: Path, movie: Path, image: np.ndarray
 
 
 def log_movie_results(movie_path: Path, run_dir: Path, movie_data: dict[str, Any]) -> None:
+    """Write a per-movie JSON log with NumPy scalar values converted to native types."""
     movie_name = Path(movie_path).stem
     json_path = Path(run_dir) / "movie_logs" / f"{movie_name}_log.json"
 
@@ -115,7 +120,15 @@ def _file_matches_any_movie_stem(file_path: Path, movie_stems: set[str] | None) 
     if not movie_stems:
         return True
     name = file_path.name
-    return any(stem and stem in name for stem in movie_stems)
+    from autobehaver.portable_paths import original_name
+    logical_name = original_name(file_path)
+    return any(stem and (stem in logical_name or name.startswith(f'.crop-{crop_partial_token(stem)}-'))
+               for stem in movie_stems)
+
+
+def crop_partial_token(movie_stem: str) -> str:
+    """Keep crop temporary names short while retaining their recording scope."""
+    return hashlib.sha256(str(movie_stem).encode('utf-8')).hexdigest()[:16]
 
 
 def delete_incomplete_files(
@@ -124,24 +137,17 @@ def delete_incomplete_files(
     movie_stems: Iterable[str] | None = None,
     min_partial_age_seconds: int = 0,
 ) -> None:
-    """Delete stale/broken cropped-video outputs.
+    """Remove aged partial files and cropped MP4s smaller than 1 KiB.
 
-    Parameters
-    ----------
-    movie_stems:
-        Optional scope. When several swarm subjobs share an output directory,
-        cleanup must not delete another subjob's active temp files. Passing the
-        current run's movie stems keeps cleanup local to the selected movies.
-    min_partial_age_seconds:
-        Only delete ``*.partial`` files older than this age. This protects active
-        ffmpeg subprocesses from another concurrently running Python process.
+    When supplied, movie_stems limits cleanup to names containing a selected
+    movie stem. The age threshold protects recently written partial files.
     """
 
     scoped_stems = {str(s) for s in movie_stems or [] if str(s)} or None
     min_partial_age_seconds = max(0, int(min_partial_age_seconds))
     now = time.time()
 
-    for file_path in Path(output_dir).rglob("*"):
+    for file_path in Path(output_dir).iterdir():
         if not file_path.is_file():
             continue
         if not _file_matches_any_movie_stem(file_path, scoped_stems):
@@ -159,10 +165,12 @@ def delete_incomplete_files(
                 )
                 continue
             logging.info(f"Deleting stale temp video file: {file_path}")
+            from autobehaver.file_locks import FileLock
             try:
-                file_path.unlink()
-            except Exception:
-                pass
+                with FileLock(file_path.with_suffix('.lock'), timeout_sec=0):
+                    file_path.unlink(missing_ok=True)
+            except (OSError, RuntimeError):
+                logging.debug('Leaving owned or inaccessible partial crop: %s', file_path)
             continue
 
         if file_path.suffix.lower() != ".mp4":
@@ -204,7 +212,7 @@ def _load_movie_logs(
 
 
 def summarize_results(run_dir: Path, *, movie_names: Iterable[str] | None = None) -> None:
-    """Append a robust per-movie summary to the pipeline processing log."""
+    """Append per-movie outcomes to an existing pipeline processing log."""
     log_file = find_processing_log(run_dir)
     movie_logs_dir = Path(run_dir) / "movie_logs"
 
@@ -251,23 +259,6 @@ def summarize_results(run_dir: Path, *, movie_names: Iterable[str] | None = None
             else:
                 f.write("Chamber Coordinates: not available\n")
             f.write("\n")
-
-            validation_results = movie_data.get("validation_results") or {}
-            if isinstance(validation_results, dict) and validation_results:
-                f.write("Chamber Validation Results:\n")
-                for chamber_id, result in sorted(validation_results.items()):
-                    if not isinstance(result, dict):
-                        continue
-                    is_occupied = bool(result.get("is_occupied", False))
-                    status_text = "OCCUPIED" if is_occupied else "EMPTY"
-                    confidence = result.get("confidence")
-                    if isinstance(confidence, (int, float)):
-                        f.write(
-                            f"  {chamber_id}: {status_text} (confidence: {float(confidence):.3f})\n"
-                        )
-                    else:
-                        f.write(f"  {chamber_id}: {status_text}\n")
-                f.write("\n")
 
             cropped_files = movie_data.get("cropped_files") or {}
             f.write("Cropped Chamber Files:\n")

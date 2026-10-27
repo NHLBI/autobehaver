@@ -10,21 +10,6 @@ from autobehaver.postinf.mmgen.pipeline import run_post_inference_analysis
 from autobehaver.postinf.mmgen.shard_merge import merge_shard_temp_stores
 
 
-class _SerialPool:
-    def __init__(self, processes=None):
-        self.processes = processes
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def imap(self, func, iterable):
-        for item in iterable:
-            yield func(item)
-
-
 class TestMMGenShardedGuards(unittest.TestCase):
     def test_empty_shard_writes_done_marker_and_empty_store(self):
         with tempfile.TemporaryDirectory() as td:
@@ -37,7 +22,7 @@ class TestMMGenShardedGuards(unittest.TestCase):
             out.mkdir()
 
             # trial1 -> shard 1 when num_shards=3 and shard_by='trial', so shard 0 is empty.
-            name = "CONTROL-PLPdeltaR-plus_FEMALE_plp_deltaR_experiment_trial1_rpi-1_movie0_20250501124915PM_chamber5_positional_calcs_normalized_inference.csv"
+            name = "CONTROL-Example-reference_FEMALE_example_experiment_trial1_rpi-1_movie0_20250501124915PM_chamber5_positional_calcs_normalized_inference.csv"
             (inf / name).write_text("Smoothed Pose Label,Smoothed Orient Label\nWalking,Floor\n")
 
             run_post_inference_analysis(
@@ -69,17 +54,19 @@ class TestMMGenShardedGuards(unittest.TestCase):
             pos.mkdir()
             out.mkdir()
 
-            name = "CONTROL-PLPdeltaR-plus_FEMALE_plp_deltaR_experiment_trial1_rpi-1_movie0_20250501124915PM_chamber5_positional_calcs_normalized_inference.csv"
+            name = "CONTROL-Example-reference_FEMALE_example_experiment_trial1_rpi-1_movie0_20250501124915PM_chamber5_positional_calcs_normalized_inference.csv"
             (inf / name).write_text("Smoothed Pose Label,Smoothed Orient Label\nWalking,Floor\n")
+            from autobehaver.postinf.mmgen.input_contract import required_keypre_columns
+            pd.DataFrame({column: [1.] for column in required_keypre_columns()}).to_csv(
+                pos / name.replace("_normalized_inference", ""), index=False)
 
-            with patch("autobehaver.postinf.mmgen.pipeline.Pool", _SerialPool), \
+            with patch("autobehaver.postinf.mmgen.pipeline.initialize_mmgen_worker"), \
                  patch(
                      "autobehaver.postinf.mmgen.pipeline.process_video_data",
                      return_value=(
                          None,
                          None,
                          0,
-                         None,
                          None,
                          None,
                          None,
@@ -113,7 +100,7 @@ class TestMMGenShardedGuards(unittest.TestCase):
             self.assertEqual(failed_df["error_type"].astype(str).tolist(), ["NameError"])
             self.assertIn("mm_per_px", failed_df["error_message"].astype(str).iloc[0])
 
-    def test_merge_requires_clean_done_markers(self):
+    def test_merge_rejects_unverified_legacy_done_markers(self):
         with tempfile.TemporaryDirectory() as td:
             out = Path(td)
             shards_root = out / "_mmgen_shards"
@@ -134,7 +121,9 @@ class TestMMGenShardedGuards(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 merge_shard_temp_stores(output_folder=str(out), num_shards=2, strict_missing=True)
 
-            self.assertIn("n_committed_files=0", str(ctx.exception))
+            # These hand-written stores lack the shared complete-cohort proof.
+            # Native merge rejects that legacy state before reading science tables.
+            self.assertIn("complete frozen cohort inventory", str(ctx.exception))
 
 
 if __name__ == "__main__":

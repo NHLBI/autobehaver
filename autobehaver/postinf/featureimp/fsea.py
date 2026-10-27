@@ -1,11 +1,5 @@
-"""
-Feature-set enrichment analysis helpers.
-
-This module contains the feature grouping logic and small utilities used by
-the Feature Importance (featureimp) post-inference pipeline, primarily to
-support the FSEA (feature set enrichment analysis) stage.
-
-The code here is kept focused on FSEA grouping, result cleaning, and documentation.
+"""Construct FeatureImp enrichment groups and document their membership, exclusions, and
+validation results.
 """
 
 from __future__ import annotations
@@ -31,14 +25,10 @@ HYBRID_POSE_KINEMATIC_POSES = {'Jump', 'Scramble'}
 
 
 def _generate_bout_timebudget_groups(all_feature_names, skip_existence_check=False):
-    """Generate broad BoutSummary/TimeBudget groups.
+    """Generate broad pose-statistics and orientation enrichment groups.
 
-    The cleaned grouping surface keeps only the broad pose-statistics and
-    orientation-level groups used for enrichment. Tiny pose+orient-specific
-    groups are omitted because they are redundant and often fail minimum-size
-    criteria. Jump and Scramble suppress the tiny pure pose-statistics groups
-    because those behaviors are represented by dedicated PoseStatsKinematic
-    hybrid groups downstream.
+    Jump and Scramble use dedicated pose/kinematic hybrid groups; small combined-context
+    groups are omitted.
     """
     groups: Dict[str, List[str]] = {}
 
@@ -105,18 +95,10 @@ def _generate_bout_timebudget_groups(all_feature_names, skip_existence_check=Fal
 
 
 def _generate_kinematic_groups(all_feature_names, skip_existence_check=False):
-    """Generate cleaned kinematic FSEA groups.
+    """Group bout-based kinematics by behavior and active body parts.
 
-    This cleaned grouping surface:
-      - treats KinematicBB and KinematicTW features together,
-      - keeps broad body-movement groups for locomotion / all-grooming,
-      - prunes biologically implausible grooming pose × body-part pairings,
-      - keeps Standing as Head + LegMove + body movement,
-      - keeps Scramble as Head + LegMove while routing its body-movement
-        features into the hybrid group,
-      - removes redundant Jump/Scramble body-movement-only subgroups because
-        those behaviors are represented by dedicated pose/kinematic hybrids,
-      - folds Jump/Scramble pose-timebudget signal into dedicated hybrid groups.
+    Use dedicated Jump/Scramble pose/kinematic hybrids and omit unsupported grooming
+    body-part pairings.
     """
     groups: Dict[str, List[str]] = {}
 
@@ -126,8 +108,6 @@ def _generate_kinematic_groups(all_feature_names, skip_existence_check=False):
         feat_str = str(feat)
         if feat_str.startswith('KinematicBB_'):
             normalized = 'Kinematic_' + feat_str[len('KinematicBB_'):]
-        elif feat_str.startswith('KinematicTW_'):
-            normalized = 'Kinematic_' + feat_str[len('KinematicTW_'):]
         else:
             normalized = feat_str
         normalized_features.append(normalized)
@@ -238,10 +218,8 @@ def _generate_kinematic_groups(all_feature_names, skip_existence_check=False):
 
 
 def _generate_transition_groups(all_feature_names, skip_existence_check=False):
-    """Generate cleaned transition groups.
-
-    Walking and Standing keep separate From/To groups. Rarer behaviors use a
-    single combined transition group to avoid many tiny, direction-specific sets.
+    """Group Walking and Standing transitions by direction and combine directions for
+    rarer behaviors.
     """
     groups: Dict[str, List[str]] = {}
     by_from: Dict[str, List[str]] = {}
@@ -358,16 +336,10 @@ def _generate_spatial_groups(all_feature_names, skip_existence_check=False):
 
 
 def _generate_sleep_groups(all_feature_names, skip_existence_check=False):
-    """
-    Programmatically generates FSEA feature groups for Sleep features.
+    """Collect present SleepFeat columns in the Sleep_All enrichment group.
 
-    Creates a single group 'Sleep_All' containing all SleepFeat_* columns
-    present in the feature matrix.
-    
-    Args:
-        all_feature_names: List of all feature names in the feature matrix
-        skip_existence_check: If True, includes all theoretically possible features without checking existence
-        (Note: This function already works with all_feature_names, so skip_existence_check has no effect)
+    The compatibility argument skip_existence_check does not change this name-driven
+    grouping.
     """
     groups = {}
 
@@ -380,11 +352,10 @@ def _generate_sleep_groups(all_feature_names, skip_existence_check=False):
 
 def _write_fsea_group_documentation(validated_groups, all_feature_names, fsea_base_folder,
                                      missing_features_by_group=None, skipped_groups=None, fsea_min_size=1):
-    """
-    Creates two output files documenting the FSEA feature groups:
+    """Create two output files documenting the FSEA feature groups:
     1. CSV membership matrix: feature_name, group_count, then one column per group (0/1)
     2. Text log: detailed group definitions organized by source function
-    
+
     Args:
         validated_groups: dict mapping group names to lists of feature names (actual groups used)
         all_feature_names: list of all feature names in the dataset
@@ -517,10 +488,10 @@ def _write_fsea_group_documentation(validated_groups, all_feature_names, fsea_ba
 
 
 def _identify_ungrouped_features(theoretical_groups, all_feature_names, fsea_base_folder):
-    """
-    Identifies features in the master feature matrix that are not part of any theoretical group.
+    """Identify features in the master feature matrix that are not part of any
+    theoretical group.
     This helps identify features that might need additional groups.
-    
+
     Args:
         theoretical_groups: dict of all theoretical groups
         all_feature_names: list of all features in the dataset
@@ -616,10 +587,10 @@ def _identify_ungrouped_features(theoretical_groups, all_feature_names, fsea_bas
 
 def _compare_theoretical_vs_actual_groups(theoretical_groups, validated_groups, skipped_groups,
                                           all_feature_names, fsea_base_folder):
-    """
-    Compares theoretical groups (what rules would create) vs actual groups (what passed validation).
+    """Compare theoretical groups (what rules would create) vs actual groups (what
+    passed validation).
     Identifies features that should be in groups but aren't.
-    
+
     Args:
         theoretical_groups: dict of groups created by applying rules without filtering
         validated_groups: dict of groups that passed validation

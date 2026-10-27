@@ -75,13 +75,15 @@ def test_iter_parallel_results_serial_path_runs_initializer():
 
 
 def test_iter_parallel_results_raises_clear_error_on_broken_pool(monkeypatch):
-    monkeypatch.setattr(mp_utils, "ProcessPoolExecutor", _DummyExecutor)
-    monkeypatch.setattr(mp_utils, "as_completed", lambda futures: list(futures))
+    from autobehaver.postinf.featureimp import bounded_pool
+    monkeypatch.setattr(bounded_pool, "ProcessPoolExecutor", _DummyExecutor)
+    monkeypatch.setattr(bounded_pool, "wait", lambda futures, **kwargs: (set(futures), set()))
+    monkeypatch.setattr(mp_utils, "_main_module_is_importable", lambda: True)
     monkeypatch.setattr(mp_utils.mp, "get_context", lambda method: object())
     monkeypatch.setattr(mp_utils.mp, "get_all_start_methods", lambda: ["spawn"])
     monkeypatch.setattr(mp_utils.mp, "get_start_method", lambda allow_none=True: None)
 
-    with pytest.raises(RuntimeError, match="worker process crashed or terminated unexpectedly"):
+    with pytest.raises(RuntimeError, match="worker process crashed"):
         list(
             mp_utils.iter_parallel_results(
                 str,

@@ -1,12 +1,5 @@
-"""Identity resolution helpers for the mmgen worker.
-
-The per-recording worker attaches metadata (group/sex/individual) to per-file
-outputs.
-
-If an animal mapping config is provided (from `create_animal_mapping`), we use it
-as the source of truth. Otherwise we fall back to filename parsing.
-
-The helper centralizes filename-derived identity parsing for worker jobs.
+"""Resolve MMGen recording metadata from the supplied animal mapping or filename
+parsing.
 """
 
 from __future__ import annotations
@@ -39,9 +32,9 @@ def resolve_group_individual_sex(inf_csv_path: str, config: Optional[dict]) -> T
             if animal_info.get("individual_ids"):
                 individual_id = animal_info["individual_ids"][0]
             else:
-                _, individual_id, _ = parse_group_and_individual(filename)
+                _, individual_id, _ = parse_group_and_individual(inf_csv_path)
 
         return group, individual_id, sex
 
-    group, individual_id, sex = parse_group_and_individual(filename)
+    group, individual_id, sex = parse_group_and_individual(inf_csv_path)
     return group, individual_id, sex

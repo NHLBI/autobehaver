@@ -1,14 +1,4 @@
-"""Synthetic tests for keyprenorm.
-
-These tests are intentionally small and run without multiprocessing.
-They validate that:
-  - schema filtering skips files with missing/extra columns
-  - normalization params are computed correctly
-  - normalization output HDF5 has expected shape/attrs
-  - zero-stddev columns normalize to 0.0 (by design)
-
-The goal is to catch accidental interface / format changes.
-"""
+"""Check schema selection, normalization values and HDF5 metadata on small arrays."""
 
 import os
 import tempfile
@@ -68,7 +58,7 @@ class TestKeypreNormSynthetic(unittest.TestCase):
             self.assertEqual(len(bad), 1)
             self.assertTrue(bad[0]["file"].endswith("bad_positional_calcs.csv"))
 
-            # Compute norm params using BOTH good files.
+            # Both schema-compatible files contribute to the normalization scale.
             # Combine df1 + df1 (same values) so mean/std are easy.
             expected_mean = {"f1": 1.5, "f2": 11.5, "const": 5.0}
             expected_std = {
@@ -82,20 +72,17 @@ class TestKeypreNormSynthetic(unittest.TestCase):
             import multiprocessing as mp
 
             q = mp.Queue(-1)
-            norm_df, skipped_short = calculate_normalization_params(
+            norm_df = calculate_normalization_params(
                 csv_files=good,
                 canonical_columns=canonical_cols,
                 norm_params_path=norm_path,
                 norm_params_dir=norm_dir,
                 num_workers=1,
                 edge_skip=0,
-                max_rows=0,
-                require_full_length=False,
                 batch_size=10,
                 log_queue=q,
                 log_level="ERROR",
             )
-            self.assertEqual(skipped_short, [])
             self.assertTrue(os.path.exists(norm_path))
 
             # Validate means/stds
@@ -112,8 +99,6 @@ class TestKeypreNormSynthetic(unittest.TestCase):
                 means=means,
                 stds=stds,
                 edge_skip=0,
-                max_rows=0,
-                require_full_length=False,
                 output_dir=out_dir,
                 labels_input_dir=None,
                 labels_output_dir=None,

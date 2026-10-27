@@ -1,7 +1,7 @@
-"""Keypre feature-generation settings.
+"""Define KeyPre feature-generation settings.
 
-If you change these values, treat the outputs as a new feature set and retrain
-downstream models.
+Changing these values changes the model input schema; downstream models must
+be compatible with that feature set or retrained.
 """
 
 from __future__ import annotations

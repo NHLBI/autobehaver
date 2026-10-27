@@ -1,129 +1,34 @@
-"""CLI for autocropper.
-
-This stage is currently tailored to the lab's acquisition geometry.
-
-"""
+"""Command-line options for cropping chamber videos."""
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
 
-import yaml
 
-from autobehaver.argparse_utils import add_bool_pair
-from autobehaver.pipeline_layout import apply_main_dir_overrides, config_main_dir_default
+from autobehaver.argparse_utils import add_bool_pair, parse_cli_args
+from autobehaver.resource_monitor import add_monitor_arguments, monitored_cli, record_settings
+from autobehaver.pipeline_layout import apply_main_dir_overrides
 
 from .config import AutocropperConfig
 from .core import run_autocropper
 
 
-def _load_config_defaults(config_path: str) -> Dict[str, Any]:
-    """Load defaults from a global YAML config file.
-
-    Autocropper reads:
-      - the ``autocropper:`` section (stage-specific)
-      - the top-level ``registry:`` section (project-wide registry settings)
-
-    Stage keys override registry defaults when they overlap.
-    """
-    cfg_path = Path(config_path).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
-    with cfg_path.open("r") as f:
-        data = yaml.safe_load(f) or {}
-
-    # Resolve relative paths relative to config file directory
-    base_dir = cfg_path.parent
-
-    resolved: Dict[str, Any] = {}
-
-    global_main_dir = config_main_dir_default(data, base_dir)
-    if global_main_dir:
-        resolved["main_dir"] = global_main_dir
-
-    # --- Project registry (global) ---
-    reg = data.get("registry", {})
-    if reg is None:
-        reg = {}
-    if isinstance(reg, dict):
-        if "enabled" in reg:
-            resolved["registry_enabled"] = bool(reg.get("enabled"))
-        if "csv" in reg and isinstance(reg.get("csv"), str) and str(reg.get("csv")).strip() != "":
-            p = Path(str(reg.get("csv")).strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved["registry_csv"] = str(p)
-        if "lock_timeout_sec" in reg and reg.get("lock_timeout_sec") is not None:
-            try:
-                resolved["registry_lock_timeout_sec"] = int(reg.get("lock_timeout_sec"))
-            except Exception:
-                pass
-        if "lock_stale_sec" in reg and reg.get("lock_stale_sec") is not None:
-            try:
-                resolved["registry_lock_stale_sec"] = int(reg.get("lock_stale_sec"))
-            except Exception:
-                pass
-
-    section = data.get("autocropper", {})
-    if section is None:
-        section = {}
-
-    if not isinstance(section, dict):
-        raise ValueError("Expected 'autocropper' section in config to be a mapping (dict)")
-
-    path_keys = {
-        "main_dir",
-        "input_dir",
-        "output_dir",
-        "exclusions_csv",
-        "recording_database_dir",
-        "recording_database_csv",
-        "model_path",
-        "norm_params_path",
-        "movie_list",
-        "registry_csv",
-    }
-
-    # Stage section overrides registry defaults when present.
-    for k, v in section.items():
-        if k in path_keys and isinstance(v, str) and v.strip() != "":
-            p = Path(v.strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved[k] = str(p)
-        else:
-            resolved[k] = v
-
-    return resolved
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Auto-crop fly chamber videos")
+    """Build the Autocropper command-line parser with runtime defaults."""
+    defaults = AutocropperConfig(input_dir="")
+    p = argparse.ArgumentParser(description='Crop standard six-chamber recordings with Autocropper')
 
-    # Global config
-    p.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help=(
-            "Path to global pipeline YAML config (autocropper reads the 'autocropper:' section). "
-            "CLI args override config defaults."
-        ),
-    )
 
     # Project registry (single CSV at project root)
     add_bool_pair(
         p,
         "registry_enabled",
-        default=False,
+        default=defaults.registry_enabled,
         help=(
             "If enabled, update the project-wide registry CSV after autocropper finishes. "
-            "Default: disabled (commonly enabled via config template)."
+            "Default: disabled."
         ),
         dest="registry_enabled",
     )
@@ -131,7 +36,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--registry_csv",
         type=str,
-        default=None,
+        default=defaults.registry_csv,
         help=(
             "Path to the project registry CSV. If omitted and registry_enabled is True, "
             "defaults to <project_root>/registry.csv (project_root inferred from input/output dirs)."
@@ -141,15 +46,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--registry_lock_timeout_sec",
         type=int,
-        default=120,
+        default=defaults.registry_lock_timeout_sec,
         help="Seconds to wait for registry lock before failing (default 120).",
     )
 
     p.add_argument(
         "--registry_lock_stale_sec",
         type=int,
-        default=60 * 60,
-        help="Consider registry lock stale after this many seconds (default 3600).",
+        default=defaults.registry_lock_stale_sec,
+        help="Legacy option retained for compatibility; locks release when their process exits.",
     )
 
 
@@ -171,14 +76,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Input directory containing full-frame MP4 files to process. "
-            "Required unless provided via --config."
+            "Required unless --main_dir supplies the standard project folder."
         ),
     )
 
     p.add_argument(
         "--output_dir",
         type=str,
-        default=None,
+        default=defaults.output_dir,
         help=(
             "Directory to write cropped chamber movies and stage artifacts. "
             "If omitted, cropped chamber movies go under <input_dir>/cropped_chambers and stage artifacts stay under <input_dir>."
@@ -189,16 +94,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--exclusions_csv",
         type=str,
-        default=None,
+        default=defaults.exclusions_csv,
         help=(
-            "Path to exclusions.csv produced by moviechecker. If omitted, defaults to <input_dir>/exclusions.csv."
+            'Path to exclusions.csv produced by MovieChecker. Defaults to <input_dir>/exclusions.csv.'
         ),
     )
 
     add_bool_pair(
         p,
         "require_exclusions",
-        default=True,
+        default=defaults.require_exclusions,
         help=(
             "Require exclusions.csv to exist before cropping. "
             "Disable to allow cropping when exclusions.csv is missing."
@@ -210,9 +115,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--recording_database_dir",
         type=str,
-        default=None,
+        default=defaults.recording_database_dir,
         help=(
-            "Directory containing recording_database_*.csv backups created by the recording script. "
+            "Directory containing recording_database*.csv or crop_occupancy_*.csv metadata. "
             "If omitted, defaults to <input_dir>."
         ),
     )
@@ -220,9 +125,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--recording_database_csv",
         type=str,
-        default=None,
+        default=defaults.recording_database_csv,
         help=(
-            "Optional explicit path to a recording database CSV to use instead of auto-selecting the latest one "
+            "Optional explicit path to a recording database or crop occupancy CSV instead of autodiscovery "
             "from --recording_database_dir."
         ),
     )
@@ -230,7 +135,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_bool_pair(
         p,
         "skip_labeling",
-        default=False,
+        default=defaults.skip_labeling,
         help=(
             "Skip recording-database labeling (do not prefix cropped outputs). "
             "Default: labeling enabled."
@@ -242,17 +147,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--file_filter",
         type=str,
-        default=None,
+        default=defaults.file_filter,
         help="Only process movies whose filename contains this substring (case-insensitive).",
     )
 
     p.add_argument(
         "--movie_list",
         type=str,
-        default=None,
+        default=defaults.movie_list,
         help=(
-            "Optional text file listing which movies to process (one filename or path per line). "
-            "If provided, takes precedence over --file_filter."
+            'Optional selection file with one movie filename or path per line; relative movie paths resolve under --input_dir. Without it, process the folder or use --trial_number/--file_filter. Takes precedence over both selectors.'
         ),
     )
 
@@ -260,10 +164,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--trial_number",
         "--trial",
         type=int,
-        default=None,
+        default=defaults.trial_number,
         help=(
-            "Only process movies whose filename has an exact _trialN_ token. "
-            "This is safer than --file_filter trial1 because trial1 also matches trial10/trial11/etc."
+            'Select the exact _trialN_ filename token; trial1 does not select trial10 or trial11. An explicit --movie_list takes precedence.'
         ),
     )
 
@@ -272,7 +175,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--approx_radius",
         "-a",
         type=int,
-        default=265,
+        default=defaults.approx_radius,
         help="Approximate radius of chambers in pixels",
     )
 
@@ -280,7 +183,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--chamber_columns",
         "-c",
         type=int,
-        default=3,
+        default=defaults.chamber_columns,
         help="Number of chamber columns",
     )
 
@@ -288,7 +191,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--chamber_rows",
         "-r",
         type=int,
-        default=2,
+        default=defaults.chamber_rows,
         help="Number of chamber rows",
     )
 
@@ -296,62 +199,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--crop_dim_2k",
         "-d",
         type=int,
-        default=600,
-        help=(
-            "Crop dimension for 2K resolution videos in pixels - if using 4k, "
-            "please enter half the resolution"
-        ),
+        default=defaults.crop_dim_2k,
+        help="Crop dimension in pixels for the supported standard recordings",
     )
 
-    # Validation flags
-    add_bool_pair(
-        p,
-        "validate_chambers",
-        default=True,
-        help="Enable chamber validation using CNN to detect empty chambers.",
-        dest="validate_chambers",
-    )
-
-    add_bool_pair(
-        p,
-        "skip_validation",
-        default=False,
-        help="Skip chamber validation and crop all detected chambers (except excluded ones).",
-        dest="skip_validation",
-    )
-
-    p.add_argument(
-        "--model_path",
-        "-m",
-        default=None,
-        help=(
-            "Path to the trained CNN model for chamber validation. "
-            "If omitted, uses the packaged default model."
-        ),
-    )
-
-    p.add_argument(
-        "--norm_params_path",
-        "-n",
-        default=None,
-        help=(
-            "Path to the normalization parameters JSON file. "
-            "If omitted, uses the packaged default JSON."
-        ),
-    )
-
+    p.add_argument('--chamber_calibration_json', type=str, default=defaults.chamber_calibration_json,
+                   help='Optional measured chamber-center calibration for the supported standard recording sizes. The built-in six-chamber geometry is used otherwise.')
     # Detection settings
     p.add_argument(
         "--frame_avg",
         type=int,
-        default=10,
+        default=defaults.frame_avg,
         help="Number of frames to average for circle detection",
     )
 
     p.add_argument(
         "--down_factor",
         type=int,
-        default=2,
+        default=defaults.down_factor,
         help="Factor to downsample frames for circle detection",
     )
 
@@ -359,53 +224,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--num_workers",
         type=int,
-        default=2,
+        default=defaults.num_workers,
         help="Number of parallel processes for movie processing",
     )
 
     p.add_argument(
         "--max_workers",
         type=int,
-        default=6,
-        help="Max number of chamber-crop threads per movie worker",
+        default=defaults.max_workers,
+        help='Maximum simultaneous chamber encoders per shared-source FFmpeg graph.',
     )
 
     p.add_argument(
         "--native_threads",
         type=int,
-        default=1,
+        default=defaults.native_threads,
         help=(
-            "Native-library threads per Python process for OpenCV/OpenMP/BLAS. "
-            "Default: 1, which is safest for swarm/Slurm runs."
+            'Native-library threads per Python process for OpenCV/OpenMP/BLAS (default: 1).'
         ),
     )
 
     p.add_argument(
         "--ffmpeg_threads",
         type=int,
-        default=1,
-        help="ffmpeg/libx264 threads per chamber crop subprocess (default: 1).",
+        default=defaults.ffmpeg_threads,
+        help="Threads per FFmpeg decoder/filter/encoder pool, not a subprocess-wide CPU cap (default: 1).",
     )
 
     # Monitoring / robustness
     p.add_argument(
         "--heartbeat_interval",
         type=int,
-        default=10,
+        default=defaults.heartbeat_interval,
         help="Heartbeat interval for monitoring processes in seconds",
     )
 
     p.add_argument(
         "--timeout",
         type=int,
-        default=600,
+        default=defaults.timeout,
         help="Timeout for cropping a single chamber in seconds",
     )
 
     p.add_argument(
         "--partial_cleanup_min_age_sec",
         type=int,
-        default=60 * 60,
+        default=defaults.partial_cleanup_min_age_sec,
         help=(
             "Only delete stale .partial crop files older than this many seconds. "
             "This prevents one swarm subjob from deleting another subjob's active ffmpeg temp file. "
@@ -417,7 +281,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--crop_crf",
         "--crf",
         type=int,
-        default=12,
+        default=defaults.crop_crf,
         help=(
             "CRF quality setting for cropped chamber MP4s (lower is higher quality, larger files). " 
             "Default: 12."
@@ -427,7 +291,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max_retries",
         type=int,
-        default=10,
+        default=defaults.max_retries,
         help="Max retry attempts for incomplete movies (default: 10).",
     )
 
@@ -435,97 +299,81 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--log_level",
         type=str,
-        default="INFO",
+        default=defaults.log_level,
         help="Logging level (DEBUG, INFO, WARNING, ERROR). Default: INFO.",
     )
 
-    return p
+    return add_monitor_arguments(p)
 
 
 def _config_from_args(args: argparse.Namespace) -> AutocropperConfig:
-    # `skip_validation` is an override: it forces validation off.
-    skip_validation = bool(getattr(args, "skip_validation", False)) or (not bool(args.validate_chambers))
-
+    """Build Autocropper runtime options from parsed arguments."""
     return AutocropperConfig(
         input_dir=str(args.input_dir),
         output_dir=str(args.output_dir) if args.output_dir else None,
         exclusions_csv=str(args.exclusions_csv) if args.exclusions_csv else None,
-        require_exclusions=bool(getattr(args, "require_exclusions", True)),
+        require_exclusions=bool(args.require_exclusions),
         recording_database_dir=str(args.recording_database_dir) if args.recording_database_dir else None,
         recording_database_csv=str(args.recording_database_csv) if args.recording_database_csv else None,
-        skip_labeling=bool(getattr(args, "skip_labeling", False)),
+        skip_labeling=bool(args.skip_labeling),
         file_filter=str(args.file_filter) if args.file_filter else None,
         movie_list=str(args.movie_list) if args.movie_list else None,
-        trial_number=int(args.trial_number) if getattr(args, "trial_number", None) is not None else None,
-        max_retries=int(getattr(args, "max_retries", 10)),
+        trial_number=int(args.trial_number) if args.trial_number is not None else None,
+        max_retries=int(args.max_retries),
         approx_radius=int(args.approx_radius),
         chamber_columns=int(args.chamber_columns),
         chamber_rows=int(args.chamber_rows),
         crop_dim_2k=int(args.crop_dim_2k),
+        chamber_calibration_json=args.chamber_calibration_json,
         frame_avg=int(args.frame_avg),
         down_factor=int(args.down_factor),
         num_workers=int(args.num_workers),
         max_workers=int(args.max_workers),
-        native_threads=max(1, int(getattr(args, "native_threads", 1))),
-        ffmpeg_threads=max(1, int(getattr(args, "ffmpeg_threads", 1))),
+        native_threads=max(1, int(args.native_threads)),
+        ffmpeg_threads=max(1, int(args.ffmpeg_threads)),
         heartbeat_interval=int(args.heartbeat_interval),
         timeout=int(args.timeout),
-        partial_cleanup_min_age_sec=max(0, int(getattr(args, "partial_cleanup_min_age_sec", 3600))),
-        crop_crf=int(getattr(args, "crop_crf", 12)),
-        skip_validation=skip_validation,
-        model_path=str(args.model_path) if args.model_path else None,
-        norm_params_path=str(args.norm_params_path) if args.norm_params_path else None,
+        partial_cleanup_min_age_sec=max(0, int(args.partial_cleanup_min_age_sec)),
+        crop_crf=int(args.crop_crf),
         log_level=str(args.log_level),
 
         # Registry
-        registry_enabled=bool(getattr(args, "registry_enabled", False)),
-        registry_csv=str(getattr(args, "registry_csv", "")) if getattr(args, "registry_csv", None) else None,
-        registry_lock_timeout_sec=int(getattr(args, "registry_lock_timeout_sec", 120)),
-        registry_lock_stale_sec=int(getattr(args, "registry_lock_stale_sec", 60 * 60)),
+        registry_enabled=bool(args.registry_enabled),
+        registry_csv=str(args.registry_csv) if args.registry_csv else None,
+        registry_lock_timeout_sec=int(args.registry_lock_timeout_sec),
+        registry_lock_stale_sec=int(args.registry_lock_stale_sec),
     )
 
 
+@monitored_cli("autocropper")
 def main(argv: list[str] | None = None) -> None:
+    """Parse runtime options and run Autocropper."""
+    parser = build_arg_parser()
     argv_list = list(argv) if argv is not None else sys.argv[1:]
 
-    # Pre-parse config path (so we can apply defaults before full parse).
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=str, default=None)
-    pre_args, _ = pre.parse_known_args(argv_list)
-
-    parser = build_arg_parser()
-
-    # Apply config defaults (if provided)
-    if pre_args.config:
-        defaults = _load_config_defaults(pre_args.config)
-        # Only apply defaults for keys that correspond to known argparse destinations
-        valid_dests = {a.dest for a in parser._actions}
-        filtered = {k: v for k, v in defaults.items() if k in valid_dests}
-        parser.set_defaults(**filtered)
-
-    args = parser.parse_args(argv_list)
+    args = parse_cli_args(parser, argv_list)
+    record_settings(args)
     apply_main_dir_overrides(args, stage="autocropper")
 
-    if not getattr(args, "input_dir", None):
+    if not args.input_dir:
         raise SystemExit(
-            "Missing --input_dir. Provide --input_dir explicitly, or use --config with an 'autocropper:' section that sets input_dir."
+            "Missing --input_dir. Provide --input_dir explicitly, or use --main_dir for the standard project folders."
         )
 
-    # If output_dir is provided and it's relative, resolve relative to CWD.
-    # (Config loader already resolves relative paths relative to config file.)
-    if getattr(args, "output_dir", None):
+    # Expand home-directory notation; relative paths retain current-directory semantics.
+    if args.output_dir:
         args.output_dir = str(Path(args.output_dir).expanduser())
-    if getattr(args, "input_dir", None):
+    if args.input_dir:
         args.input_dir = str(Path(args.input_dir).expanduser())
-    if getattr(args, "exclusions_csv", None):
+    if args.exclusions_csv:
         args.exclusions_csv = str(Path(args.exclusions_csv).expanduser())
-    if getattr(args, "movie_list", None):
+    if args.movie_list:
         args.movie_list = str(Path(args.movie_list).expanduser())
-    if getattr(args, "recording_database_dir", None):
+    if args.recording_database_dir:
         args.recording_database_dir = str(Path(args.recording_database_dir).expanduser())
-    if getattr(args, "recording_database_csv", None):
+    if args.recording_database_csv:
         args.recording_database_csv = str(Path(args.recording_database_csv).expanduser())
-    if getattr(args, "registry_csv", None):
+    if args.registry_csv:
         args.registry_csv = str(Path(args.registry_csv).expanduser())
 
     cfg = _config_from_args(args)

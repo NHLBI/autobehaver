@@ -1,4 +1,4 @@
-"""Run manifest helpers for keyprenorm."""
+"""Record KeyPreNorm runtime options, discovered inputs, paths, and outcomes."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ logger = logging.getLogger("keyprenorm")
 
 
 def sha256_file(path: str) -> Optional[str]:
+    """Return the file SHA256 digest, or None when unavailable."""
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -34,6 +35,7 @@ def sha256_file(path: str) -> Optional[str]:
 
 
 def atomic_write_json(path: str, payload: Dict[str, object]) -> None:
+    """Write JSON to a temporary file and atomically replace the destination."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -52,11 +54,7 @@ def build_run_manifest(
     stage_version: str,
     script_path: Optional[str] = None,
 ) -> Tuple[str, Dict[str, object]]:
-    """Build and write the run manifest JSON file.
-
-    Returns:
-        (manifest_path, manifest_dict)
-    """
+    """Write the initial run manifest and return its path and dictionary."""
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
     manifest_path = os.path.join(out_dir, f"keyprenorm_run_manifest_{run_id}.json")
@@ -100,6 +98,7 @@ def build_run_manifest(
             "csv_pattern": csv_glob,
             "csv_count": len(all_csv_files),
             "example_csv_files": [os.path.basename(p) for p in list(all_csv_files)[:10]],
+            "csv_files": [os.path.abspath(p) for p in all_csv_files],
         },
         "runtime": {
             "python_version": sys.version,

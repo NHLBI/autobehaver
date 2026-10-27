@@ -4,11 +4,8 @@ import argparse
 import subprocess
 from pathlib import Path
 
-import yaml
-
 from autobehaver.preinf.autocropper.cli import (
     _config_from_args,
-    _load_config_defaults,
     build_arg_parser,
 )
 from autobehaver.preinf.autocropper.core import _sync_runtime_args
@@ -31,7 +28,6 @@ def test_autocropper_cli_args_map_to_config_and_runtime_args() -> None:
             "--no_require_exclusions",
             "--crop_crf",
             "23",
-            "--no_validate_chambers",
         ]
     )
     cfg = _config_from_args(args)
@@ -39,39 +35,59 @@ def test_autocropper_cli_args_map_to_config_and_runtime_args() -> None:
     assert cfg.file_filter == "movieA"
     assert cfg.require_exclusions is False
     assert cfg.crop_crf == 23
-    assert cfg.skip_validation is True
 
     _sync_runtime_args(cfg=cfg, args=args)
 
     assert args.file_filter == "movieA"
     assert args.require_exclusions is False
     assert args.crop_crf == 23
-    assert args.skip_validation is True
-    assert args.validate_chambers is False
-    assert args.crop_dim_4k == cfg.crop_dim_2k * 2
+    assert args.crop_dim_2k == cfg.crop_dim_2k
+    assert not hasattr(args, "crop_dim_4k")
 
 
-def test_autocropper_config_defaults_support_canonical_keys(tmp_path: Path) -> None:
-    cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(
-        yaml.safe_dump(
-            {
-                "autocropper": {
-                    "input_dir": "1_full_movies",
-                    "file_filter": "movie_token",
-                    "require_exclusions": False,
-                    "crop_crf": 21,
-                }
-            }
-        )
-    )
+def test_autocropper_cli_defaults_match_runtime_defaults() -> None:
+    from autobehaver.preinf.autocropper.config import AutocropperConfig
 
-    defaults = _load_config_defaults(str(cfg_path))
+    defaults = AutocropperConfig(input_dir="1_full_movies")
+    args = _parse_args(["--input_dir", defaults.input_dir])
 
-    assert defaults["input_dir"] == str((tmp_path / "1_full_movies").resolve())
-    assert defaults["file_filter"] == "movie_token"
-    assert defaults["require_exclusions"] is False
-    assert defaults["crop_crf"] == 21
+    assert _config_from_args(args) == defaults
+
+
+def test_standard_geometry_preserves_existing_chamber_assignments() -> None:
+    from autobehaver.preinf.autocropper.detection import calculate_theoretical_centers
+
+    expected = {
+        "chamber1": (373, 449), "chamber2": (996, 443), "chamber3": (1622, 440),
+        "chamber4": (378, 1073), "chamber5": (1001, 1070), "chamber6": (1626, 1064),
+    }
+    for width in (2016, 2028):
+        assert calculate_theoretical_centers(width, 1520, 3, 2) == expected
+
+
+def test_nonstandard_geometry_cannot_be_enabled_by_calibration() -> None:
+    import pytest
+    from autobehaver.preinf.autocropper.detection import calculate_theoretical_centers
+
+    centers = calculate_theoretical_centers(2016, 1520, 3, 2)
+    for width, height in ((4032, 3040), (4056, 3040), (3840, 2160), (3000, 2000)):
+        calibration = {"image_width": width, "image_height": height, "centers": centers,
+                       "max_center_distance_px": 10}
+        with pytest.raises(ValueError, match="standard recording sizes"):
+            calculate_theoretical_centers(width, height, 3, 2, calibration)
+
+
+def test_measured_centers_remain_supported_at_standard_movie_size() -> None:
+    import pytest
+    from autobehaver.preinf.autocropper.detection import calculate_theoretical_centers
+
+    centers = calculate_theoretical_centers(2016, 1520, 3, 2)
+    measured = {key: (x + 3, y - 2) for key, (x, y) in centers.items()}
+    calibration = {"image_width": 2016, "image_height": 1520, "centers": measured,
+                   "max_center_distance_px": 10}
+    assert calculate_theoretical_centers(2016, 1520, 3, 2, calibration) == measured
+    with pytest.raises(ValueError, match="resolution does not match"):
+        calculate_theoretical_centers(2028, 1520, 3, 2, calibration)
 
 
 def test_autocropper_select_movie_files_respects_canonical_file_filter(monkeypatch) -> None:
@@ -97,7 +113,7 @@ def test_crop_single_chamber_uses_crf_and_timeout(monkeypatch, tmp_path: Path) -
     def fake_get_ffmpeg_executable() -> str:
         return "/usr/bin/ffmpeg"
 
-    def fake_run(cmd, check, stdout, stderr, text, timeout):
+    def fake_run(cmd, *, total_frames, desc, timeout):
         calls["cmd"] = list(cmd)
         calls["timeout"] = timeout
         out_path = Path(cmd[-1])
@@ -113,10 +129,11 @@ def test_crop_single_chamber_uses_crf_and_timeout(monkeypatch, tmp_path: Path) -
         fake_get_ffmpeg_executable,
     )
     monkeypatch.setattr(
-        "autobehaver.preinf.autocropper.cropping.subprocess.run",
+        "autobehaver.preinf.autocropper.cropping.run_ffmpeg",
         fake_run,
     )
 
+    monkeypatch.setattr("autobehaver.preinf.autocropper.cropping.valid_crop", lambda *a, **k: True)
     input_video = tmp_path / "input.mp4"
     input_video.write_bytes(b"not a real video")
     output_video = tmp_path / "cropped.mp4"
@@ -188,7 +205,7 @@ def test_crop_single_chamber_limits_ffmpeg_threads(monkeypatch, tmp_path: Path) 
     def fake_get_ffmpeg_executable() -> str:
         return "/usr/bin/ffmpeg"
 
-    def fake_run(cmd, check, stdout, stderr, text, timeout):
+    def fake_run(cmd, *, total_frames, desc, timeout):
         calls["cmd"] = list(cmd)
         out_path = Path(cmd[-1])
         out_path.write_bytes(b"fake mp4 bytes")
@@ -203,11 +220,12 @@ def test_crop_single_chamber_limits_ffmpeg_threads(monkeypatch, tmp_path: Path) 
         fake_get_ffmpeg_executable,
     )
     monkeypatch.setattr(
-        "autobehaver.preinf.autocropper.cropping.subprocess.run",
+        "autobehaver.preinf.autocropper.cropping.run_ffmpeg",
         fake_run,
     )
 
     output_video = tmp_path / "cropped.mp4"
+    monkeypatch.setattr("autobehaver.preinf.autocropper.cropping.valid_crop", lambda *a, **k: True)
     result = crop_single_chamber(
         "input.mp4",
         output_video,

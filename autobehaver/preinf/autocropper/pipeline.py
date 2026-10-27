@@ -1,17 +1,10 @@
-"""Autocropper orchestration.
-
-This module coordinates:
-  1) movie discovery and validation
-  2) circle detection and chamber matching
-  3) optional CNN chamber validation
-  4) cropping and logging
-  5) retry logic for robustness
-
-Autocropper reads ``exclusions.csv`` and can process subsets via
-``--file_filter`` or ``--movie_list``.
-"""
+"""Coordinate movie selection, metadata exclusions, chamber cropping, and retries."""
 
 from __future__ import annotations
+
+from autobehaver.cli_summary import reported_stage, validation_details
+
+from autobehaver.progress import Progress, drain_events, set_worker_queue
 
 import concurrent.futures as cf
 import json
@@ -19,12 +12,16 @@ import logging
 import multiprocessing as mp
 import os
 import re
+import shutil
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from autobehaver.validation import StageValidationReport
 
 from .config import AutocropperConfig
 from .cropping import crop_chambers_in_parallel
@@ -41,7 +38,6 @@ from .io_utils import (
     setup_logging,
     summarize_results,
 )
-from .validator import ChamberValidator
 
 from .recording_db import (
     RecordingDBIndex,
@@ -53,9 +49,7 @@ from ..moviechecker.core import derive_pair_key
 from ..moviechecker.exclusions import ExclusionsStore
 
 
-# -----------------------------------------------------------------------------
 # Runtime state (set by core.run_autocropper)
-# -----------------------------------------------------------------------------
 
 cfg: AutocropperConfig | None = None
 args: Any | None = None
@@ -63,7 +57,7 @@ args: Any | None = None
 # Full movies folder
 input_dir: Path | None = None
 
-# Stage run directory (logs, validation_results, chamber_images, movie_logs)
+# Stage run directory (logs, chamber_images, movie_logs)
 run_dir: Path | None = None
 
 # Where cropped chamber movies are written
@@ -76,8 +70,6 @@ exclusions_store: ExclusionsStore | None = None
 # recording database labeling
 recording_db_path: Path | None = None
 recording_db_index: RecordingDBIndex | None = None
-
-chamber_validator: ChamberValidator | None = None
 
 
 def set_runtime(*, cfg: AutocropperConfig, args: Any) -> None:
@@ -128,10 +120,12 @@ def _trial_number_value() -> int | None:
 
 
 def _trial_token_pattern(trial_number: int) -> re.Pattern[str]:
+    """Build an exact trial-token pattern that excludes longer trial numbers."""
     return re.compile(rf"(?:^|_)trial{int(trial_number)}(?:_|$)", flags=re.IGNORECASE)
 
 
 def _trial_number_from_name(name: str) -> int | None:
+    """Return the trial number from an exact filename token, if present."""
     m = re.search(r"(?:^|_)trial(\d+)(?:_|$)", str(name), flags=re.IGNORECASE)
     if not m:
         return None
@@ -147,7 +141,7 @@ def _warn_if_trial_filter_is_ambiguous(selected: list[Path], filter_value: str) 
     if not m:
         return
     requested = int(m.group(1))
-    selected_trials = sorted({n for n in (_trial_number_from_name(p.name) for p in selected) if n is not None})
+    selected_trials = sorted({n for n in (_trial_number_from_name(original_name(p)) for p in selected) if n is not None})
     if any(n != requested for n in selected_trials):
         logging.warning(
             "file_filter=%r is a substring match and selected trial numbers %s. "
@@ -159,15 +153,8 @@ def _warn_if_trial_filter_is_ambiguous(selected: list[Path], filter_value: str) 
         )
 
 
-def _validation_enabled() -> bool:
-    """Return whether chamber validation should run."""
-    assert args is not None
-    return (not bool(getattr(args, "skip_validation", False))) and bool(
-        getattr(args, "validate_chambers", True)
-    )
-
-
 def _heartbeat_interval_seconds() -> int:
+    """Return the configured positive progress-report interval in seconds."""
     assert args is not None
     return max(1, int(getattr(args, "heartbeat_interval", 10)))
 
@@ -207,13 +194,6 @@ def _assess_required_crops(
         if matches:
             final_files[chamber_id] = str(matches[0])
 
-    for chamber_id, file_info in raw_cropped_files.items():
-        if chamber_id in final_files:
-            continue
-        if _is_failure_marker(file_info):
-            continue
-        final_files[chamber_id] = str(file_info)
-
     return {
         "cropped_files": final_files,
         "missing_required_chambers": missing_required,
@@ -221,9 +201,7 @@ def _assess_required_crops(
     }
 
 
-# -----------------------------------------------------------------------------
 # Exclusions helpers
-# -----------------------------------------------------------------------------
 
 
 def _load_exclusions_if_available() -> None:
@@ -251,7 +229,6 @@ def _load_exclusions_if_available() -> None:
         logging.info(f"Loaded exclusions file: {ex_path}")
         return
 
-    # Missing
     if _exclusions_optional():
         exclusions_store = None
         logging.warning(
@@ -266,20 +243,25 @@ def _load_exclusions_if_available() -> None:
 
 
 def _excluded_set_for_movie(movie: Path) -> set[str]:
-    """Return a set of chamber IDs (e.g., {'chamber2','chamber6'}) to exclude."""
-    if exclusions_store is None:
-        return set()
-
-    key = derive_pair_key(str(movie))
-    rec = exclusions_store.get(key)
-    if rec is None:
-        # Missing record: treat as no exclusions for safety.
-        return set()
-
+    """Combine manual MovieChecker exclusions with recording-time chamber exclusions."""
     excluded: set[str] = set()
-    for i, flag in enumerate(rec.exclude_ch):
-        if int(flag) == 1:
-            excluded.add(f"chamber{i+1}")
+    if exclusions_store is not None:
+        key = derive_pair_key(str(movie))
+        rec = exclusions_store.get(key)
+        if rec is not None:
+            for i, flag in enumerate(rec.exclude_ch):
+                if int(flag) == 1:
+                    excluded.add(f"chamber{i+1}")
+
+    # Combine recording-time occupancy with visual review of recording faults.
+    if recording_db_index is not None:
+        exp, subexp, trial, rpi = _parse_full_movie_identity(movie)
+        excluded.update(recording_db_index.get_excluded_chambers(
+            experiment=exp,
+            subexperiment=subexp,
+            trial_number=trial,
+            rpi_number=rpi,
+        ))
     return excluded
 
 
@@ -311,22 +293,14 @@ def _require_exclusions_coverage(movie_files: list[Path]) -> None:
         )
 
 
-# -----------------------------------------------------------------------------
 # Recording database labeling helpers
-# -----------------------------------------------------------------------------
 
 
 def _load_recording_db_if_needed() -> None:
-    """Load the recording database into memory (module global).
+    """Load indexed recording metadata when labeling is enabled.
 
-    Behavior:
-      - If args.skip_labeling is True -> do nothing (labeling disabled).
-      - Else:
-          * Resolve CSV path:
-              - if args.recording_database_csv provided -> use it
-              - else: look in args.recording_database_dir (default: input_dir) and pick latest
-          * Load into RecordingDBIndex for fast lookups.
-      - Missing DB when labeling is enabled -> raise SystemExit with an actionable message.
+    An explicit CSV overrides discovery; missing or invalid metadata aborts
+    the run before cropping.
     """
 
     global recording_db_path, recording_db_index
@@ -352,9 +326,9 @@ def _load_recording_db_if_needed() -> None:
             db_csv = find_latest_recording_database_csv(db_dir)
         except FileNotFoundError:
             raise SystemExit(
-                f"No recording_database_*.csv found in: {db_dir}\n"
+                f"No recording_database*.csv or crop_occupancy_*.csv found in: {db_dir}\n"
                 "Labeling is enabled by default.\n"
-                "Either copy a recording_database_*.csv into the full-movies folder, set --recording_database_dir, "
+                "Either put recording metadata in the full-movies folder, set --recording_database_dir, "
                 "or rerun with --skip_labeling."
             )
 
@@ -363,54 +337,80 @@ def _load_recording_db_if_needed() -> None:
         recording_db_path = db_csv
     except Exception as e:
         raise SystemExit(
-            f"Failed to load recording database CSV: {db_csv}\n"
+            f"Failed to load recording metadata: {db_csv}\n"
             f"Error: {e}\n"
             "If you want to run without DB labeling, rerun with --skip_labeling."
         )
 
 
 def _parse_full_movie_identity(movie: Path) -> tuple[str, str, int, int]:
-    """Parse (experiment, subexperiment, trial_number, rpi_number) from a full-movie filename.
+    """Resolve experiment, subexperiment, trial, and camera from a movie name.
 
-    Expected filename convention:
-        <experiment>_<subexperiment>_trial<trial>_rpi-<n>_movie<m>_...
+    Prefer indexed recording metadata; retain the legacy filename-only fallback
+    for callers that have not loaded it.
     """
 
-    stem = Path(movie).stem
+    if recording_db_index is not None:
+        return recording_db_index.resolve_movie_identity(Path(original_name(movie)))
 
-    # Fast path: strict tokens
-    parts = stem.split("_")
-    if len(parts) >= 5 and parts[2].startswith("trial") and parts[3].startswith("rpi") and parts[4].startswith(
-        "movie"
-    ):
-        experiment = parts[0]
-        subexperiment = parts[1]
-        try:
-            trial = int(re.sub(r"^trial", "", parts[2], flags=re.IGNORECASE))
-        except Exception:
-            trial = None  # type: ignore
-        m_rpi = re.match(r"^rpi-(\d+)$", parts[3], flags=re.IGNORECASE)
-        rpi = int(m_rpi.group(1)) if m_rpi else None  # type: ignore
-        if trial is not None and rpi is not None:
-            return str(experiment), str(subexperiment), int(trial), int(rpi)
+    stem = Path(original_name(movie)).stem
+
+    match = re.match(
+        r"^(?P<prefix>.+)_trial(?P<trial>\d+)_rpi-(?P<rpi>\d+)_movie\d+(?:_|$)",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        prefix = match.group("prefix")
+        trial = int(match.group("trial"))
+        rpi = int(match.group("rpi"))
+        # Compatibility fallback for callers that parse without loading metadata.
+        # New recordings sanitize internal underscores to dashes, so one underscore
+        # reliably denotes a subexperiment; old ambiguous names need the DB resolver.
+        identity_parts = prefix.split("_", 1)
+        experiment = identity_parts[0]
+        subexperiment = identity_parts[1] if len(identity_parts) == 2 else ""
+        return experiment, subexperiment, trial, rpi
 
     raise ValueError(
         f"Could not parse movie identity from filename: {movie.name}\n"
-        "Expected something like: <experiment>_<subexperiment>_trial1_rpi-6_movie0_<timestamp>.mp4"
+        "Expected <experiment>[_<subexperiment>]_trial1_rpi-6_movie0_<timestamp>.mp4"
     )
 
 
+from autobehaver.portable_paths import generated_path, original_name
+from .contract import crop_request, valid_crop, video_shape
+from autobehaver.completion import verified_run, file_signature, file_digest, write_receipt, preserve_previous, read_receipt
+from .selection import write_selection
+
+_movie_requests = {}
+_movie_shapes = {}
+
+
+def _crop_identity(movie, chamber_id):
+    """Share immutable input and code identity across chambers in this process."""
+    key = file_signature(movie)
+    if key not in _movie_requests:
+        _movie_requests[key] = crop_request(movie, chamber_id, args)
+    return crop_request(movie, chamber_id, args, base_request=_movie_requests[key])
+
+
+def _checked_source_shape(movie):
+    """Cache validated video dimensions and frame count by source file signature."""
+    key = file_signature(movie)
+    if key not in _movie_shapes:
+        _movie_shapes[key] = video_shape(movie)
+    return _movie_shapes[key]
+
 def _expected_crop_output_path(movie: Path, output_dir: Path, chamber_id: str) -> Path:
-    """Compute the expected cropped output path for a chamber.
+    """Return the portable chamber output path with the current metadata label."""
 
-    If recording DB labeling is enabled, the filename is prefixed with the DB label.
-    When labeling is disabled, the filename uses the movie stem and chamber ID.
-    """
-
-    base_name = Path(movie).stem
+    # Preserve legacy identity text while removing accidental empty filename
+    # components such as the old blank-subexperiment ``experiment__trial1``.
+    base_name = re.sub(r"_+", "_", Path(original_name(movie)).stem).strip("_")
 
     if recording_db_index is None or bool(getattr(args, "skip_labeling", False)):
-        return Path(output_dir) / f"{base_name}_{chamber_id}.mp4"
+        return generated_path(output_dir, f"{base_name}_{chamber_id}.mp4", reserve=65)
 
     exp, subexp, trial, rpi = _parse_full_movie_identity(movie)
     chamber_num = int(str(chamber_id).replace("chamber", ""))
@@ -421,7 +421,12 @@ def _expected_crop_output_path(movie: Path, output_dir: Path, chamber_id: str) -
         rpi_number=rpi,
         chamber_number=chamber_num,
     )
-    return Path(output_dir) / f"{label_prefix}{base_name}_{chamber_id}.mp4"
+    # Both legacy labels (which conventionally end in ``_``) and newer labels
+    # are accepted. Publish exactly one separator before the recording name.
+    normalized_prefix = re.sub(r"_+", "_", str(label_prefix).strip()).rstrip("_")
+    if not normalized_prefix:
+        raise ValueError(f"Recording metadata returned a blank label for {movie.name} {chamber_id}")
+    return generated_path(output_dir, f"{normalized_prefix}_{base_name}_{chamber_id}.mp4", reserve=65)
 
 
 def _resolve_existing_crop(
@@ -429,58 +434,55 @@ def _resolve_existing_crop(
     output_dir: Path,
     chamber_id: str,
 ) -> dict[str, Any]:
-    """Resolve whether a crop already exists for a given movie/chamber.
+    """Find a unique crop that matches the source request and passes integrity checks.
 
-    Returns a dict with:
-      - status: one of {"expected", "exists_other", "missing"}
-      - expected_name: expected output filename
-      - path: Path to an existing crop (if present)
-      - matches: list[str] of matching filenames (when ambiguous)
-
-    Important
-    ---------
-    We treat *any* existing crop matching '*<base>_<chamber>.mp4' as "present" to avoid
-    accidental re-cropping when label prefixes change.
+    Return status, expected paths, matched names, and a usable path when present.
+    Republish verified pixels under a corrected label and preserve the old version.
     """
 
     expected_path = _expected_crop_output_path(movie, output_dir, chamber_id)
-    base_name = Path(movie).stem
+    base_name = Path(original_name(movie)).stem
 
-    if expected_path.exists():
-        return {
-            "status": "expected",
-            "expected_name": expected_path.name,
-            "expected_path": expected_path,
-            "path": expected_path,
-            "matches": [expected_path.name],
-        }
-
-    matches = sorted(Path(output_dir).glob(f"*{base_name}_{chamber_id}.mp4"))
-    if not matches:
-        return {
-            "status": "missing",
-            "expected_name": expected_path.name,
-            "expected_path": expected_path,
-            "path": None,
-            "matches": [],
-        }
-
-
-    # Some other prefixed file exists; do NOT recrop.
-    return {
-        "status": "exists_other",
-        "expected_name": expected_path.name,
-        "expected_path": expected_path,
-        "path": matches[0],
-        "matches": [m.name for m in matches],
-    }
+    matches = sorted(set(([expected_path] if expected_path.exists() else []) + [
+        path for path in Path(output_dir).glob("*.mp4")
+        if original_name(path).endswith(f"{base_name}_{chamber_id}.mp4")
+    ]))
+    identity = _crop_identity(movie, chamber_id) if matches else None
+    candidates = matches
+    matches = [path for path in candidates if valid_crop(movie, path, identity,
+                                                        source_shape=_checked_source_shape(movie))]
+    if len(matches) > 1:
+        raise ValueError(f'Ambiguous valid crops for {movie.name} {chamber_id}: {[p.name for p in matches]}')
+    usable = bool(matches)
+    if usable:
+        for invalid in set(candidates) - set(matches):
+            preserve_previous(invalid)
+    if usable and matches[0] != expected_path:
+        # A deliberate label correction changes identity text, not crop pixels.
+        # Publish those verified pixels under the current label, then retain the
+        # old version in the stage history rather than leaving two active crops.
+        previous_path = matches[0]
+        producer_identity = read_receipt(previous_path)['request']
+        temporary = Path(output_dir) / (".crop-label-" + uuid.uuid4().hex[:12] + ".tmp")
+        before = file_signature(previous_path)
+        try:
+            shutil.copyfile(previous_path, temporary)
+            if file_signature(previous_path) != before or file_digest(temporary) != file_digest(previous_path):
+                raise ValueError(f"Crop changed during label correction: {previous_path}")
+            preserve_previous(previous_path)
+            os.replace(temporary, expected_path)
+            write_receipt(expected_path, producer_identity, relabelled_from=previous_path.name)
+            matches = [expected_path]
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return {'status': ('expected' if matches[0] == expected_path else 'exists_other') if usable else 'missing',
+            'expected_name':expected_path.name, 'expected_path':expected_path,
+            'path':matches[0] if usable else None, 'matches':[p.name for p in matches]}
 
 
 def _require_recording_db_coverage(movie_files: list[Path]) -> None:
-    """Ensure the recording DB can provide labels for selected movies.
-
-    We require labels for *non-excluded* chambers only (exclusions already loaded).
-    """
+    """Require metadata labels for every selected, non-excluded chamber."""
 
     assert args is not None
 
@@ -522,82 +524,15 @@ def _require_recording_db_coverage(movie_files: list[Path]) -> None:
         )
 
 
-# -----------------------------------------------------------------------------
-# Validation helpers
-# -----------------------------------------------------------------------------
+# Worker initialization and crop completion
 
 
-def _init_chamber_validator() -> None:
-    """Initialize chamber validation model if enabled."""
-    global chamber_validator
-
-    assert args is not None
-    if run_dir is None:
-        raise RuntimeError("run_dir is not set (did you call run_autocropper()?)")
-
-    chamber_validator = None
-
-    validation_requested = _validation_enabled()
-
-    if validation_requested:
-        model_path = Path(args.model_path)
-        norm_params_path = Path(args.norm_params_path)
-
-        if model_path.exists() and norm_params_path.exists():
-            logging.info("\n=== Chamber validation enabled ===")
-            logging.info(f"Model path: {model_path}")
-            logging.info(f"Normalization params path: {norm_params_path}")
-            chamber_validator = ChamberValidator(
-                model_path,
-                norm_params_path,
-                base_output_dir=run_dir,
-            )
-        else:
-            # Model files missing -> force skip_validation so verification logic is consistent.
-            logging.warning("\n" + "=" * 70)
-            logging.warning("!!! CHAMBER VALIDATION SKIPPED !!!")
-            logging.warning("Could not find the model and/or normalization files at the specified paths.")
-            logging.warning(f"Searched for model: {model_path}")
-            logging.warning(f"Searched for params: {norm_params_path}")
-            logging.warning("The script will proceed by cropping ALL detected chambers (except excluded ones).")
-            logging.warning("=" * 70)
-            args.skip_validation = True
-            chamber_validator = None
-    else:
-        logging.info("\n=== Chamber validation disabled by user flag ===")
-        chamber_validator = None
-
-
-def _prepare_validation_mode() -> None:
-    """Resolve validation mode in the parent process without loading torch models."""
-    assert args is not None
-
-    if not _validation_enabled():
-        logging.info("\n=== Chamber validation disabled by user flag ===")
-        return
-
-    model_path = Path(args.model_path)
-    norm_params_path = Path(args.norm_params_path)
-    if model_path.exists() and norm_params_path.exists():
-        logging.info("\n=== Chamber validation enabled ===")
-        logging.info("Model will be initialized lazily inside worker processes.")
-        logging.info(f"Model path: {model_path}")
-        logging.info(f"Normalization params path: {norm_params_path}")
-        return
-
-    logging.warning("\n" + "=" * 70)
-    logging.warning("!!! CHAMBER VALIDATION SKIPPED !!!")
-    logging.warning("Could not find the model and/or normalization files at the specified paths.")
-    logging.warning(f"Searched for model: {model_path}")
-    logging.warning(f"Searched for params: {norm_params_path}")
-    logging.warning("The script will proceed by cropping ALL detected chambers (except excluded ones).")
-    logging.warning("=" * 70)
-    args.skip_validation = True
-
-
-def _worker_init(worker_cfg: AutocropperConfig, worker_args: Any) -> None:
+def _worker_init(worker_cfg: AutocropperConfig, worker_args: Any, metadata_snapshot=None, progress_events=None) -> None:
     """Initialize per-process runtime state for spawn-safe multiprocessing."""
+    set_worker_queue(progress_events)
     random_seed = 42
+    _movie_requests.clear()
+    _movie_shapes.clear()
     configure_native_threading(getattr(worker_args, "native_threads", 1), overwrite=False)
     set_runtime(cfg=worker_cfg, args=worker_args)
     if run_dir is None or crop_output_dir is None:
@@ -606,9 +541,12 @@ def _worker_init(worker_cfg: AutocropperConfig, worker_args: Any) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     crop_output_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(run_dir, log_level=str(getattr(worker_args, "log_level", "INFO")))
-    _load_exclusions_if_available()
-    _load_recording_db_if_needed()
-    _init_chamber_validator()
+    if metadata_snapshot is None:
+        _load_exclusions_if_available()
+        _load_recording_db_if_needed()
+    else:
+        global exclusions_store, recording_db_path, recording_db_index
+        exclusions_store, recording_db_path, recording_db_index = metadata_snapshot
 
     # Keep frame sampling deterministic across workers/process launches.
     import random
@@ -616,47 +554,17 @@ def _worker_init(worker_cfg: AutocropperConfig, worker_args: Any) -> None:
     random.seed(random_seed)
 
 
-def get_occupied_chambers(movie: Path) -> list[str] | None:
-    """Read occupied chamber IDs from a movie's validation JSON file."""
-    if run_dir is None:
-        raise RuntimeError("run_dir is not set (did you call run_autocropper()?)")
-
-    movie_name = Path(movie).stem
-    validation_file = run_dir / "validation_results" / f"{movie_name}_validation.json"
-    if not validation_file.exists():
-        logging.info(f"No validation results found for {movie}, needs processing")
-        return None
-
-    try:
-        with validation_file.open("r") as f:
-            validation_results = json.load(f)
-            occupied = [
-                chamber_id
-                for chamber_id, result in validation_results.items()
-                if isinstance(result, dict) and result.get("is_occupied", False)
-            ]
-            logging.info(
-                f"Found {len(occupied)} occupied chambers in validation results for {movie_name}"
-            )
-            return occupied
-    except json.JSONDecodeError:
-        logging.error(f"Error reading validation results for {movie}, file may be corrupted")
-        return None
-    except Exception as e:
-        logging.error(f"Error processing validation results for {movie}: {str(e)}")
-        return None
-
-
 def all_cropped_movies_exist(
     movie: Path,
     output_dir: Path,
     *,
     excluded_chambers: set[str] | None = None,
+    resolutions: dict | None = None,
 ) -> bool:
-    """Check if all required chambers for a movie have already been cropped.
+    """Check that all non-excluded chambers have validated crops.
 
-    - If validation is skipped: require all non-excluded chambers.
-    - If validation is enabled: require all *occupied* non-excluded chambers.
+    Use recording metadata and MovieChecker exclusions, excluding historical
+    automatic occupancy decisions.
     """
     assert args is not None
 
@@ -670,44 +578,13 @@ def all_cropped_movies_exist(
     if not expected:
         return True
 
-    # If validation is skipped, check if all expected chambers have been cropped
-    if getattr(args, "skip_validation", False):
-        for chamber_id in expected:
-            res = _resolve_existing_crop(movie, output_dir, chamber_id)
-            if res["status"] == "missing":
-                logging.debug(
-                    f"Missing cropped video for {chamber_id} (validation skipped); expected {res['expected_name']}"
-                )
-                return False
-            if res["status"] == "exists_other":
-                logging.warning(
-                    f"Crop exists for {movie.name} {chamber_id} but filename does not match expected label. "
-                    f"Expected: {res['expected_name']} | Found: {res.get('matches', [])}"
-                )
-        return True
-
-    occupied_chambers = get_occupied_chambers(movie)
-
-    # If validation hasn't been done yet, return False to trigger processing
-    if occupied_chambers is None:
-        return False
-
-    # Only require occupied chambers among the non-excluded set
-    occupied_required = [cid for cid in occupied_chambers if cid in expected]
-
-    # If validation is done and no required chambers are occupied, we're done
-    if not occupied_required:
-        logging.info(
-            f"No occupied (non-excluded) chambers found for {movie}, considering it complete."
-        )
-        return True
-
-    # Check if all required occupied chambers have been cropped
-    for chamber_id in occupied_required:
+    for chamber_id in expected:
         res = _resolve_existing_crop(movie, output_dir, chamber_id)
+        if resolutions is not None:
+            resolutions[chamber_id] = res
         if res["status"] == "missing":
             logging.debug(
-                f"Missing cropped video for occupied {chamber_id}; expected {res['expected_name']}"
+                f"Missing cropped video for {chamber_id}; expected {res['expected_name']}"
             )
             return False
         if res["status"] == "exists_other":
@@ -728,46 +605,18 @@ def verify_all_cropped_movies(movie_files: list[Path], output_dir: Path) -> list
     return incomplete_movies
 
 
-def run_chamber_validation(
-    movie_path: Path,
-    all_coords: dict[str, tuple[int, int]],
-    validator: ChamberValidator | None,
-    crop_dim: int,
-):
-    if validator is None:
-        logging.info(f"Skipping validation - will crop all {len(all_coords)} detected chambers")
-        return all_coords, {}
-
-    logging.info(f"Validating {len(all_coords)} chambers...")
-
-    occupied_coords: dict[str, tuple[int, int]] = {}
-    validation_results: dict[str, Any] = {}
-
-    for chamber_id, (x, y) in all_coords.items():
-        result = validator.validate_chamber(str(movie_path), chamber_id, x, y, crop_dim)
-        validation_results[chamber_id] = result
-
-        if result["is_occupied"]:
-            occupied_coords[chamber_id] = (int(x), int(y))
-            logging.info(f"✓ {chamber_id}: OCCUPIED (confidence: {result['confidence']:.3f})")
-        else:
-            logging.info(f"✗ {chamber_id}: EMPTY (confidence: {result['confidence']:.3f})")
-
-    logging.info(f"Validation complete: {len(occupied_coords)}/{len(all_coords)} chambers occupied")
-    return occupied_coords, validation_results
-
-
-# -----------------------------------------------------------------------------
 # Movie selection
-# -----------------------------------------------------------------------------
 
 
 def _load_movie_list(list_path: Path, *, base_dir: Path) -> list[Path]:
-    """Load a user/provided list of movies (one per line)."""
+    """Read an optional selection file with one movie path per line.
+
+    Resolve relative movie paths under base_dir, ignore blank/comment lines,
+    and preserve first occurrence order while removing duplicates.
+    """
     movies: list[Path] = []
-    if not list_path.exists():
-        logging.error(f"movie_list file not found: {list_path}")
-        return movies
+    if not list_path.is_file():
+        raise FileNotFoundError(f"Supplied movie_list file not found: {list_path}")
 
     for raw in list_path.read_text().splitlines():
         line = raw.strip()
@@ -776,13 +625,17 @@ def _load_movie_list(list_path: Path, *, base_dir: Path) -> list[Path]:
         p = Path(line)
         if not p.is_absolute():
             p = (base_dir / p).resolve()
+        else:
+            p = p.resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"Movie listed in {list_path} was not found: {p}")
         movies.append(p)
 
     # Deduplicate while preserving order
     seen: set[str] = set()
     uniq: list[Path] = []
     for p in movies:
-        k = str(p)
+        k = os.path.normcase(str(p))
         if k not in seen:
             seen.add(k)
             uniq.append(p)
@@ -790,6 +643,7 @@ def _load_movie_list(list_path: Path, *, base_dir: Path) -> list[Path]:
 
 
 def _select_movie_files(all_movie_files: list[Path]) -> list[Path]:
+    """Select movies by explicit list, exact trial, substring, or the complete folder."""
     assert args is not None
     if input_dir is None:
         raise RuntimeError("input_dir is not set")
@@ -797,33 +651,31 @@ def _select_movie_files(all_movie_files: list[Path]) -> list[Path]:
     # Explicit list takes precedence
     movie_list_path = getattr(args, "movie_list", None)
     if movie_list_path:
-        selected = _load_movie_list(Path(movie_list_path), base_dir=input_dir)
-        if selected:
-            return selected
-        # If list file is empty/missing, fall back to no selection (but warn)
-        logging.warning("movie_list was provided but yielded no valid movie paths; falling back to scanning folder.")
+        return _load_movie_list(Path(movie_list_path), base_dir=input_dir)
 
     trial_number = _trial_number_value()
     if trial_number is not None:
         pattern = _trial_token_pattern(trial_number)
-        return [m for m in all_movie_files if pattern.search(m.stem)]
+        return [m for m in all_movie_files if pattern.search(Path(original_name(m)).stem)]
 
     filt = _file_filter_value()
     if filt:
         needle = str(filt).lower()
-        selected = [m for m in all_movie_files if needle in m.name.lower()]
+        selected = [m for m in all_movie_files if needle in original_name(m).lower()]
         _warn_if_trial_filter_is_ambiguous(selected, str(filt))
         return selected
 
     return all_movie_files
 
 
-# -----------------------------------------------------------------------------
 # Multiprocessing entrypoint
-# -----------------------------------------------------------------------------
 
 
+@verified_run
 def process_single_movie(movie: Path) -> None:
+    """Crop missing included chambers and save the per-movie outcome log."""
+    _movie_requests.clear()
+    _movie_shapes.clear()
     assert args is not None
     if input_dir is None:
         raise RuntimeError("input_dir is not set (did you call run_autocropper()?)")
@@ -837,9 +689,10 @@ def process_single_movie(movie: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_user_permissions(output_dir)
 
-    movie_data: dict[str, Any] = {"movie_name": movie_name}
+    movie_data: dict[str, Any] = {"movie_name": movie_name, "source_path": str(Path(movie).resolve())}
 
     excluded = _excluded_set_for_movie(movie)
+    movie_data["expected_chamber_count"] = int(args.chamber_columns) * int(args.chamber_rows)
     if excluded:
         movie_data["excluded_chambers"] = sorted(excluded)
 
@@ -859,13 +712,24 @@ def process_single_movie(movie: Path) -> None:
                     "rpi_number": int(rpi),
                 }
             )
+            if recording_db_index is not None and not bool(getattr(args, "skip_labeling", False)):
+                movie_data["chamber_labels"] = {
+                    f"chamber{i}": recording_db_index.get_label_prefix(
+                        experiment=exp, subexperiment=subexp, trial_number=trial,
+                        rpi_number=rpi, chamber_number=i,
+                    )
+                    for i in range(1, movie_data["expected_chamber_count"] + 1)
+                    if f"chamber{i}" not in excluded
+                }
         except Exception as e:
             if not bool(getattr(args, "skip_labeling", False)):
                 raise
             movie_data["identity_parse_warning"] = str(e)
 
-        # Fast skip path: if all required crops already exist, do not redo detection/validation.
-        if all_cropped_movies_exist(movie, output_dir, excluded_chambers=excluded):
+        # Fast skip path: if all required crops already exist, do not redo chamber detection.
+        existing_resolutions = {}
+        if all_cropped_movies_exist(movie, output_dir, excluded_chambers=excluded,
+                                   resolutions=existing_resolutions):
             movie_data["skipped"] = True
             movie_data["status"] = "skipped"
             movie_data["skip_reason"] = "already processed"
@@ -877,18 +741,20 @@ def process_single_movie(movie: Path) -> None:
                     chamber_id = f"chamber{i}"
                     if chamber_id in excluded:
                         continue
-                    res = _resolve_existing_crop(movie, output_dir, chamber_id)
+                    res = existing_resolutions[chamber_id]
                     p = res.get("path")
                     if p is not None:
                         existing[chamber_id] = Path(p).name
                 movie_data["cropped_files"] = existing
             except Exception:
                 pass
-            logging.info(f"✓ {movie_name}: Already processed, skipping")
+            logging.info(f"[OK] {movie_name}: Already processed, skipping")
             return
 
-        # Step 1: Find all potential chambers
+        # Detect the complete grid before applying exclusions.
+        args._detection_diagnostic_dir = str(run_dir / 'chamber_images')
         all_coords, viz_frame, circles, crop_dim = detect_and_match_chambers(movie, args)
+        movie_data['grid_fit'] = getattr(args, '_last_grid_fit', {})
         movie_data["chamber_coordinates"] = {
             cid: {"x": int(x), "y": int(y)} for cid, (x, y) in all_coords.items()
         }
@@ -897,38 +763,31 @@ def process_single_movie(movie: Path) -> None:
         allowed_coords = {cid: xy for cid, xy in all_coords.items() if cid not in excluded}
 
         if not allowed_coords:
-            logging.info(f"✓ {movie_name}: All chambers excluded, skipping cropping")
+            logging.info(f"[OK] {movie_name}: All chambers excluded, skipping cropping")
             movie_data["status"] = "skipped"
             movie_data["skip_reason"] = "all chambers excluded"
             movie_data["cropped_files"] = {}
             return
 
-        # Step 2: Filter for occupied chambers using the CNN validator
-        occupied_coords, validation_results = run_chamber_validation(
-            movie, allowed_coords, chamber_validator, crop_dim
-        )
-        movie_data["validation_results"] = validation_results
-
-        # Step 3: Create and save visualization of detected (and occupied) chambers
         draw_circles(
             viz_frame,
             circles,
             args.down_factor,
-            occupied_coords,
+            allowed_coords,
             approx_radius=int(args.approx_radius),
         )
         save_chamber_coordinates_image(run_dir, movie, viz_frame)
 
-        # Step 4: Crop (only what is missing) while respecting DB-based naming
+        # Crop (only what is missing) while respecting DB-based naming
         crop_status: dict[str, Any] = {}
         existing_or_final: dict[str, str] = {}
         coords_to_crop: dict[str, tuple[int, int]] = {}
         output_paths_to_crop: dict[str, Path] = {}
 
-        for chamber_id, (x, y) in occupied_coords.items():
-            res = _resolve_existing_crop(
-                movie, output_dir, chamber_id
-            )
+        for chamber_id, (x, y) in allowed_coords.items():
+            res = existing_resolutions.get(chamber_id)
+            if res is None:
+                res = _resolve_existing_crop(movie, output_dir, chamber_id)
 
             # Store only JSON-serializable fields
             crop_status[chamber_id] = {
@@ -961,6 +820,7 @@ def process_single_movie(movie: Path) -> None:
                 crop_dim,
                 args,
                 source_size=source_size,
+                identities={cid: _crop_identity(movie, cid) for cid in coords_to_crop},
             )
             cropped_files.update(newly_cropped)
 
@@ -969,7 +829,7 @@ def process_single_movie(movie: Path) -> None:
         assessment = _assess_required_crops(
             movie,
             output_dir,
-            required_chambers=list(occupied_coords.keys()),
+            required_chambers=list(allowed_coords.keys()),
             raw_cropped_files=cropped_files,
         )
         movie_data["cropped_files"] = assessment["cropped_files"]
@@ -981,29 +841,29 @@ def process_single_movie(movie: Path) -> None:
         missing_required = assessment["missing_required_chambers"]
         failed_attempts = assessment["crop_failures"]
         n_present = len(assessment["cropped_files"])
-        n_required = len(occupied_coords)
+        n_required = len(allowed_coords)
 
         if missing_required or failed_attempts:
             movie_data["status"] = "incomplete"
             logging.warning(
-                f"△ {movie_name}: Finished attempt with incomplete required crops "
+                f"Ã¢â€“Â³ {movie_name}: Finished attempt with incomplete required crops "
                 f"({n_present}/{n_required} present; {len(missing_required)} still missing, "
                 f"{len(failed_attempts)} crop failures this attempt)"
             )
         else:
             movie_data["status"] = "completed"
             logging.info(
-                f"✓ {movie_name}: All required crops present "
+                f"[OK] {movie_name}: All required crops present "
                 f"({len(coords_to_crop)} new chambers cropped, {len(existing_or_final)} already present)"
             )
 
     except Exception as e:
-        logging.error(f"✗ {movie_name}: Failed - {str(e)}")
+        logging.error(f"[FAILED] {movie_name}: Failed - {str(e)}")
         movie_data["status"] = "failed"
         movie_data["error"] = str(e)
 
     finally:
-        # Step 5: Always save the log file for this movie
+        # Preserve per-movie outcomes even when cropping fails.
         log_movie_results(movie, run_dir, movie_data)
 
     return {"movie_name": movie_name, "error": movie_data.get("error")}
@@ -1017,7 +877,7 @@ def process_movies_in_parallel(movie_files: list[Path]) -> None:
     if not movie_files:
         return
 
-    num_workers = max(1, int(getattr(args, "num_workers", 2)))
+    num_workers = min(len(movie_files), max(1, int(getattr(args, "num_workers", 2))))
     heartbeat = _heartbeat_interval_seconds()
     ctx = mp.get_context("spawn")
 
@@ -1027,57 +887,56 @@ def process_movies_in_parallel(movie_files: list[Path]) -> None:
 
     completed = 0
     total = len(movie_files)
-    last_progress_log = 0.0
+    events = ctx.Queue(maxsize=64)
 
-    with cf.ProcessPoolExecutor(
-        max_workers=num_workers,
-        mp_context=ctx,
-        initializer=_worker_init,
-        initargs=(cfg, args),
-    ) as executor:
-        future_to_movie = {executor.submit(process_single_movie, movie): movie for movie in movie_files}
+    try:
+        with Progress(total=total, desc="Autocropper movies") as display, cf.ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=ctx,
+            initializer=_worker_init,
+            initargs=(cfg, args, (exclusions_store, recording_db_path, recording_db_index), events),
+        ) as executor:
+            future_to_movie = {executor.submit(process_single_movie, movie): movie for movie in movie_files}
 
-        while future_to_movie:
-            done, _pending = cf.wait(
-                tuple(future_to_movie.keys()),
-                timeout=heartbeat,
-                return_when=cf.FIRST_COMPLETED,
-            )
-
-            now = time.monotonic()
-            if not done:
-                if (now - last_progress_log) >= heartbeat:
-                    logging.info(
-                        f"Autocropper progress: {completed}/{total} movie tasks finished in this attempt, {len(future_to_movie)} still running."
-                    )
-                    last_progress_log = now
-                continue
-
-            for future in done:
-                movie = future_to_movie.pop(future)
-                try:
-                    future.result()
-                except Exception:
-                    logging.exception(f"Worker failed while processing {movie.name}")
-                    for pending in future_to_movie:
-                        pending.cancel()
-                    raise
-                completed += 1
-
-            if (now - last_progress_log) >= heartbeat or completed == total:
-                logging.info(
-                    f"Autocropper progress: {completed}/{total} movie tasks finished in this attempt, {len(future_to_movie)} still running."
+            while future_to_movie:
+                done, _pending = cf.wait(
+                    tuple(future_to_movie.keys()),
+                    timeout=min(heartbeat, 1),
+                    return_when=cf.FIRST_COMPLETED,
                 )
-                last_progress_log = now
+
+                drain_events(events, display)
+                if not done:
+                    continue
+
+                for future in done:
+                    movie = future_to_movie.pop(future)
+                    try:
+                        future.result()
+                    except Exception:
+                        logging.exception(f"Worker failed while processing {movie.name}")
+                        for pending in future_to_movie:
+                            pending.cancel()
+                        raise
+                    completed += 1
+
+                if not future_to_movie:
+                    display.detail = ""
+                display.update(len(done))
+    finally:
+        events.close()
+        events.join_thread()
 
 
-# -----------------------------------------------------------------------------
 # Main orchestrator
-# -----------------------------------------------------------------------------
 
 
+@reported_stage("Autocropper")
+@verified_run
 def run_pipeline() -> None:
-    """Main function to orchestrate autocropping for all movies."""
+    """Validate selected movies, crop required chambers with retries, and record outcomes."""
+    _movie_requests.clear()
+    _movie_shapes.clear()
     assert args is not None
     if input_dir is None or run_dir is None or crop_output_dir is None:
         raise RuntimeError("runtime state is not set (did you call run_autocropper()?)")
@@ -1095,12 +954,15 @@ def run_pipeline() -> None:
     configured_ffmpeg_threads = max(1, int(getattr(args, "ffmpeg_threads", 1)))
     configured_native_threads = max(1, int(getattr(args, "native_threads", 1)))
     effective_crop_jobs = configured_movie_workers * configured_crop_workers
-    estimated_crop_threads = effective_crop_jobs * configured_ffmpeg_threads
+    # Each movie shares decoder/filter pools; encoders retain separate caps.
+    # FFmpeg can also create helper/I/O threads beyond this estimate.
+    estimated_crop_threads = (2 * configured_movie_workers + effective_crop_jobs) * configured_ffmpeg_threads
     logging.info(
         "Configured parallelism: "
         f"{configured_movie_workers} movie worker(s) x {configured_crop_workers} chamber worker(s) per movie "
-        f"= up to {effective_crop_jobs} concurrent chamber crop jobs; "
-        f"ffmpeg_threads={configured_ffmpeg_threads}, native_threads={configured_native_threads}."
+        f"= up to {effective_crop_jobs} chamber encoders sharing movie decoders; "
+        f"ffmpeg_threads={configured_ffmpeg_threads} per decoder/filter/encoder pool, "
+        f"native_threads={configured_native_threads}."
     )
 
     slurm_cpus = 0
@@ -1110,12 +972,13 @@ def run_pipeline() -> None:
         slurm_cpus = 0
     if slurm_cpus:
         logging.info(f"Detected SLURM_CPUS_PER_TASK={slurm_cpus} for this autocropper command.")
-        # Add movie workers as a small overhead on top of ffmpeg crop threads.
-        estimated_threads = estimated_crop_threads + configured_movie_workers
+        # An indicative pool budget, not a measured peak or a hard CPU bound.
+        estimated_threads = estimated_crop_threads + configured_movie_workers * configured_native_threads
         if estimated_threads > slurm_cpus:
             logging.warning(
                 "Configured autocropper parallelism can exceed CPUs allocated to this swarm subjob: "
-                f"estimated runnable crop/movie threads ~ {estimated_threads}, SLURM_CPUS_PER_TASK={slurm_cpus}. "
+                f"configured decoder/filter/encoder/native pools ~ {estimated_threads} threads "
+                f"plus helper threads, SLURM_CPUS_PER_TASK={slurm_cpus}. "
                 "Reduce --num_workers/--max_workers/--ffmpeg_threads or request more -t CPUs."
             )
     else:
@@ -1131,11 +994,6 @@ def run_pipeline() -> None:
 
     # Load recording database (labeling) if enabled
     _load_recording_db_if_needed()
-
-    # Resolve validation mode after logging is ready. The validator itself is
-    # initialized lazily inside worker processes to avoid parent-process torch
-    # initialization before multiprocessing starts.
-    _prepare_validation_mode()
 
     # Find the processing log (in run_dir)
     log_file = find_processing_log(run_dir)
@@ -1153,6 +1011,14 @@ def run_pipeline() -> None:
     # Get all movie files (full-frame) and apply selection
     all_movie_files = get_movie_files(input_dir)
     selected_movies = _select_movie_files(all_movie_files)
+    for describe, key in (('native', lambda p: p.stem.casefold()),
+                          ('logical', lambda p: Path(original_name(p)).stem.casefold())):
+        seen = {}
+        for movie in selected_movies:
+            name = key(movie)
+            if name in seen and seen[name].resolve() != movie.resolve():
+                raise ValueError(f'Autocropper {describe} movie name collision: {seen[name]}; {movie}')
+            seen[name] = movie
     logging.info(f"Movie selection yielded {len(selected_movies)} candidate movie(s).")
 
     # Validate movie files before processing
@@ -1174,10 +1040,26 @@ def run_pipeline() -> None:
         for m in missing_listed_files[:20]:
             logging.warning(f"  missing: {m}")
 
-    # If there are no valid movies, exit early
+    # A selected-but-unreadable input is a failed run, not an empty successful run.
     if not movie_files:
-        logging.info("No valid movie files found to process. Exiting.")
-        return
+        validation = StageValidationReport.for_items(
+            "autocropper",
+            [str(movie) for movie in selected_movies],
+            metadata={"crop_output_directory": str(crop_output_dir)},
+        )
+        if not selected_movies:
+            validation.add_issue(
+                "no_inputs_selected",
+                "error",
+                "No full-movie inputs matched the requested selection.",
+            )
+        for movie in invalid_movie_files:
+            validation.add_outcome(str(movie), "failed", reason="video could not be opened and decoded")
+        for movie in missing_listed_files:
+            validation.add_outcome(str(movie), "failed", reason="selected movie does not exist")
+        validation.write_run_reports(run_dir / "AUTOCROPPER_VALIDATION.json")
+        validation_details(validation, unit="Movies", output=str(crop_output_dir))
+        validation.raise_for_errors()
 
     # Ensure exclusions.csv has coverage for this subset when required.
     if not _exclusions_optional():
@@ -1185,6 +1067,25 @@ def run_pipeline() -> None:
 
     # Ensure recording DB covers this subset (unless --skip_labeling)
     _require_recording_db_coverage(movie_files)
+
+    # Publish current selections once in the parent, before workers run. Old
+    # crops remain on disk but cannot override an explicit chamber exclusion.
+    selection_records = {}
+    for movie in movie_files:
+        excluded = _excluded_set_for_movie(movie)
+        if recording_db_index is not None and not bool(getattr(args, "skip_labeling", False)):
+            exp, subexp, trial, rpi = _parse_full_movie_identity(movie)
+        for i in range(1, int(args.chamber_columns) * int(args.chamber_rows) + 1):
+            record = {
+                "included": f"chamber{i}" not in excluded,
+            }
+            if record["included"] and recording_db_index is not None and not bool(getattr(args, "skip_labeling", False)):
+                record["label_prefix"] = recording_db_index.get_label_prefix(
+                    experiment=exp, subexperiment=subexp, trial_number=trial,
+                    rpi_number=rpi, chamber_number=i,
+                )
+            selection_records[f"{Path(original_name(movie)).stem}_chamber{i}"] = record
+    write_selection(crop_output_dir, selection_records)
 
     # Add initial entry to pipeline log
     with log_file.open("a") as f:
@@ -1225,12 +1126,6 @@ def run_pipeline() -> None:
         f.write(f"   Crop timeout (s): {int(getattr(args, 'timeout', 600))}\n")
         f.write(f"   Crop CRF: {int(getattr(args, 'crop_crf', 12))}\n")
 
-        validation_enabled = _validation_enabled()
-        f.write(f"   Chamber validation: {'enabled' if validation_enabled else 'disabled'}\n")
-        if validation_enabled:
-            f.write(f"   CNN Model path: {args.model_path}\n")
-            f.write(f"   Normalization params: {args.norm_params_path}\n")
-
         f.write("\n")
         f.write("   Files to process:\n")
         for movie in movie_files:
@@ -1252,16 +1147,16 @@ def run_pipeline() -> None:
     ensure_user_permissions(crop_output_dir)
 
     # Create and set permissions for other directories (in run_dir)
-    validation_dir = run_dir / "validation_results"
     chamber_images_dir = run_dir / "chamber_images"
 
-    for directory in [validation_dir, chamber_images_dir]:
+    for directory in [chamber_images_dir]:
         directory.mkdir(parents=True, exist_ok=True)
         ensure_user_permissions(directory)
 
     # Retry loop
     movies_to_process = movie_files[:]
     max_retries = int(getattr(args, "max_retries", 10))
+    worker_failure = None
 
     for attempt in range(max_retries + 1):
         if not movies_to_process:
@@ -1275,10 +1170,14 @@ def run_pipeline() -> None:
         else:
             logging.info(f"Starting initial processing for {len(movies_to_process)} movies.")
 
-        process_movies_in_parallel(movies_to_process)
+        try:
+            process_movies_in_parallel(movies_to_process)
+        except Exception as exc:
+            worker_failure = f'{type(exc).__name__}: {exc}'
+            logging.exception('Autocropper worker pool failed; stopping automatic retries')
         delete_incomplete_files(
             crop_output_dir,
-            movie_stems=[Path(m).stem for m in movie_files],
+            movie_stems=[Path(original_name(m)).stem for m in movie_files],
             min_partial_age_seconds=int(getattr(args, "partial_cleanup_min_age_sec", 3600)),
         )
 
@@ -1290,11 +1189,13 @@ def run_pipeline() -> None:
             f"{len(verified_incomplete)} still incomplete."
         )
         movies_to_process = verified_incomplete
+        if worker_failure is not None:
+            break
 
     logging.info("-" * 50)
 
     if not movies_to_process:
-        logging.info("✓ All movies processed successfully.")
+        logging.info("All required crops are present; completing final checks.")
     else:
         logging.error(f"Processing finished, but hit max retry limit ({max_retries}).")
         logging.error("The following movies failed permanently:")
@@ -1303,9 +1204,8 @@ def run_pipeline() -> None:
 
     summarize_results(run_dir, movie_names=[Path(m).name for m in movie_files])
 
-    # ------------------------------------------------------------------
     # Project registry update (single CSV at project root)
-    # ------------------------------------------------------------------
+    registry_error: str | None = None
     try:
         if cfg is not None and bool(getattr(cfg, "registry_enabled", False)):
             reg_csv = cfg.resolved_registry_csv()
@@ -1326,5 +1226,56 @@ def run_pipeline() -> None:
                     lock_timeout_sec=int(getattr(cfg, "registry_lock_timeout_sec", 120)),
                     lock_stale_sec=int(getattr(cfg, "registry_lock_stale_sec", 60 * 60)),
                 )
-    except Exception:
+    except Exception as exc:
+        registry_error = str(exc)
         logging.exception("Registry update failed (autocropper)")
+
+    validation = StageValidationReport.for_items(
+        "autocropper",
+        [str(movie) for movie in selected_movies],
+        metadata={
+            "crop_output_directory": str(crop_output_dir),
+            "recording_database": str(recording_db_path) if recording_db_path else None,
+        },
+    )
+    incomplete = {str(movie) for movie in movies_to_process}
+    invalid = {str(movie) for movie in invalid_movie_files}
+    missing = {str(movie) for movie in missing_listed_files}
+    expected_chambers = int(args.chamber_columns) * int(args.chamber_rows)
+    for movie in selected_movies:
+        item = str(movie)
+        if item in missing:
+            validation.add_outcome(item, "failed", reason="selected movie does not exist")
+        elif item in invalid:
+            validation.add_outcome(item, "failed", reason="video could not be opened and decoded")
+        elif item in incomplete:
+            validation.add_outcome(
+                item,
+                "failed",
+                reason="one or more required chamber crops remain incomplete after retries",
+            )
+        else:
+            excluded = _excluded_set_for_movie(movie)
+            deliberately_empty = len(excluded) >= expected_chambers
+            validation.add_outcome(
+                item,
+                "excluded" if deliberately_empty else "succeeded",
+                reason="all chambers excluded by recording metadata or MovieChecker"
+                if deliberately_empty
+                else None,
+                details={"excluded_chambers": sorted(excluded)},
+            )
+    if registry_error is not None:
+        validation.add_issue(
+            "registry_update_failed",
+            "error",
+            "Autocropper outputs were created, but the project registry could not be updated.",
+            details={"error": registry_error},
+        )
+    if worker_failure is not None:
+        validation.add_issue('worker_pool_failed', 'error',
+            'A worker process failed; completed crops were checked and automatic retries stopped.',
+            details={'error': worker_failure})
+    validation.write_run_reports(run_dir / "AUTOCROPPER_VALIDATION.json")
+    validation_details(validation, unit="Movies", output=str(crop_output_dir))
+    validation.raise_for_errors()

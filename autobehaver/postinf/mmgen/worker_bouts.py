@@ -1,12 +1,5 @@
-"""Bout extraction helpers for the mmgen worker.
-
-This module centralizes the logic that converts per-frame labels into bout
-structures for:
-- Pose-only
-- Orient-only
-- Pose+Orient
-
-The helper centralizes bout construction and valid-label arrays for worker jobs.
+"""Build MMGen pose, orientation, and combined bouts and their valid per-frame label
+arrays.
 """
 
 from __future__ import annotations
@@ -17,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .bouts import extract_bouts_from_label_sequence, _build_valid_label_array_from_bouts
+from .categories import POSE_LABELS, ORIENT_LABELS, validate_labels
 
 
 def build_bouts_and_valid_arrays(
@@ -28,6 +22,16 @@ def build_bouts_and_valid_arrays(
     num_frames: int,
 ):
     """Build bout lists and corresponding "valid" per-frame label arrays."""
+    if len(masked_poses) != num_frames or (has_orient and (masked_orients is None or len(masked_orients) != num_frames)):
+        raise ValueError('Behavior/orientation timelines must match num_frames.')
+    validate_labels(masked_poses, POSE_LABELS, category='Pose')
+    if not any(pd.notna(x) and str(x) != '' for x in masked_poses):
+        raise ValueError('Recording contains no observed behavior labels; unknown data cannot be certified as zero events.')
+    if has_orient:
+        validate_labels(masked_orients, ORIENT_LABELS, category='Orient')
+        observed_poses = {str(x) for x in masked_poses if pd.notna(x) and str(x) != ''}
+        if not any(pd.notna(x) and str(x) != '' for x in masked_orients) and not observed_poses.issubset({'Jump','Scramble'}):
+            raise ValueError('Present orientation column contains no observed labels; remove an unavailable column or supply valid data.')
 
     # Category 1: Pose-Only
     pose_bouts = extract_bouts_from_label_sequence(masked_poses, min_bout, exempt_labels={"Jump"})
@@ -35,13 +39,13 @@ def build_bouts_and_valid_arrays(
     # Category 2: Pose+Orient
     pose_orient_bouts = []
     if has_orient and masked_orients is not None:
-        temp_masked_poses = pd.Series(masked_poses).replace({"Jump": np.nan, "Scramble": np.nan})
         pose_orient_seq = [
-            f"{p} + {o}" if pd.notna(p) and pd.notna(o) else np.nan
-            for p, o in zip(temp_masked_poses, masked_orients)
+            (str(p) if pd.notna(p) and p in ('Jump', 'Scramble') else f"{p} + {o}"
+             if pd.notna(p) and p != '' and pd.notna(o) and o != '' else np.nan)
+            for p, o in zip(masked_poses, masked_orients)
         ]
         pose_orient_bouts_raw = extract_bouts_from_label_sequence(pose_orient_seq, min_bout)
-        pose_orient_bouts = [b for b in pose_orient_bouts_raw if "nan" not in str(b["label"])]
+        pose_orient_bouts = [b for b in pose_orient_bouts_raw if "+" in str(b["label"]) and "nan" not in str(b["label"])]
 
     # Category 3: Orient-Only
     orient_bouts = []

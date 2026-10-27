@@ -1,24 +1,8 @@
-"""Weighted SHAP aggregation from saved fold-models.
+"""Aggregate positive-class SHAP from complete saved specialist subsets using subset
+weights.
 
-This module complements the logit-based prediction aggregation:
-
-* Logits/predictions are aggregated using subset-level weights.
-* SHAP values use the same subset-level weights so feature importance is
-  consistent with the weighted ensemble.
-
-Design goals
-------------
-* Correctness-first: weighting is applied at the *subset* level.
-* Equitable philosophy preserved: a feature is only updated when it is present
-  in a subset; denominators are feature-specific.
-* Robustness: incomplete subsets (missing any fold model) contribute **nothing**.
-
-Notes
------
-- This function operates on the saved fold-models referenced in the committee
-  performance records.
-- For binary problems, we aggregate SHAP values for the positive class
-  (index=1 by convention in this pipeline).
+Normalize each feature by its own contributing weights; incomplete subsets contribute
+nothing.
 """
 
 from __future__ import annotations
@@ -27,10 +11,12 @@ import os
 from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
+from .integrity import strict_bool
 import pandas as pd
 import xgboost as xgb
 
 from .shap_compat import make_tree_explainer
+from .logit_ensemble import load_classifier_model
 
 
 def _coerce_shap_array(shap_values: Any, positive_class_index: int = 1) -> np.ndarray:
@@ -51,6 +37,17 @@ def _coerce_shap_array(shap_values: Any, positive_class_index: int = 1) -> np.nd
         shap_values = shap_values[positive_class_index]
     return np.asarray(shap_values)
 
+
+
+def _record_features(record):
+    features = record.get("specialist_features")
+    if features is None:
+        features = record.get("features")
+    if features is None:
+        return []
+    if isinstance(features, str):
+        return [features]
+    return list(features)
 
 def compute_weighted_shap_from_saved_models(
     *,
@@ -114,41 +111,36 @@ def compute_weighted_shap_from_saved_models(
 
     feat_to_idx = {str(f): i for i, f in enumerate(all_feature_names)}
 
-    # ------------------------------------------------------------------
     # Group fold records by subset.
-    # ------------------------------------------------------------------
     subset_to_entry: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for rec in performance_records:
         if not isinstance(rec, Mapping):
             continue
         try:
-            if skip_permuted and bool(rec.get("is_permuted", False)):
+            if skip_permuted and strict_bool(rec.get("is_permuted", False)):
                 continue
 
             h_hit = int(rec.get("h_hit"))
             subset_idx = int(rec.get("subset_idx"))
             fold_idx = int(rec.get("fold_idx"))
-        except Exception:
-            continue
+        except Exception as exc:
+            raise ValueError("Invalid saved-model SHAP task identity") from exc
 
         key = (h_hit, subset_idx)
         entry = subset_to_entry.get(key)
         if entry is None:
-            feats = rec.get("specialist_features")
-            if feats is None:
-                feats = rec.get("features")
-            if isinstance(feats, (pd.Index, np.ndarray, tuple)):
-                feats = list(feats)
-            if not isinstance(feats, list):
-                feats = list(feats) if feats is not None else []
+            feats = _record_features(rec)
             entry = {"features": list(feats), "model_paths": {}}
             subset_to_entry[key] = entry
 
+        if fold_idx in entry["model_paths"]:
+            raise ValueError("Duplicate saved-model SHAP fold identity")
+        current_features = _record_features(rec)
+        if current_features != entry["features"]:
+            raise ValueError("Saved-model SHAP feature order differs across folds")
         entry["model_paths"][fold_idx] = rec.get("model_path")
 
-    # ------------------------------------------------------------------
     # Allocate accumulators.
-    # ------------------------------------------------------------------
     oof_sum = np.zeros((n_train, n_features), dtype=np.float32)
     insample_sum = np.zeros((n_train, n_features), dtype=np.float32)
     all_sum = np.zeros((n_all, n_features), dtype=np.float32)
@@ -167,20 +159,20 @@ def compute_weighted_shap_from_saved_models(
 
     for (h_hit, subset_idx), entry in subset_to_entry.items():
         w = float(subset_weights.get((h_hit, subset_idx), 0.0))
-        if not np.isfinite(w) or w <= 0.0:
+        if not np.isfinite(w) or w < 0:
+            raise ValueError("Subset weights must be nonnegative finite")
+        if w == 0.0:
             n_subsets_skipped_zero_w += 1
             continue
 
         features = list(entry.get("features") or [])
         if not features:
-            n_subsets_skipped_incomplete += 1
-            continue
+            raise ValueError(f"Positive-weight subset {(h_hit, subset_idx)} has no features")
 
         # Validate folds
         folds = fold_indices_by_h_hit.get(h_hit)
         if folds is None or len(folds) != n_splits:
-            n_subsets_skipped_incomplete += 1
-            continue
+            raise ValueError(f"Positive-weight subset {(h_hit, subset_idx)} lacks its complete fold plan")
 
         # Validate model paths for ALL folds upfront.
         model_paths = dict(entry.get("model_paths") or {})
@@ -191,15 +183,15 @@ def compute_weighted_shap_from_saved_models(
                 missing_model = True
                 break
         if missing_model:
-            n_subsets_skipped_incomplete += 1
-            continue
+            raise ValueError(f"Positive-weight subset {(h_hit, subset_idx)} lacks a required saved model")
 
         # Map subset features to global indices.
         try:
             feat_idxs = np.fromiter((feat_to_idx[f] for f in features), dtype=np.int64)
-        except Exception:
-            n_subsets_skipped_incomplete += 1
-            continue
+        except Exception as exc:
+            raise ValueError(f"Positive-weight subset {(h_hit, subset_idx)} references an absent feature") from exc
+        if len(set(feat_idxs.tolist())) != len(feat_idxs):
+            raise ValueError("Subset contains duplicate feature identities")
 
         # Extract subset feature matrix once.
         X_sub = X_all_groups[features]
@@ -217,8 +209,7 @@ def compute_weighted_shap_from_saved_models(
                 model_path = model_paths.get(fold_idx)
                 # model_path existence validated above
 
-                model = xgb.XGBClassifier()
-                model.load_model(str(model_path))
+                model = load_classifier_model(str(model_path))
                 n_models_loaded += 1
 
                 explainer = make_tree_explainer(model)
@@ -232,6 +223,8 @@ def compute_weighted_shap_from_saved_models(
                     raise ValueError(
                         f"Unexpected SHAP shape {shap_vals.shape}; expected ({n_all}, {len(feat_idxs)})"
                     )
+                if not np.isfinite(shap_vals).all():
+                    raise ValueError("Required saved-model SHAP values are nonfinite")
 
                 train_idx, test_idx = folds[fold_idx]
 
@@ -242,8 +235,8 @@ def compute_weighted_shap_from_saved_models(
                 shap_train = shap_vals[:n_train, :]
                 local_oof[test_idx, :] += np.float32(w) * shap_train[test_idx, :]
                 local_ins[train_idx, :] += np.float32(w) * shap_train[train_idx, :]
-        except Exception:
-            subset_ok = False
+        except Exception as exc:
+            raise RuntimeError(f'Failed to read/evaluate required positive-weight subset {(h_hit, subset_idx)}') from exc
 
         if not subset_ok:
             n_subsets_skipped_incomplete += 1
@@ -264,9 +257,9 @@ def compute_weighted_shap_from_saved_models(
                 f"(skipped_zero_w={n_subsets_skipped_zero_w}, skipped_incomplete={n_subsets_skipped_incomplete})"
             )
 
-    # ------------------------------------------------------------------
     # Normalize.
-    # ------------------------------------------------------------------
+    if not np.isfinite(total_weight_sum) or total_weight_sum <= 0:
+        raise ValueError("No positive-weight complete SHAP committee is available")
     denom = feature_weight_sums.astype(np.float32, copy=False)
     denom_safe = np.where(denom > 0, denom, 1.0).astype(np.float32)
 
