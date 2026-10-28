@@ -14,6 +14,10 @@ jobs:
       AUTOBEHAVER_TEST_SCIENCE: "1"
     steps:
       - uses: actions/checkout@v5
+      - name: Install Linux Qt runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -29,6 +33,9 @@ jobs:
           python -m pip install -r environment/requirements-local-core.txt
           python -m pip install -e ".[dev,monitoring,desktop]"
           python -m pip check
+      - name: Check headless Qt startup
+        run: |
+          python -c "from PySide6.QtWidgets import QApplication, QWidget; app = QApplication([]); widget = QWidget(); app.processEvents(); print('Qt platform:', app.platformName()); widget.close(); app.quit()"
       - name: Compile and test with coverage
         run: |
           python -m compileall -q autobehaver tests

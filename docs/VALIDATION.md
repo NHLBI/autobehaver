@@ -15,6 +15,9 @@ python -m pytest -q
 
 On a Linux machine without a display, set `QT_QPA_PLATFORM=offscreen` before
 running the suite so GUI checks can create their windows without a desktop.
+Qt also needs system libraries even in offscreen mode. On Debian/Ubuntu, an
+import error naming `libEGL.so.1` is resolved with `sudo apt-get install libegl1`;
+installing the Python desktop extra does not install this system package.
 
 The tests cover input contracts, frame alignment, scientific calculations,
 parallel execution, interrupted processing, output reuse, and job preparation.

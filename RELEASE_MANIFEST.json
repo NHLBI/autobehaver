@@ -7,7 +7,7 @@
     "SHA256SUMS"
   ],
   "file_count": 471,
-  "bytes": 6173893,
+  "bytes": 6174533,
   "python_modules_parsed": 426,
   "files": [
     {
@@ -17,8 +17,8 @@
     },
     {
       "path": ".github/workflows/ci.yml",
-      "bytes": 2529,
-      "sha256": "1193bf37893e933a80d352c2a5e921be8b85de9d7fdfdadd066533936d08493f"
+      "bytes": 2938,
+      "sha256": "2cddea0c343b539d7ea9b3ddd946e00526a186535849aad4da1c219e090c6967"
     },
     {
       "path": ".gitignore",
@@ -1387,8 +1387,8 @@
     },
     {
       "path": "docs/VALIDATION.md",
-      "bytes": 5249,
-      "sha256": "9a2fbcaccb922191c589927626fc776d1332470cd17fbd917741d446a4670b81"
+      "bytes": 5480,
+      "sha256": "89f2d250457e48dc8d6986cdd0a4125aba738c471f5399007b1b14a8e1e4adff"
     },
     {
       "path": "docs/featureimp-desktop.md",
