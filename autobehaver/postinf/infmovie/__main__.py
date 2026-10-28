@@ -1,9 +1,4 @@
-"""Module entrypoint for infmovie.
-
-Allows running inference-overlay movie generation via:
-
-    python -m autobehaver.postinf.infmovie ...
-"""
+"""Run the InfMovie command-line interface."""
 
 from .cli import main
 

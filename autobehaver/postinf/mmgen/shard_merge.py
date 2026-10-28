@@ -1,18 +1,12 @@
-"""Shard merge utilities for mmgen.
+"""Verify and stream MMGen shard stores into a consolidated HDF5 store.
 
-This module implements a *safe, deterministic* merge of multiple shard
-`temp_store.h5` files into a single consolidated store.
-
-It is designed to be used after running mmgen in `--process_only` mode with
-`--num_shards > 1`.
-
-Key goals:
-  - No unbounded RAM usage (stream large HDF tables in chunks).
-  - Guard against accidental double-counting (detect duplicate source_file).
-  - Use an atomic write pattern for the merged store.
+Reject active or overlapping shards and publish the verified store with its calculation
+identity.
 """
 
 from __future__ import annotations
+
+from autobehaver.progress import progress
 
 import json
 import os
@@ -25,7 +19,12 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import pandas as pd
 
+from autobehaver.atomic_io import atomic_write_json, sha256_file
+from .integrity import STORE_IDENTITY_FILENAME, content_hash, validate_commits, read_store_identity
 from .hdf_store import HDF_KEYS, get_done_source_files, hdf_safe_append, open_store
+from .recording_commits import append_recording_commits, read_recording_commits
+from .locks import shard_lock_active
+from .cohort import read_shard_cohort, verify_shard_membership
 
 
 def _active_shard_locks(
@@ -35,7 +34,7 @@ def _active_shard_locks(
     work_dirname: str = "_mmgen_work",
     lock_dirname: str = "_mmgen_shard.lock",
 ) -> List[str]:
-    """Return any active shard lock directories under the shard root.
+    """Return shard locks held by live writers under the shard root.
 
     We deliberately scan by shard index directories (shard_XXX_of_YYY) rather
     than only checking shard stores that already exist. This catches the case
@@ -48,7 +47,7 @@ def _active_shard_locks(
     for i in range(int(num_shards)):
         shard_dir = root / _default_shard_dir_name(i, int(num_shards))
         lock_dir = shard_dir / work_dirname / lock_dirname
-        if lock_dir.exists():
+        if shard_lock_active(lock_dir):
             active.append(str(lock_dir))
     return active
 
@@ -194,6 +193,7 @@ def validate_shard_done_markers(
     """
 
     root = Path(str(shards_root))
+    cohort = read_shard_cohort(root, int(num_shards))
     missing_done: list[int] = []
     bad_done: list[str] = []
 
@@ -223,6 +223,18 @@ def validate_shard_done_markers(
             bad_done.append(
                 f"{done_path} reports shard_index={payload.get('shard_index')} (expected {i})"
             )
+
+        identity = read_store_identity(shard_dir / work_dirname)
+        manifest_path = shard_dir / work_dirname / 'SHARD_MANIFEST.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else None
+        verify_shard_membership(cohort, i, markers=[manifest, payload], sources=identity['sources'])
+        if payload.get('temp_store_sha256') != sha256_file(store_path):
+            raise RuntimeError(f'Changed shard store: {store_path}')
+        if payload.get('calculation_sha256') != identity['calculation_sha256'] or payload.get('sources_sha256') != identity['sources_sha256']:
+            raise RuntimeError(f'Changed shard identity: {shard_dir}')
+        done = validate_commits(store_path, identity)
+        if done != set(identity['sources']) or len(done) != int(payload.get('n_committed_files', -1)):
+            raise RuntimeError(f'Incomplete shard source inventory: {shard_dir}')
 
         if require_full_commit:
             n_selected = payload.get("n_inference_files_selected", None)
@@ -285,12 +297,12 @@ def merge_shard_temp_stores(
     merged_store_name: str = "temp_store.h5",
     chunk_rows: int = 50_000,
     strict_missing: bool = False,
+    verified_store_identities: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Merge shard stores into a single consolidated temp_store.h5.
+    """Verify and merge completed shard stores using bounded table reads.
 
-    The merged store is written *atomically* into `output_folder/merged_store_name`.
-    If an existing merged store is present, it is first renamed to a timestamped
-    backup.
+    Copy and verify an existing destination as a timestamped backup before atomically
+    replacing it. Publish the merged calculation identity for finalization checks.
     """
 
     output_folder = str(Path(output_folder).expanduser().resolve())
@@ -323,18 +335,16 @@ def merge_shard_temp_stores(
         )
 
     # Safety: refuse to merge while any shard appears to still be running.
-    # (Shard jobs create a _mmgen_work/_mmgen_shard.lock directory and only
-    # remove it on successful completion.)
+    # Probe actual ownership; a persistent OS lock file is harmless after exit.
     active_locks = _active_shard_locks(shards_root=disc.shards_root, num_shards=resolved_num_shards)
     if active_locks:
         preview = "\n".join(f"  - {p}" for p in active_locks[:20])
         raise RuntimeError(
             "[mmgen-merge] Active shard lock(s) detected. One or more shard jobs may still be running, "
-            "or a shard crashed and left a stale lock.\n\n"
-            "Lock directories found:\n"
+            "or an older directory lock has an unverified owner.\n\n"
+            "Held locks found:\n"
             f"{preview}\n\n"
-            "Fix: wait for shard jobs to finish, or (if you are sure no shard job is running) delete the lock "
-            "directory/directories and retry the merge."
+            "Wait for live shard jobs to finish. Completed-shard records are still required before merge."
         )
 
     # Safety: require all requested shards to have completed cleanly before merge.
@@ -344,63 +354,64 @@ def merge_shard_temp_stores(
         require_full_commit=True,
     )
 
+    verified_shards = [(str(path), sha256_file(path)) for path in progress(store_paths, desc='MMGen checking shard hashes')]
+
     # Safety: prevent accidental overlap.
     _check_no_duplicate_source_files(store_paths)
 
     merged_path = os.path.join(output_folder, merged_store_name)
 
-    # If a merged store already exists, back it up rather than clobbering.
-    if os.path.exists(merged_path):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(output_folder, f"{Path(merged_store_name).stem}_premerge_{ts}.h5")
-        print(f"[mmgen-merge] Existing merged store found. Moving to backup: {backup_path}")
-        os.replace(merged_path, backup_path)
-
-    tmp_path = merged_path + ".tmp"
+    # Validate all shard calculation identities and collect exact source content.
+    calculation = None
+    sources = {}
+    for path in store_paths:
+        identity = read_store_identity(Path(path).parent/'_mmgen_work')
+        if calculation is None:
+            calculation = identity['calculation']
+        elif calculation != identity['calculation']:
+            raise RuntimeError('Shard scientific settings or source code differ')
+        overlap = set(sources).intersection(identity['sources'])
+        if overlap:
+            raise RuntimeError(f'Duplicate shard sources: {sorted(overlap)[:10]}')
+        sources.update(identity['sources'])
+    cohort = read_shard_cohort(disc.shards_root, resolved_num_shards)
+    if set(sources) != {record['source_file'] for record in cohort['files']}:
+        raise RuntimeError('Shard stores do not cover the complete frozen cohort.')
+    merged_identity = {'calculation':calculation, 'calculation_sha256':content_hash(calculation),
+                       'sources':sources, 'sources_sha256':content_hash(sources)}
+    tmp_path = merged_path + '.tmp'
     if os.path.exists(tmp_path):
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-    # Start by copying the first shard store to preserve table schemas.
-    base = store_paths[0]
-    print(f"[mmgen-merge] Using base shard store: {base}")
-    shutil.copy2(base, tmp_path)
-
-    keys = list(HDF_KEYS.values())
-
-    # Append remaining shards.
-    with open_store(tmp_path, mode="a") as dst:
-        for src_path in store_paths[1:]:
-            print(f"[mmgen-merge] Merging shard store: {src_path}")
-            with open_store(src_path, mode="r") as src:
-                for key in keys:
-                    if key not in src:
-                        continue
-                    try:
-                        it = src.select(key, iterator=True, chunksize=int(chunk_rows))
-                        for chunk in it:
-                            if chunk is None or chunk.empty:
-                                continue
-                            hdf_safe_append(dst, key, chunk)
-                    except (ValueError, KeyError, FileNotFoundError):
-                        # Fallback to full read (best-effort) if chunk iterator fails.
-                        try:
-                            df = src.select(key)
-                            if df is not None and not df.empty:
-                                hdf_safe_append(dst, key, df)
-                        except Exception:
-                            continue
-
-    # Basic sanity check: merged commit table must exist.
+        os.remove(tmp_path)
     try:
-        done = get_done_source_files(tmp_path)
-        print(f"[mmgen-merge] Merged temp store now contains {len(done)} committed source files.")
-    except Exception:
-        pass
-
-    # Atomic finalize.
-    os.replace(tmp_path, merged_path)
-    print(f"[mmgen-merge] Wrote merged temp store: {merged_path}")
+        shutil.copy2(store_paths[0], tmp_path)
+        with open_store(tmp_path, mode='a') as dst:
+            for src_path in progress(store_paths[1:], desc='MMGen merging shard stores'):
+                with open_store(src_path, mode='r') as src:
+                    for key in HDF_KEYS.values():
+                        if key == HDF_KEYS['video_lengths_tmp'] or key not in src:
+                            continue
+                        # Never append a full-read fallback after a partial stream.
+                        for chunk in src.select(key, iterator=True, chunksize=int(chunk_rows)):
+                            if chunk is not None and not chunk.empty:
+                                hdf_safe_append(dst, key, chunk)
+                    append_recording_commits(dst, read_recording_commits(src))
+            dst.flush(fsync=True)
+        if validate_commits(tmp_path, merged_identity) != set(sources):
+            raise RuntimeError('Merged store does not contain exact verified sources')
+        if os.path.exists(merged_path):
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            backup = Path(output_folder)/f'{Path(merged_store_name).stem}_premerge_{stamp}.h5'
+            shutil.copy2(merged_path, backup)
+            if sha256_file(backup) != sha256_file(merged_path):
+                raise RuntimeError('Merged store backup verification failed')
+        # An interruption between store and identity leaves an identity mismatch;
+        # finalize refuses reuse rather than accepting a mixed generation.
+        os.replace(tmp_path, merged_path)
+        identity_path = Path(output_folder)/'_mmgen_work'/STORE_IDENTITY_FILENAME
+        atomic_write_json(merged_identity, identity_path)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    if verified_store_identities is not None:
+        verified_store_identities.extend(verified_shards)
+        verified_store_identities.append((merged_path, sha256_file(merged_path)))
     return merged_path

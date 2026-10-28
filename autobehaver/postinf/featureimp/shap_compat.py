@@ -1,18 +1,7 @@
-"""Compatibility helpers for SHAP + XGBoost interactions in FeatureImp.
+"""Handle supported SHAP and XGBoost representation differences.
 
-Why this exists
----------------
-SHAP versions prior to the upstream fix for XGBoost >= 3.1 can fail when
-``TreeExplainer`` inspects a booster whose serialized ``base_score`` is stored
-in list-like form, e.g. ``"[5E-1]"``.  FeatureImp constructs SHAP explainers in
-multiple places (prereq checks, worker-time SHAP, and saved-model weighted SHAP
-reaggregation), so we centralize the workaround here.
-
-The workaround is intentionally narrow:
-- patch only SHAP's UBJSON decode path used by the XGBoost tree loader;
-- normalize only ``learner.learner_model_param.base_score``;
-- leave newer SHAP versions effectively unchanged (the patch is idempotent and
-  harmless when the upstream parser already supports list-like values).
+Normalize list-form XGBoost base scores in the SHAP UBJSON loader and supply the NumPy
+alias required by older SHAP releases.
 """
 
 from __future__ import annotations

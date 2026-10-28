@@ -1,13 +1,9 @@
-"""Naming helpers for infmovie.
-
-The inference-movie overlay workflow needs to match inference CSVs to the
-corresponding source movie files. This module contains filename-key extraction
-helpers used for that matching.
-"""
+"""Extract source-movie keys from inference CSV filenames for InfMovie matching."""
 
 from __future__ import annotations
 
 import os
+from autobehaver.portable_paths import original_name
 import re
 
 
@@ -18,7 +14,7 @@ def extract_inf_csv_filename_part(inf_csv_file_path: str) -> str:
     """
 
     # Extract the base name of the file (no directory).
-    base_name = os.path.basename(inf_csv_file_path)
+    base_name = original_name(inf_csv_file_path)
     # Strip the .csv extension if present to simplify downstream operations.
     if base_name.lower().endswith(".csv"):
         base_name = base_name[:-4]

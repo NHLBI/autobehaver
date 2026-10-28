@@ -1,9 +1,8 @@
-"""Supervised training pipeline for pose/orientation prediction.
-
-Contains data preparation, training/validation loops, AMP + gradient clipping, checkpointing,
-scheduler stepping, and early stopping logic."""
+"""Prepare supervised PosePred data and run training, validation and checkpointing."""
 
 from __future__ import annotations
+
+from autobehaver.progress import progress
 
 import os
 import time
@@ -18,18 +17,21 @@ from torch.amp import GradScaler
 from torch.optim.lr_scheduler import LinearLR, ReduceLROnPlateau, SequentialLR
 from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import DataLoader, Subset
+from .window_index import WindowInstructions, close_feature_stores
 from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
 from .constants import MEMORY_CLEANUP_EVERY_EPOCHS, STANDARD_WEIGHT_INIT_POLICY
+from .resource_monitor import record_work
 from .model import PosePredTransformer
-from .schedulers import InverseSquareRootDecayScheduler, CosineAnnealingScheduler, LinearAnnealingScheduler
-from .datasets import KeypointsDataset, build_dataloader
+from .schedulers import InverseSquareRootDecayScheduler, CosineAnnealingScheduler, LinearAnnealingScheduler, EpochCosineScheduler
+from .datasets import KeypointsDataset, build_dataloader, validate_supervised_training_metadata
 from .augmentation import augment_features, select_columns_for_augmentation
 from .losses import calculate_class_weights, masked_mse_loss
-from .checkpoint import load_checkpoint_model, save_checkpoint, is_pretrain_checkpoint_dict, is_pretrain_checkpoint_path, set_checkpoint_globals, build_checkpoint_global_vars
+from .checkpoint import load_checkpoint_model, save_checkpoint, atomic_save_checkpoint, is_pretrain_checkpoint_dict, is_pretrain_checkpoint_path, set_checkpoint_globals, build_checkpoint_global_vars, validate_supervised_class_schema
 from .records import setup_records_file, setup_confusion_matrix_files, log_epoch_results, log_confusion_matrix, log_wandb_metrics
 from .utils import cleanup_memory, print_gpu_memory_summary
+from .training_identity import build_training_data_identity, validate_training_data_identity
 
 if TYPE_CHECKING:  # pragma: no cover
     from .feature_selection import FeaturePlan
@@ -41,7 +43,7 @@ DEFAULT_SWA_ANNEAL_EPOCHS: int = 10
 
 
 def _default_swa_anneal_epochs(swa_epochs: int) -> int:
-    """Return a sensible SWA annealing window for the given tail length."""
+    """Return the bounded annealing window for an SWA tail."""
     return max(1, min(int(swa_epochs), int(DEFAULT_SWA_ANNEAL_EPOCHS)))
 
 
@@ -91,11 +93,7 @@ def _extract_training_runtime_state(
     total_time_optimizer_step: float,
     total_inputs: int,
 ) -> dict:
-    """Serialize non-model runtime state needed for accurate supervised resume.
-
-    This keeps early stopping, best-checkpoint bookkeeping, and running timing aggregates
-    consistent across interrupted/resumed runs.
-    """
+    """Serialize early stopping, best-checkpoint bookkeeping and timing aggregates."""
     return {
         'best_val_loss': float(best_val_loss),
         'best_pose_macro_f1': float(best_pose_macro_f1),
@@ -166,6 +164,18 @@ def _select_primary_validation_metric(
     return -float(val_total_loss_avg), 'val_total_loss'
 
 
+def _base_movie_identity(directory, filename):
+    """Group augmented siblings by their normalized parent path and base filename."""
+    from pathlib import Path
+    path = (Path(directory) / str(filename).replace('\\', '/')).resolve()
+    for prefix in ('original_', 'rotated90_', 'rotated180_', 'rotated270_',
+                   'mirrored_', 'mirrored90_', 'mirrored180_', 'mirrored270_'):
+        if path.name.startswith(prefix):
+            path = path.with_name(path.name[len(prefix):])
+            break
+    return os.path.normcase(str(path))
+
+
 def prepare_data(
     directory: str,
     metadata: pd.DataFrame,
@@ -181,90 +191,45 @@ def prepare_data(
     noval: bool = False,
     feature_plan: Optional["FeaturePlan"] = None,
     ablation_strict: bool = True,
+    restart_optimizer: bool = False,
+    preserve_checkpoint_split: bool = True,
 ) -> tuple[
                      Subset, Subset, Optional[dict[str, int]], Optional[dict[str, int]], 
-                     list[int], torch.Tensor, torch.Tensor, dict[str, list[str]]]:
-    """
-    Prepares comprehensive training and validation datasets with intelligent data splitting and preprocessing.
-    
-    This function orchestrates the complete data preparation pipeline for transformer training, handling
-    file validation, dataset creation, train/validation splitting, checkpoint resume logic, and class
-    weight calculation. It supports both predefined splits and intelligent movie-based grouping to
-    prevent data leakage between augmented versions of the same video.
-    
-    Data Preparation Pipeline:
-    1. **File Validation**: Validates existence of data and label files from metadata
-    2. **Dataset Creation**: Initializes KeypointsDataset with all valid sequences
-    3. **Split Management**: Handles checkpoint resuming and orphan file assignment
-    4. **Intelligent Splitting**: Groups augmented movie versions to prevent leakage
-    5. **Index Mapping**: Maps filenames to dataset instruction indices
-    6. **Preprocessing Setup**: Determines augmentation columns and calculates class weights
-    7. **Checkpointing Preparation**: Packages split information for robust resuming
-    
-    Splitting Logic:
-    - **Defined Split**: Uses 'set' column from metadata ('train'/'val' values)
-    - **Random Split**: Groups by base movie name to keep augmentations together
-    - **Checkpoint Resume**: Preserves existing splits and handles new files
-    - **Handoff Detection**: Recognizes pretraining-to-finetuning transitions
-    
-    Parameters:
-    - directory: Path to directory containing HDF5 data and label files.
-    - metadata: DataFrame with 'filename', 'labels', and optionally 'set' columns.
-    - sequence_length: Number of frames in each training sequence.
-    - pretrained_model_path: Optional path to checkpoint for split resume and handoff detection.
-    - pose_pred: Whether to enable pose classification prediction head.
-    - orient_pred: Whether to enable orientation classification prediction head.
-    - recon: Whether to enable sequence reconstruction objective.
-    - max_class_weight: Maximum class weight to prevent over-weighting rare classes.
-    - defined_split: Whether to use predefined train/val split from metadata 'set' column.
-    
-    Returns:
-    - train_dataset: Subset containing training sequences with augmentation support.
-    - val_dataset: Subset containing validation sequences for evaluation.
-    - pose_dict: Dictionary mapping pose class names to integer indices (None if pose_pred=False).
-    - orient_dict: Dictionary mapping orientation class names to integer indices (None if orient_pred=False).
-    - columns_to_noise: List of column indices for noise augmentation.
-    - train_class_weights: Tensor of sample weights for training class balance.
-    - val_class_weights: Tensor of sample weights for validation consistency.
-    - split_filenames: Dictionary with 'train_filenames' and 'val_filenames' lists for checkpointing.
-    
-    Notes:
-    - Handles missing files gracefully with warnings
-    - Prevents data leakage by grouping augmented movie versions
-    - Supports seamless checkpoint resuming and pretraining handoffs
-    - Calculates class weights to handle imbalanced datasets effectively
+                     list[int], torch.Tensor, torch.Tensor, dict[str, object]]:
+    """Prepare validated supervised windows, class mappings and file splits.
+
+    Use metadata-defined splits or group augmented versions by base movie for
+    a random split. True resume requires unchanged input contents and retains
+    saved splits. Supervised weights-only restarts also retain the saved split;
+    pretraining handoff and training-only LR sweeps use current splits. Explicit
+    noval training combines all files. Class weights use training-window frequencies only. Return train/val
+    subsets, class dictionaries, augmentation indices, global-index weight
+    tensors and split/input-identity metadata.
     """
     start_time = time.time()
+    if pretrained_model_path and not os.path.isfile(pretrained_model_path):
+        raise FileNotFoundError(f'Requested checkpoint does not exist: {pretrained_model_path}')
 
-    # This helper prepares *training* and *validation* datasets. It is not used for inference.
     inference_mode = False
-    # Pretraining uses a different codepath; here we assume supervised training/fine-tuning.
     pretrain_mode = False
 
-    # Step 1: Gather usable files from metadata
-    valid_rows = []
-    missing_files = []
-    missing_labels = []
-    for idx, row in metadata.iterrows():
-        data_path = os.path.join(directory, row['filename'])
-        label_path = os.path.join(directory, row['labels']) if 'labels' in row and not pd.isna(row['labels']) else None
-        data_exists = os.path.isfile(data_path)
-        label_exists = os.path.isfile(label_path) if label_path else True
-        if data_exists and label_exists:
-            valid_rows.append(row)
-        else:
-            if not data_exists:
-                missing_files.append(row['filename'])
-            if label_path and not label_exists:
-                missing_labels.append(row['labels'])
-    if missing_files:
-        print(f"Warning: The following data files listed in metadata were not found and will be skipped: {missing_files}")
-    if missing_labels:
-        print(f"Warning: The following label files listed in metadata were not found and will be skipped: {missing_labels}")
-    valid_metadata = pd.DataFrame(valid_rows)
-    print(f"Found {len(valid_metadata)} valid files out of {len(metadata)} in metadata.")
+    # Validate the declared inventory before constructing any training windows.
+    valid_metadata = validate_supervised_training_metadata(
+        directory,
+        metadata,
+        sequence_length=sequence_length,
+        pose_pred=pose_pred,
+        orient_pred=orient_pred,
+        defined_split=defined_split,
+        noval=noval,
+        scan_values=not ablation_strict,  # Strict loading checks values once; non-strict skips must not hide invalid data.
+    )
+    print(f"Validated all {len(valid_metadata)} files declared by training metadata.")
+    training_data_identity = build_training_data_identity(
+        directory, valid_metadata, sequence_length=sequence_length,
+        pose_pred=pose_pred, orient_pred=orient_pred,
+    )
 
-    # Step 2: Initialize the full dataset with all valid files
     full_dataset = KeypointsDataset(
         directory,
         valid_metadata,
@@ -278,7 +243,6 @@ def prepare_data(
         ablation_strict=ablation_strict,
     )
 
-    # Checkpoint-based splitting logic
     train_filenames = set()
     val_filenames = set()
     is_handoff = False
@@ -286,11 +250,24 @@ def prepare_data(
         checkpoint = torch.load(pretrained_model_path, map_location='cpu')
         is_pretrain_checkpoint = is_pretrain_checkpoint_dict(checkpoint)
         is_handoff = is_pretrain_checkpoint and not pretrain_mode
+        if not is_handoff and not restart_optimizer:
+            validate_training_data_identity(checkpoint.get('training_data_identity'), training_data_identity)
+        if not is_handoff:
+            full_dataset.pose_dict, full_dataset.orient_dict = validate_supervised_class_schema(
+                checkpoint, full_dataset.pose_dict, full_dataset.orient_dict,
+                pose_pred=pose_pred, orient_pred=orient_pred)
+            full_dataset._add_indices_to_instructions()
 
-        # If it's NOT a handoff, load the file lists from the checkpoint
-        if 'train_filenames' in checkpoint and 'val_filenames' in checkpoint and not is_handoff:
+        if ('train_filenames' in checkpoint and 'val_filenames' in checkpoint and not is_handoff
+                and (preserve_checkpoint_split or not restart_optimizer)):
             train_filenames = set(checkpoint['train_filenames'])
             val_filenames = set(checkpoint['val_filenames'])
+            overlap = sorted(train_filenames & val_filenames)
+            if overlap:
+                raise ValueError(
+                    "Checkpoint train/validation file lists overlap; evaluation would leak "
+                    f"training data. Examples: {overlap[:20]}"
+                )
             print(f"Loaded train/val split from checkpoint: {len(train_filenames)} train, {len(val_filenames)} val files.")
 
     if noval:
@@ -298,17 +275,12 @@ def prepare_data(
         train_filenames.update(val_filenames)
         val_filenames.clear()
 
-    # Identify all files available in the current dataset
     all_valid_filenames = set(valid_metadata['filename'])
 
-    # Determine which files need to be assigned to a split.
-    # If it's a handoff or a new run, this is all files.
-    # If resuming, this is just the orphan files.
     files_to_split = all_valid_filenames - train_filenames - val_filenames
     print(f"Found {len(files_to_split)} files to assign to train/val splits.")
 
 
-    # Assign files_to_split
     if files_to_split:
         if noval:
             train_additions = files_to_split
@@ -321,19 +293,15 @@ def prepare_data(
                 val_additions = set(files_to_split_metadata[files_to_split_metadata['set'] == 'val']['filename'])
             else:
                 # Use by-movie grouping logic for random split
-                AUG_PREFIXES = [
-                    "original_", "rotated90_", "rotated180_", "rotated270_",
-                    "mirrored_", "mirrored90_", "mirrored180_", "mirrored270_"
-                ]
-                def get_base_movie_name(filename):
-                    for prefix in AUG_PREFIXES:
-                        if filename.startswith(prefix):
-                            return filename[len(prefix):]
-                    return filename
-                
                 files_to_split_metadata = files_to_split_metadata.copy()
-                files_to_split_metadata['base_movie'] = files_to_split_metadata['filename'].apply(get_base_movie_name)
-                unique_base_movies = files_to_split_metadata['base_movie'].unique()
+                files_to_split_metadata['base_movie'] = files_to_split_metadata['filename'].apply(
+                    lambda filename: _base_movie_identity(directory, filename))
+                unique_base_movies = files_to_split_metadata['base_movie'].unique().tolist()
+                if len(unique_base_movies) < 2:
+                    raise ValueError(
+                        "At least two independent base movies are required to create a train/validation split. "
+                        "Use --noval only when validation is intentionally disabled."
+                    )
                 
                 from sklearn.model_selection import train_test_split
                 split_seed = random_seed if random_seed is not None else 42
@@ -345,26 +313,65 @@ def prepare_data(
         train_filenames.update(train_additions)
         val_filenames.update(val_additions)
 
-    # Map filenames to instruction indices
+    split_overlap = sorted(train_filenames & val_filenames)
+    if split_overlap:
+        raise ValueError(
+            "Train/validation file lists overlap; evaluation would leak training data. "
+            f"Examples: {split_overlap[:20]}"
+        )
+    stale_split_files = sorted((train_filenames | val_filenames) - all_valid_filenames)
+    if stale_split_files:
+        raise ValueError(
+            "The saved train/validation split references files absent from current metadata. "
+            f"Examples: {stale_split_files[:20]}"
+        )
+    unassigned_files = sorted(all_valid_filenames - train_filenames - val_filenames)
+    if unassigned_files:
+        raise ValueError(
+            "Some training files were not assigned to train or validation. "
+            f"Examples: {unassigned_files[:20]}"
+        )
+    if not train_filenames:
+        raise ValueError("The training split is empty.")
+    if not noval and not val_filenames:
+        raise ValueError("The validation split is empty; use --noval only when intentional.")
+
+    train_base_movies = {_base_movie_identity(directory, name) for name in train_filenames}
+    val_base_movies = {_base_movie_identity(directory, name) for name in val_filenames}
+    leaking_base_movies = sorted(train_base_movies & val_base_movies)
+    if leaking_base_movies:
+        raise ValueError(
+            "Augmented versions of the same base movie occur in both train and validation. "
+            f"Examples: {leaking_base_movies[:20]}"
+        )
+
     train_indices = []
     val_indices = []
-    for idx, instr in enumerate(full_dataset.dataset_instructions):
-        file_base = os.path.basename(instr['input_file'])
-        if file_base in train_filenames:
-            train_indices.append(idx)
-        elif file_base in val_filenames:
-            val_indices.append(idx)
+    if isinstance(full_dataset.dataset_instructions, WindowInstructions):
+        train_indices = full_dataset.dataset_instructions.indices_for_files(train_filenames)
+        val_indices = full_dataset.dataset_instructions.indices_for_files(val_filenames)
+    else:
+        train_paths = {os.path.normcase(os.path.abspath(os.path.join(directory, name))) for name in train_filenames}
+        val_paths = {os.path.normcase(os.path.abspath(os.path.join(directory, name))) for name in val_filenames}
+        for idx, instr in enumerate(full_dataset.dataset_instructions):
+            input_path = os.path.normcase(os.path.abspath(instr['input_file']))
+            if input_path in train_paths:
+                train_indices.append(idx)
+            elif input_path in val_paths:
+                val_indices.append(idx)
 
     print(f"Final split: {len(train_indices)} train, {len(val_indices)} val instructions.")
+    if len(train_indices) == 0:
+        raise ValueError("No valid training sequences remain after label validation.")
+    if not noval and len(val_indices) == 0:
+        raise ValueError("No valid validation sequences remain after label validation.")
 
-    # ... after train_indices and val_indices are created ...
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
 
     print(f"Number of samples in train_dataset: {len(train_dataset)}")
     print(f"Number of samples in val_dataset: {len(val_dataset)}\n")
 
-    # Determine which columns to apply noise augmentation to
     if feature_plan is not None:
         headers_for_aug = list(feature_plan.included_columns)
     else:
@@ -373,7 +380,6 @@ def prepare_data(
     columns_to_noise = select_columns_for_augmentation(headers_for_aug)
     print(f"Augmentation columns: noise={len(columns_to_noise)} of {len(headers_for_aug)} features")
 
-    # Calculate and create class weights tensor for the training dataset
     train_class_weights, val_class_weights = calculate_class_weights(
         full_dataset, train_indices, val_indices, pose_pred, orient_pred, max_class_weight
     )
@@ -389,14 +395,13 @@ def prepare_data(
             else:
                 val_class_weights = torch.ones_like(train_class_weights)
         else:
-            # Fallback if no weights were calculated
             val_class_weights = torch.tensor([])
 
 
-    # For checkpointing: save train/val filename lists
     split_filenames = {
         'train_filenames': list(train_filenames),
-        'val_filenames': list(val_filenames)
+        'val_filenames': list(val_filenames),
+        'training_data_identity': training_data_identity,
     }
 
     return (
@@ -443,38 +448,27 @@ def model_setup(
     t_0: int = 1000,
     t_mult: int = 1,
     eta_min: float = 1e-6,
-    # --- Fine-tuning / handoff controls (explicit, no implicit checkpoint reading) ---
+    # Pretraining handoff controls.
     is_handoff: bool = False,
     freeze_encoder: bool = False,
     weight_encoder: float = 1.0,
+    warmup_epochs: Optional[int] = None,
+    cosine_decay_epochs: Optional[int] = None,
 ) -> tuple[
     PosePredTransformer,
     torch.optim.AdamW,
     Union[InverseSquareRootDecayScheduler, CosineAnnealingScheduler, ReduceLROnPlateau],
     GradScaler
 ]:
+    """Build the model, optimizer, scheduler and scaler without restoring state.
+
+    Checkpoint loading is separate. During pretraining-to-supervised handoff,
+    ``freeze_encoder`` trains prediction heads only; otherwise ``weight_encoder``
+    can multiply the backbone learning rate.
     """
-    Initializes and configures all components required for transformer model training or inference.
-
-    This function is intentionally *checkpoint-agnostic*: it builds the model/optimizer/scheduler/scaler
-    **without** loading any checkpoint weights or optimizer/scheduler state. All checkpoint loading
-    is handled by the dedicated `load_checkpoint_model()` function to avoid duplicated state restores
-    and subtle resume bugs.
-
-    Parameters (key additions):
-    - is_handoff: True if this run is a *pretrain → supervised* handoff (i.e., checkpoint is pretraining).
-                 Used only to apply optional fine-tuning optimizer policies (freeze/differential LR).
-    - freeze_encoder: If True AND is_handoff, freezes the backbone and trains only prediction heads.
-    - weight_encoder: If != 1.0 AND is_handoff (and not freeze_encoder), uses differential LR for backbone.
-
-    Returns:
-    - model, optimizer, scheduler, scaler
-    """
-    # Calculate the number of pose and orientation classes
     num_pose_classes = len(pose_dict) if pose_pred and pose_dict else 0
     num_orient_classes = len(orient_dict) if orient_pred and orient_dict else 0
 
-    # Configuration dictionary for model initialization
     config = {
         "sequence_length": sequence_length,
         "num_features": num_features,
@@ -499,13 +493,10 @@ def model_setup(
 
     print(f"Initializing model with sequence_length={sequence_length}, num_features={num_features}")
 
-    # Initialize the PosePredTransformer model
     model = PosePredTransformer(**config)
 
-    # Move the model to the correct device
     model.to(device)
 
-    # Print model layer shapes.
     print("\nShapes after model initialization:")
     print(f"Initial Linear Input Shape: {model.initial_linear.weight.shape}")
     if hasattr(model, "positional_encoding"):
@@ -539,14 +530,11 @@ def model_setup(
 
     print("\nTotal number of parameters:", sum(p.numel() for p in model.parameters()))
 
-    # Initialize the optimizer with weight decay
-    # Use the 'fused' implementation if available (on CUDA) for a potential speedup
+    # Use fused AdamW on CUDA when available.
     is_cuda = device.type == "cuda"
 
-    # --- Optional fine-tuning policies for handoff runs ---
-    if is_handoff and freeze_encoder:
-        print("[CKPT] Handoff detected + freeze_encoder=True. Freezing encoder backbone parameters.")
-        # Freeze backbone parameters
+    if not pretrain_mode and freeze_encoder:
+        print("Freezing encoder backbone parameters according to the supervised run configuration.")
         for param in model.initial_linear.parameters():
             param.requires_grad = False
         for param in model.transformer_encoder.parameters():
@@ -571,10 +559,9 @@ def model_setup(
             fused=is_cuda,
         )
 
-    elif is_handoff and (not freeze_encoder) and (weight_encoder != 1.0):
-        print(f"[CKPT] Handoff detected. Using differential LR with encoder weight: {weight_encoder}")
+    elif not pretrain_mode and (not freeze_encoder) and (weight_encoder != 1.0):
+        print(f"Using differential LR with encoder weight: {weight_encoder}")
 
-        # Group 1: Backbone parameters with a lower learning rate
         backbone_params = list(model.initial_linear.parameters()) + list(model.transformer_encoder.parameters())
         if hasattr(model, "positional_encoding") and isinstance(model.positional_encoding, nn.Parameter):
             backbone_params.append(model.positional_encoding)
@@ -587,19 +574,6 @@ def model_setup(
         if hasattr(model, "cls_projection"):
             backbone_params.extend(model.cls_projection.parameters())
 
-        # Group 2: Prediction head parameters with the full learning rate
-        head_params: list[nn.Parameter] = []
-        if pose_pred:
-            if hasattr(model, "pose_fc"):
-                head_params.extend(model.pose_fc.parameters())
-            elif hasattr(model, "pose_mlp"):
-                head_params.extend(model.pose_mlp.parameters())
-        if orient_pred:
-            if hasattr(model, "orient_fc"):
-                head_params.extend(model.orient_fc.parameters())
-            elif hasattr(model, "orient_mlp"):
-                head_params.extend(model.orient_mlp.parameters())
-
         # Safety: remove duplicates while preserving order
         def _unique_params(params):
             seen = set()
@@ -611,7 +585,8 @@ def model_setup(
             return uniq
 
         backbone_params = _unique_params(backbone_params)
-        head_params = _unique_params(head_params)
+        backbone_ids = {id(p) for p in backbone_params}
+        head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in backbone_ids]
 
         param_groups = [
             {"params": backbone_params, "lr": base_lr * weight_encoder, "weight_decay": weight_decay},
@@ -626,9 +601,13 @@ def model_setup(
             print("Not a handoff. Training all layers with the same LR.")
         optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay, fused=is_cuda)
 
-    # Initialize the learning rate scheduler
     if create_scheduler:
-        if scheduler_type == "cosine":
+        if cosine_decay_epochs is not None:
+            if scheduler_type != 'cosine':
+                raise ValueError('Epoch cosine mode requires scheduler_type=cosine.')
+            scheduler = EpochCosineScheduler(optimizer, batches_per_epoch,
+                1 if warmup_epochs is None else warmup_epochs, cosine_decay_epochs, eta_min)
+        elif scheduler_type == "cosine":
             print("Using CosineAnnealingScheduler with a linear warmup.")
             warmup_scheduler = LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps)
             t_0_batches = int(t_0)  # t_0 is steps per cycle
@@ -661,7 +640,6 @@ def model_setup(
     else:
         scheduler = None
 
-    # Initialize the gradient scaler for mixed precision training
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
     return model, optimizer, scheduler, scaler
@@ -675,120 +653,16 @@ def train_one_epoch(model: PosePredTransformer, train_dataloader: DataLoader, op
                    is_plateau_warmup: bool = False, base_lr: float = 0.001, grad_clip_norm: float = 1.0,
                    step_scheduler_per_batch: bool = True, mask_p: float = 0.05, noise_level: float = 0.05,
                    scheduler_type: str = 'cosine') -> tuple[float, float, float, float, float, float, float, float, float, int, float, float, int]:
-    """
-    Executes one complete training epoch with data augmentation, multi-objective loss computation, and comprehensive metrics tracking.
-    
-    This function performs a full training pass through the dataset, handling data augmentation,
-    forward propagation, multi-objective loss calculation (reconstruction, pose, orientation),
-    gradient propagation with scaling, and detailed performance monitoring. It supports
-    flexible training configurations with optional prediction heads and weighted loss combinations.
-    
-    Training Process:
-    1. **Model Preparation**: Sets model to training mode for dropout and batch normalization
-    2. **Batch Processing**: Iterates through all training batches with data loading
-    3. **Data Augmentation**: Applies masking and noise transformations
-    4. **Multi-Objective Forward Pass**: Computes predictions for enabled heads (pose/orient/recon)
-    5. **Loss Computation**: Calculates individual and weighted losses with class balancing
-    6. **Gradient Processing**: Performs scaled gradient pass with gradient clipping
-    7. **Weight Updates**: Updates model parameters with optimizer step
-    8. **Metrics Accumulation**: Tracks accuracy, loss, and timing information
-    
-    Loss Components:
-    - **Reconstruction Loss**: Mean squared error between input and decoded sequences
-    - **Pose Classification Loss**: Cross-entropy with label smoothing and class weighting
-    - **Orientation Classification Loss**: Cross-entropy with label smoothing and class weighting
-    - **Total Loss**: Weighted combination of all enabled loss components
-    
-    Performance Optimizations:
-    - **Mixed Precision**: Automatic FP16/FP32 casting for memory efficiency
-    - **Gradient Scaling**: Prevents underflow in mixed precision training
-    - **Gradient Clipping**: Stabilizes training with max norm constraint
-    - **Non-blocking Transfer**: Asynchronous GPU memory transfers
-    
-    Parameters:
-    - model: PosePredTransformer model in training mode for parameter updates.
-    - train_dataloader: DataLoader providing batched training sequences and labels.
-    - optimizer: AdamW optimizer for model parameter updates with weight decay.
-    - scheduler: Learning rate scheduler with current state and configuration.
-    - device: PyTorch device for computation (CPU or CUDA GPU).
-    - scaler: Gradient scaler for automatic mixed precision training stability.
-    - columns_to_noise: List of feature column indices for noise augmentation.
-    - pose_pred: Whether pose classification head is enabled for training.
-    - orient_pred: Whether orientation classification head is enabled for training.
-    - recon: Whether reconstruction objective is enabled for training.
-    - recon_weight: Loss weighting factor for reconstruction objective.
-    - pose_weight: Loss weighting factor for pose classification objective.
-    - orient_weight: Loss weighting factor for orientation classification objective.
-    - train_class_weights: Per-sample class weights for handling dataset imbalance.
-    - global_step: The total number of batches processed so far.
-    - is_plateau_warmup: If True, a special per-batch linear warmup is performed for the plateau scheduler.
-    - base_lr: The target learning rate to reach at the end of the warmup.
-    
-    Returns:
-    - train_pose_accuracy: Classification accuracy for pose predictions (0.0 if disabled).
-    - train_orient_accuracy: Classification accuracy for orientation predictions (0.0 if disabled).
-    - train_recon_loss_avg: Average reconstruction loss across all batches (0.0 if disabled).
-    - train_weighted_recon_loss_avg: Average weighted reconstruction loss (0.0 if disabled).
-    - train_pose_loss_avg: Average pose classification loss (0.0 if disabled).
-    - train_weighted_pose_loss_avg: Average weighted pose classification loss (0.0 if disabled).
-    - train_orient_loss_avg: Average orientation classification loss (0.0 if disabled).
-    - train_weighted_orient_loss_avg: Average weighted orientation classification loss (0.0 if disabled).
-    - train_total_loss_avg: Average combined weighted loss across all enabled objectives.
-    - total_inputs: Total number of input sequences processed during the epoch.
-    - time_forward_pass: Total time spent on forward propagation (seconds).
-    - time_optimizer_step: Total time spent on gradient computation and parameter updates (seconds).
-    - global_step: The updated total number of batches processed.
-    
-    Notes:
-    - Uses label smoothing (0.1) for classification losses to improve generalization
-    - Applies gradient clipping (max_norm=grad_clip_norm) to prevent exploding gradients
-    - Tracks detailed timing information for performance analysis and bottleneck identification
-    - Supports flexible multi-head training with independent loss weighting
-    - **Non-blocking Transfer**: Asynchronous GPU memory transfers
-    
-    Parameters:
-    - model: PosePredTransformer model in training mode for parameter updates.
-    - train_dataloader: DataLoader providing batched training sequences and labels.
-    - optimizer: AdamW optimizer for model parameter updates with weight decay.
-    - scheduler: Learning rate scheduler with current state and configuration.
-    - device: PyTorch device for computation (CPU or CUDA GPU).
-    - scaler: Gradient scaler for automatic mixed precision training stability.
-    - columns_to_noise: List of feature column indices for noise augmentation.
-    - pose_pred: Whether pose classification head is enabled for training.
-    - orient_pred: Whether orientation classification head is enabled for training.
-    - recon: Whether reconstruction objective is enabled for training.
-    - recon_weight: Loss weighting factor for reconstruction objective.
-    - pose_weight: Loss weighting factor for pose classification objective.
-    - orient_weight: Loss weighting factor for orientation classification objective.
-    - train_class_weights: Per-sample class weights for handling dataset imbalance.
-    - global_step: The total number of batches processed so far.
-    - is_plateau_warmup: If True, a special per-batch linear warmup is performed for the plateau scheduler.
-    - base_lr: The target learning rate to reach at the end of the warmup.
-    
-    Returns:
-    - train_pose_accuracy: Classification accuracy for pose predictions (0.0 if disabled).
-    - train_orient_accuracy: Classification accuracy for orientation predictions (0.0 if disabled).
-    - train_recon_loss_avg: Average reconstruction loss across all batches (0.0 if disabled).
-    - train_weighted_recon_loss_avg: Average weighted reconstruction loss (0.0 if disabled).
-    - train_pose_loss_avg: Average pose classification loss (0.0 if disabled).
-    - train_weighted_pose_loss_avg: Average weighted pose classification loss (0.0 if disabled).
-    - train_orient_loss_avg: Average orientation classification loss (0.0 if disabled).
-    - train_weighted_orient_loss_avg: Average weighted orientation classification loss (0.0 if disabled).
-    - train_total_loss_avg: Average combined weighted loss across all enabled objectives.
-    - total_inputs: Total number of input sequences processed during the epoch.
-    - time_forward_pass: Total time spent on forward propagation (seconds).
-    - time_optimizer_step: Total time spent on gradient computation and parameter updates (seconds).
-    - global_step: The updated total number of batches processed.
-    
-    Notes:
-    - Uses label smoothing (0.1) for classification losses to improve generalization
-    - Applies gradient clipping (max_norm=grad_clip_norm) to prevent exploding gradients
-    - Tracks detailed timing information for performance analysis and bottleneck identification
-    - Supports flexible multi-head training with independent loss weighting
-    """
-    model.train()  # Set the model to training mode
+    """Train one epoch with Gaussian noise followed by elementwise masking.
 
-    # Initialize accumulators for losses and metrics
+    Use training-derived global-window weights for classification cross-entropy
+    with label smoothing 0.1. Reconstruction targets remain clean and its MSE
+    uses masked elements only. Unscale gradients before norm clipping. Return
+    loss/accuracy aggregates, sample count, timing totals in seconds and the
+    updated global step; step batch-based schedulers after optimization.
+    """
+    model.train()  
+
     train_recon_loss_total = 0.0
     train_weighted_recon_loss_total = 0.0
     train_pose_loss_total = 0.0
@@ -801,25 +675,25 @@ def train_one_epoch(model: PosePredTransformer, train_dataloader: DataLoader, op
     train_total_orient_predictions = 0
     total_inputs = 0
 
-    # Initialize timers for performance measurement
     time_forward_pass = 0.0
     time_optimizer_step = 0.0
 
-    optimizer.zero_grad()  # Clear gradients before starting the training loop
+    optimizer.zero_grad()  
 
-    # Iterate over batches in the DataLoader
-    for batch_idx, batch in enumerate(train_dataloader):
-        sequences = batch[0].to(device, non_blocking=True)  # Move input sequences to the device
-        poses = batch[1].to(device, non_blocking=True) if pose_pred else None  # Move pose labels to the device if needed
-        orients = batch[2].to(device, non_blocking=True) if orient_pred else None  # Move orientation labels to the device if needed
-        indices = batch[3]  # Indices of the samples in the batch
+    warmup_targets = [group['lr'] for group in optimizer.param_groups]
+    for batch_idx, batch in enumerate(progress(train_dataloader, desc='Training batches')):
+        if step_scheduler_per_batch and is_plateau_warmup:
+            fraction = (batch_idx + 1) / len(train_dataloader)
+            for group, target_lr in zip(optimizer.param_groups, warmup_targets):
+                group['lr'] = target_lr * fraction
+        sequences = batch[0].to(device, non_blocking=True)  
+        poses = batch[1].to(device, non_blocking=True) if pose_pred else None  
+        orients = batch[2].to(device, non_blocking=True) if orient_pred else None  
+        indices = batch[3]  
 
-        # Retrieve class weights for the current batch
         batch_class_weights = train_class_weights[indices].to(device, non_blocking=True)
 
-        # Apply data augmentation (Gaussian noise + optional masking).
-        # - Always use augmented inputs for the forward pass.
-        # - If recon is enabled, return the keep_mask so recon loss is computed ONLY on masked elements.
+        # Apply noise before masking; reconstruction compares masked elements with clean targets.
         if recon:
             sequences_aug, aug_keep_mask = augment_features(
                 sequences,
@@ -838,14 +712,10 @@ def train_one_epoch(model: PosePredTransformer, train_dataloader: DataLoader, op
             aug_keep_mask = None
 
 
-        # Forward pass
         start_time = time.time()
         with torch.amp.autocast(device_type='cuda', enabled=device.type == 'cuda'):
             pose_pred_out, orient_pred_out, recon_output, context_vector = model(sequences_aug)
 
-            # --- Reconstruction objective (denoising + masked-only loss) ---
-            # Target is ALWAYS the original clean sequence.
-            # Loss is computed ONLY on masked elements.
             if recon:
                 if aug_keep_mask is None:
                     raise RuntimeError("Internal error: recon=True but aug_keep_mask is None")
@@ -853,66 +723,53 @@ def train_one_epoch(model: PosePredTransformer, train_dataloader: DataLoader, op
             else:
                 recon_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-            # Calculate pose prediction loss if enabled
             if pose_pred:
                 pose_pred_out = pose_pred_out.view(-1, pose_pred_out.size(-1))
-                pose_labels = poses.view(-1).long()  # Use poses directly as class indices
+                pose_labels = poses.view(-1).long()  
                 pose_loss = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)(pose_pred_out, pose_labels)
-                weighted_pose_loss = (pose_loss * batch_class_weights).mean()  # Apply class weights
+                weighted_pose_loss = (pose_loss * batch_class_weights).mean()  
             else:
                 weighted_pose_loss = 0.0
 
-            # Calculate orientation prediction loss if enabled
             if orient_pred:
                 orient_pred_out = orient_pred_out.view(-1, orient_pred_out.size(-1))
-                orient_labels = orients.view(-1).long()  # Use orients directly as class indices
+                orient_labels = orients.view(-1).long()  
                 orient_loss = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)(orient_pred_out, orient_labels)
-                weighted_orient_loss = (orient_loss * batch_class_weights).mean()  # Apply class weights
+                weighted_orient_loss = (orient_loss * batch_class_weights).mean()  
             else:
                 weighted_orient_loss = 0.0
 
-        time_forward_pass += time.time() - start_time  # Update forward pass time
+        time_forward_pass += time.time() - start_time  
 
-        # Calculate total weighted loss
         weighted_recon_loss = recon_weight * recon_loss
         weighted_pose_loss = pose_weight * weighted_pose_loss
         weighted_orient_loss = orient_weight * weighted_orient_loss
         total_loss = weighted_recon_loss + weighted_pose_loss + weighted_orient_loss
 
-        # Gradient pass and optimizer step
         start_time = time.time()
-        optimizer.zero_grad()  # Clear gradients before the gradient pass
-        scaler.scale(total_loss).backward()  # Gradient pass with scaled loss
+        optimizer.zero_grad()  
+        scaler.scale(total_loss).backward()  
 
-        # IMPORTANT (AMP): Gradients are scaled when using GradScaler. We must unscale them
-        # before applying gradient clipping, otherwise the effective clip threshold becomes
-        # scale-dependent and training can become unstable or overly damped.
+        # Unscale before clipping so the norm threshold is independent of AMP scale.
         if grad_clip_norm is not None and grad_clip_norm > 0:
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
-        scaler.step(optimizer)  # Update weights
-        scaler.update()  # Update the scale for next iteration
-        time_optimizer_step += time.time() - start_time  # Update optimizer step time
+        scaler.step(optimizer)  
+        scaler.update()  
+        time_optimizer_step += time.time() - start_time  
 
-        # --- Scheduler Step / Warmup Logic ---
+        # Batch scheduler stepping and plateau warmup.
         if step_scheduler_per_batch:
-            if is_plateau_warmup:
-                # Manual linear warmup for the first epoch of the plateau scheduler
-                start_lr = 1e-8
-                num_warmup_steps = len(train_dataloader)
-                lr = start_lr + (base_lr - start_lr) * (batch_idx + 1) / num_warmup_steps
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr
-            else:
-                # The other schedulers are wrapped in SequentialLR and are stepped per-batch
+            if not is_plateau_warmup:
+            # Step batch-based schedulers after optimizer updates.
                 if scheduler_type in ['sqrt', 'cosine', 'linear']:
                     scheduler.step()
 
         global_step += 1
+        record_work("training_examples", completed=int(sequences.size(0)))
         
-        # Accumulate metrics
         if recon:
             train_recon_loss_total += recon_loss.item()
             train_weighted_recon_loss_total += weighted_recon_loss.item()
@@ -931,7 +788,6 @@ def train_one_epoch(model: PosePredTransformer, train_dataloader: DataLoader, op
             train_correct_orient_predictions += (predicted_orients == orient_labels).sum().item()
             train_total_orient_predictions += orients.size(0)
 
-    # Calculate average losses and accuracy
     train_recon_loss_avg = train_recon_loss_total / len(train_dataloader)
     train_weighted_recon_loss_avg = train_weighted_recon_loss_total / len(train_dataloader)
     train_pose_loss_avg = train_pose_loss_total / len(train_dataloader) if pose_pred else 0.0
@@ -966,72 +822,15 @@ def validate_one_epoch(
     mask_p: float = 0.05,
     noise_level: float = 0.05,
 ) -> tuple[float, float, float, float, float, float, float, float, Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[float], Optional[np.ndarray], Optional[float]]:
-    """
-    Performs comprehensive model validation with detailed performance metrics and statistical analysis.
-    
-    This function executes a complete validation pass through the dataset without gradient computation,
-    evaluating model performance across all enabled prediction heads. It computes accuracy metrics,
-    loss values, confusion matrices, and F1 scores to provide thorough assessment of model quality
-    and generalization capability for early stopping and hyperparameter selection.
-    
-    Validation Process:
-    1. **Model Preparation**: Sets model to evaluation mode (disables dropout/batch norm updates)
-    2. **Gradient Disabling**: Uses torch.no_grad() context for memory efficiency
-    3. **Batch Processing**: Iterates through validation data without augmentation
-    4. **Multi-Objective Evaluation**: Computes predictions for all enabled heads
-    5. **Loss Computation**: Calculates weighted and unweighted losses with class balancing
-    6. **Metrics Accumulation**: Tracks predictions and labels for statistical analysis
-    7. **Statistical Analysis**: Computes confusion matrices and macro F1 scores
-    8. **Performance Summary**: Aggregates all metrics for comprehensive evaluation
-    
-    Evaluation Metrics:
-    - **Accuracy**: Simple classification accuracy for pose and orientation
-    - **Loss Values**: Both raw and class-weighted losses for all objectives
-    - **Confusion Matrices**: Full confusion matrices for detailed error analysis
-    - **Macro F1 Scores**: Class-balanced F1 scores robust to class imbalance
-    - **Reconstruction Error**: Mean squared error for sequence reconstruction
-    
-    Statistical Robustness:
-    - **Class Weighting**: Consistent with training for fair comparison
-    - **Zero Division Handling**: Graceful handling of edge cases in F1 computation
-    - **Memory Efficiency**: No gradient storage for faster validation
-    - **Mixed Precision**: Automatic casting for consistent evaluation
-    
-    Parameters:
-    - model: PosePredTransformer model in evaluation mode for inference.
-    - val_dataloader: DataLoader providing batched validation sequences and labels.
-    - device: PyTorch device for computation (CPU or CUDA GPU).
-    - pose_pred: Whether pose classification head is enabled for evaluation.
-    - orient_pred: Whether orientation classification head is enabled for evaluation.
-    - recon: Whether reconstruction objective is enabled for evaluation.
-    - val_class_weights: Per-sample class weights for consistent loss computation.
-    
-    Returns:
-    - val_pose_accuracy: Classification accuracy for pose predictions (0.0 if disabled).
-    - val_orient_accuracy: Classification accuracy for orientation predictions (0.0 if disabled).
-    - val_recon_loss_avg: Average reconstruction loss across validation set (0.0 if disabled).
-    - val_pose_loss_avg: Average unweighted pose classification loss (0.0 if disabled).
-    - val_weighted_pose_loss_avg: Average class-weighted pose loss (0.0 if disabled).
-    - val_orient_loss_avg: Average unweighted orientation classification loss (0.0 if disabled).
-    - val_weighted_orient_loss_avg: Average class-weighted orientation loss (0.0 if disabled).
-    - val_total_loss_avg: Average combined loss across all enabled objectives.
-    - pose_conf_matrix: Confusion matrix for pose predictions (None if disabled).
-    - orient_conf_matrix: Confusion matrix for orientation predictions (None if disabled).
-    - pose_macro_f1: Macro-averaged F1 score for pose classification (None if disabled).
-    - orient_macro_f1: Macro-averaged F1 score for orientation classification (None if disabled).
-    
-    Notes:
-    - Pose/orient metrics are computed on clean sequences (no augmentation) for consistent evaluation.
-    - If recon is enabled, reconstruction loss is evaluated on corrupted inputs (noise+mask)
-      with clean targets, and the corruption is made deterministic during validation.
-    - Confusion matrices provide detailed per-class error analysis
-    - Macro F1 scores give equal weight to all classes regardless of frequency
-    - All metrics are computed efficiently in a single validation pass
-    - Supports partial evaluation when only some prediction heads are enabled
-    """
-    model.eval()  # Set the model to evaluation mode
+    """Evaluate clean classification windows without gradients.
 
-    # Initialize accumulators for losses and metrics
+    Use deterministic corruption only for masked reconstruction against clean
+    targets, restoring RNG states afterward. Return weighted/unweighted losses,
+    accuracies, ordered confusion matrices and macro-F1 scores. Class weights
+    retain training-derived frequencies.
+    """
+    model.eval()  
+
     val_recon_loss_total = 0.0
     val_weighted_recon_loss_total = 0.0
     val_pose_loss_total = 0.0
@@ -1043,15 +842,12 @@ def validate_one_epoch(
     val_correct_orient_predictions = 0
     val_total_orient_predictions = 0
 
-    # Initialize lists to store predictions and true labels for confusion matrix calculation
     all_pose_preds = []
     all_pose_labels = []
     all_orient_preds = []
     all_orient_labels = []
 
-    # NOTE: For denoising/masked reconstruction validation we need augmentation.
-    # To keep val metrics stable across epochs, we make recon-augmentation deterministic
-    # and then restore the RNG state when we return.
+    # Fix reconstruction-validation corruption and restore RNG states afterward.
     cpu_rng_state = torch.random.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == 'cuda' else None
     if recon:
@@ -1060,68 +856,56 @@ def validate_one_epoch(
             torch.cuda.manual_seed_all(0)
 
     try:
-        with torch.no_grad():  # Disable gradient calculation for validation
-            for batch in val_dataloader:
-                # Unpack the batch based on the flags
+        with torch.no_grad():  
+            for batch in progress(val_dataloader, desc='Validation batches'):
                 sequences = batch[0].to(device)
 
-                # Ensure the input is 3D
                 if sequences.dim() != 3:
                     raise ValueError(f"Expected 3 dimensions, but got {sequences.dim()} dimensions")
 
                 poses = batch[1].to(device) if pose_pred else None
                 orients = batch[2].to(device) if orient_pred else None
-                indices = batch[3]  # Assuming indices are passed as part of the batch
+                indices = batch[3]  
 
-                # Retrieve class weights for the current batch
                 batch_class_weights = val_class_weights[indices].to(device)
 
-                # --- Classification evaluation on CLEAN sequences (no augmentation) ---
+                # Evaluate classification on clean sequences.
                 if pose_pred or orient_pred:
                     with torch.amp.autocast(device_type='cuda', enabled=device.type == 'cuda'):
                         pose_pred_out, orient_pred_out, _recon_unused, _ctx_unused = model(sequences)
 
-                        # Calculate pose prediction loss if enabled
                         if pose_pred:
                             pose_pred_out = pose_pred_out.view(-1, pose_pred_out.size(-1))
-                            pose_labels = poses.view(-1).long()  # Use poses directly as class indices
+                            pose_labels = poses.view(-1).long()  
                             pose_loss = nn.CrossEntropyLoss(reduction='none')(pose_pred_out, pose_labels)
                             weighted_pose_loss = (pose_loss * batch_class_weights).mean()
                             val_pose_loss_total += pose_loss.mean().item()
                             val_weighted_pose_loss_total += (pose_weight * weighted_pose_loss).item()
                             _, predicted_poses = torch.max(pose_pred_out, 1)
 
-                            # Update correct predictions count
                             val_correct_pose_predictions += (predicted_poses == pose_labels).sum().item()
                             val_total_pose_predictions += poses.size(0)
 
-                            # Store predictions and true labels for poses
                             all_pose_preds.extend(predicted_poses.cpu().numpy())
                             all_pose_labels.extend(pose_labels.cpu().numpy())
 
-                        # Calculate orientation prediction loss if enabled
                         if orient_pred:
                             orient_pred_out = orient_pred_out.view(-1, orient_pred_out.size(-1))
-                            orient_labels = orients.view(-1).long()  # Use orients directly as class indices
+                            orient_labels = orients.view(-1).long()  
                             orient_loss = nn.CrossEntropyLoss(reduction='none')(orient_pred_out, orient_labels)
                             weighted_orient_loss = (orient_loss * batch_class_weights).mean()
                             val_orient_loss_total += orient_loss.mean().item()
                             val_weighted_orient_loss_total += (orient_weight * weighted_orient_loss).item()
                             _, predicted_orients = torch.max(orient_pred_out, 1)
 
-                            # Update correct predictions count
                             val_correct_orient_predictions += (predicted_orients == orient_labels).sum().item()
                             val_total_orient_predictions += orients.size(0)
 
-                            # Store predictions and true labels for orientations
                             all_orient_preds.extend(predicted_orients.cpu().numpy())
                             all_orient_labels.extend(orient_labels.cpu().numpy())
 
-                # --- Reconstruction evaluation on CORRUPTED inputs, clean targets ---
+                # Evaluate masked reconstruction on corrupted inputs with clean targets.
                 if recon:
-                    # For denoising-style recon runs:
-                    # - target is ALWAYS the clean original sequence
-                    # - loss is computed ONLY on masked elements
                     sequences_aug, aug_keep_mask = augment_features(
                         sequences,
                         mask_p,
@@ -1141,40 +925,32 @@ def validate_one_epoch(
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state_all(cuda_rng_state)
 
-    # Compute confusion matrices
-    pose_conf_matrix = confusion_matrix(all_pose_labels, all_pose_preds) if pose_pred else None
-    orient_conf_matrix = confusion_matrix(all_orient_labels, all_orient_preds) if orient_pred else None
+    pose_conf_matrix = confusion_matrix(all_pose_labels, all_pose_preds, labels=list(range(len(pose_dict)))) if pose_pred else None
+    orient_conf_matrix = confusion_matrix(all_orient_labels, all_orient_preds, labels=list(range(len(orient_dict)))) if orient_pred else None
 
-    # Compute macro F1 scores
     pose_macro_f1 = f1_score(all_pose_labels, all_pose_preds, average='macro', zero_division=0.0) if pose_pred else None
     orient_macro_f1 = f1_score(all_orient_labels, all_orient_preds, average='macro', zero_division=0.0) if orient_pred else None
 
-    # Compute combined confusion matrix and F1
     combined_conf_matrix = None
     combined_macro_f1 = None
     if pose_pred and orient_pred:
-        # Create reverse dictionaries to map index -> name
         reverse_pose_dict = {v: k for k, v in pose_dict.items()}
         reverse_orient_dict = {v: k for k, v in orient_dict.items()}
 
-        # Convert index lists to name lists
         pose_true_names = [reverse_pose_dict[i] for i in all_pose_labels]
         pose_pred_names = [reverse_pose_dict[i] for i in all_pose_preds]
         orient_true_names = [reverse_orient_dict[i] for i in all_orient_labels]
         orient_pred_names = [reverse_orient_dict[i] for i in all_orient_preds]
 
-        # Create combined labels (e.g., 'walk-forward')
         combined_true_labels = [f"{p}-{o}" for p, o in zip(pose_true_names, orient_true_names)]
         combined_pred_labels = [f"{p}-{o}" for p, o in zip(pose_pred_names, orient_pred_names)]
 
         # Define all possible combined class names to ensure matrix dimensions are correct
         all_combined_names = [f"{p}-{o}" for p in sorted(pose_dict.keys()) for o in sorted(orient_dict.keys())]
 
-        # Calculate combined matrix and F1 score
         combined_conf_matrix = confusion_matrix(combined_true_labels, combined_pred_labels, labels=all_combined_names)
         combined_macro_f1 = f1_score(combined_true_labels, combined_pred_labels, average='macro', zero_division=0.0)
 
-    # Calculate average losses and accuracy
     val_recon_loss_avg = val_recon_loss_total / len(val_dataloader) if recon else 0.0
     val_weighted_recon_loss_avg = val_weighted_recon_loss_total / len(val_dataloader) if recon else 0.0
     val_pose_loss_avg = val_pose_loss_total / len(val_dataloader) if pose_pred else 0.0
@@ -1193,9 +969,10 @@ def validate_one_epoch(
             combined_conf_matrix, combined_macro_f1)
 
 
+@close_feature_stores
 def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[dict[str, int]], 
                 orient_dict: Optional[dict[str, int]], num_workers: int, sequence_length: int, batch: int, 
-                pretrained_model_path: str, split_filenames: dict[str, list[str]], num_features: int, 
+                pretrained_model_path: str, split_filenames: dict[str, object], num_features: int, 
                 d_model: int, nhead: int, num_encoder_layers: int, num_decoder_layers: int, 
                 dim_feedforward: int, dropout_rate: float, frame_representation: str, num_cls: int, 
                 prediction_head: str, records_path: str, wandb_log: bool, num_epochs: int, 
@@ -1209,92 +986,21 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                 t_mult: int, eta_min: float, mask_p: float, noise_level: float, max_class_weight: float,
                 grad_clip_norm: float, random_seed: Optional[int], metadata_tag: str,
                 swa_mode: bool = False, swa_epochs: int = 0, swa_lr: float = 1e-5,
-                feature_plan: Optional["FeaturePlan"] = None) -> None:
+                feature_plan: Optional["FeaturePlan"] = None,
+                warmup_epochs: Optional[int] = None,
+                cosine_decay_epochs: Optional[int] = None) -> None:
+    """Run supervised optimization, evaluation and checkpoint/log publication.
+
+    Distinguish full resume from weights-only restart and pretraining handoff.
+    Select early stopping by pose macro-F1, orientation macro-F1 or negative
+    loss according to enabled heads and validation availability. Optional SWA
+    is a final training tail with a separate averaged-weight checkpoint;
+    optimizer state belongs to ordinary resumable checkpoints.
     """
-    Main worker function for training and validation.
-    
-    Execution Flow:
-    
-    1. **Setup Phase**
-       - Configure GPU device and memory optimizations
-       - Create DataLoaders with performance settings (pin_memory, persistent_workers)
-       - Initialize training infrastructure and timing variables
-    
-    2. **Model Initialization**
-       - Build PosePredTransformer with specified architecture parameters
-       - Setup optimizer (AdamW), scheduler (warmup/cosine/plateau), and mixed precision scaler
-       - Load from checkpoint if resuming training, otherwise start fresh
-    
-    3. **Logging Infrastructure Setup**
-       - Create CSV records file for epoch-wise metrics tracking
-       - Initialize confusion matrix logging files for classification analysis
-       - Setup WandB experiment tracking if enabled
-    
-    4. **Main Training Loop** (for each epoch until convergence or max_epochs)
-       - **Training Phase**:
-         • Run train_one_epoch() with data augmentation (masking and noise)
-         • Collect metrics: losses (pose, orient, recon), accuracies, F1 scores, timing
-         • Perform optimizer step with gradient scaling for mixed precision
-       
-       - **Validation Phase**:
-         • Run validate_one_epoch() for clean classification evaluation and
-           deterministic reconstruction evaluation when recon is enabled
-         • Generate confusion matrices for pose/orientation classification
-         • Calculate macro F1 scores and validation losses
-       
-       - **Performance Monitoring**:
-         • Log all metrics to CSV file and WandB (if enabled)
-         • Check for best model performance using the active primary metric
-           (pose macro-F1, orient macro-F1, or loss depending on run mode)
-         • Save best model checkpoint when improvement detected
-         • Apply learning rate scheduling based on validation metrics
-       
-       - **Progress Reporting**:
-         • Print comprehensive epoch summary with all metrics and timing
-         • Show early stopping countdown if applicable
-    
-    5. **Checkpoint Management**
-       - Save periodic training state every checkpoint_interval epochs
-       - Preserve best model separately for final deployment
-       - Handle graceful resumption from any saved checkpoint
-    
-    6. **Early Stopping & Cleanup**
-       - Monitor the active primary metric for plateau detection
-       - Stop training after patience epochs without improvement
-       - Close all file handles and cleanup GPU memory
-       - Print final training summary with best achieved performance
-    
-    Key Features:
-    - **Multi-task Learning**: Supports pose classification, orientation prediction, and reconstruction
-    - **Robust Checkpointing**: Resume training from any epoch with exact state restoration
-    - **Smart Early Stopping**: Uses appropriate metric based on enabled prediction heads
-    - **Comprehensive Logging**: CSV metrics, confusion matrices, WandB integration
-    - **Memory Optimization**: Mixed precision training with automatic loss scaling
-    - **Data Augmentation**: Element-wise masking and Gaussian noise injection
-    
-    Parameters:
-        train_dataset, val_dataset: PyTorch Subsets for training and validation
-        pose_dict, orient_dict: Class name to index mappings (None if not predicting)
-        num_workers, batch: DataLoader configuration for performance
-        pretrained_model_path: Checkpoint file for resuming or starting fresh
-        Model architecture params: d_model, nhead, num_encoder_layers, etc.
-        Training config: num_epochs, checkpoint_interval, learning rates, weights
-        Logging paths: records_path, confusion matrix files, run_name
-        Data augmentation: columns_to_noise, mask/noise parameters
-    
-    Outputs:
-        - CSV training records with epoch metrics
-        - Confusion matrix files for classification analysis  
-        - Model checkpoints (periodic + best model)
-        - WandB experiment logs (if enabled)
-    """
-    # Set the device to GPU if available, otherwise fallback to CPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Print the current device
     print(f"Current device: {device}\n")
 
-    # Create DataLoaders for training and validation
     train_dataloader = build_dataloader(
         train_dataset,
         batch_size=batch,
@@ -1317,9 +1023,7 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
     else:
         val_dataloader = None
 
-    # ----------------------------------------------------------------------------------
-    # Compute SWA schedule up front so checkpoints capture the exact run contract.
-    # ----------------------------------------------------------------------------------
+    # Resolve the SWA schedule before saving checkpoint metadata.
     if swa_mode:
         swa_epochs = int(swa_epochs)
         if swa_epochs <= 0:
@@ -1340,9 +1044,37 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
         swa_epochs = 0
         swa_anneal_epochs = 0
 
-    # ----------------------------------------------------------------------------------
-    # Populate checkpoint module globals so saved checkpoints include full hyperparams
-    # ----------------------------------------------------------------------------------
+    schedule_globals = {}
+    # Resolve epoch schedule only after --noval and the actual loader are known.
+    if warmup_epochs is not None and cosine_decay_epochs is None:
+        raise ValueError('--warmup_epochs requires --cosine_decay_epochs.')
+    if cosine_decay_epochs is not None:
+        warmup_epochs = 1 if warmup_epochs is None else int(warmup_epochs)
+        if scheduler_type != 'cosine' or swa_mode:
+            raise ValueError('Epoch cosine mode requires cosine scheduling without SWA.')
+        if warmup_epochs < 0 or int(cosine_decay_epochs) < 1:
+            raise ValueError('Invalid epoch cosine durations.')
+        if warmup_epochs + int(cosine_decay_epochs) != effective_num_epochs:
+            raise ValueError('Warmup epochs plus cosine decay epochs must equal num_epochs.')
+        if pretrained_model_path and not restart_optimizer:
+            saved = torch.load(pretrained_model_path, map_location='cpu')
+            if not is_pretrain_checkpoint_dict(saved):
+                saved_schedule = saved.get('global_vars', {})
+                expected = {'schedule_mode': 'epoch_cosine_no_restart',
+                            'warmup_epochs': warmup_epochs, 'cosine_decay_epochs': int(cosine_decay_epochs),
+                            'batches_per_epoch': len(train_dataloader)}
+                if any(saved_schedule.get(key) != value for key, value in expected.items()):
+                    raise ValueError('Epoch cosine resume requires the saved durations and batches per epoch. '
+                                     'Use --restart_optimizer for an intentional schedule change.')
+        warmup_steps = warmup_epochs * len(train_dataloader)
+        t_0 = int(cosine_decay_epochs) * len(train_dataloader)
+        t_mult = 1
+        schedule_globals.update(schedule_mode='epoch_cosine_no_restart',
+            warmup_epochs=warmup_epochs, cosine_decay_epochs=int(cosine_decay_epochs),
+            batches_per_epoch=len(train_dataloader))
+        print(f'[SCHEDULE] Epoch cosine: {warmup_steps} warmup steps, {t_0} decay steps; no restarts.')
+
+    # Checkpoint metadata
     extra_globals = {}
     if feature_plan is not None:
         extra_globals = {
@@ -1353,7 +1085,9 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             'ablation_spec': dict(feature_plan.spec),
         }
 
+    extra_globals.update(schedule_globals)
     set_checkpoint_globals(
+        reset=True,
         run_name=run_name,
         metadata_tag=metadata_tag,
         sequence_length=sequence_length,
@@ -1402,8 +1136,7 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
         swa_anneal_epochs=int(swa_anneal_epochs),
         **extra_globals,
     )
-    # MODEL INITIALIZATION
-    # Determine if this is a pretrain → supervised handoff (affects optimizer policy)
+    # Model initialization
     is_handoff = False
     if pretrained_model_path and os.path.isfile(pretrained_model_path):
         is_handoff = is_pretrain_checkpoint_path(pretrained_model_path)
@@ -1422,21 +1155,16 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
         eta_min=eta_min,
         is_handoff=is_handoff,
         freeze_encoder=freeze_encoder,
-        weight_encoder=weight_encoder
+        weight_encoder=weight_encoder,
+        warmup_epochs=warmup_epochs,
+        cosine_decay_epochs=cosine_decay_epochs
     )
     print_gpu_memory_summary()
 
-    # JIT Compile the model - this might be worth trying out, although in our case it causes the training to run slightly slower.
-    #print("Compiling the model for optimized performance...")
-    #model = torch.compile(model)
 
-    # Initialize weights
     pose_conf_matrix = None
     orient_conf_matrix = None
-    # Load the pretrained weights if the file exists
-    # NOTE: Optimizer/scheduler/scaler state should only be loaded for a true resume.
-    # If you are doing any kind of new training stage (restart_optimizer, freeze_encoder, differential LR, or pretrain→supervised handoff),
-    # we intentionally skip loading optimizer state to avoid param-group mismatches and silent training bugs.
+    # Restore optimizer/scheduler/scaler state only for true resume.
     load_optimizer_state = (not restart_optimizer) and (not is_handoff)
     if pretrained_model_path and os.path.isfile(pretrained_model_path) and not load_optimizer_state:
         print("[CKPT] Loading weights only (no optimizer/scheduler/scaler state).")
@@ -1453,10 +1181,10 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             print(f"[CKPT] Warning: could not inspect checkpoint for resume state: {e}")
 
     start_epoch, global_step = load_checkpoint_model(
-        model, optimizer, scheduler, pretrained_model_path, scaler, load_optimizer_state=load_optimizer_state, pretrain_mode=False
+        model, optimizer, scheduler, pretrained_model_path, scaler, load_optimizer_state=load_optimizer_state, pretrain_mode=False,
+        pose_dict=train_dataloader.dataset.dataset.pose_dict, orient_dict=train_dataloader.dataset.dataset.orient_dict
     )
 
-    # Setup the records file and capture headers
     file, writer, headers = setup_records_file(
         records_path, 
         start_epoch,  
@@ -1468,7 +1196,6 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
     if file is None or writer is None or headers is None:
         raise RuntimeError(f"Failed to initialize records file at {records_path}. See earlier errors above.")
 
-    # Setup confusion matrix files using the val_dataloader
     if not noval:
         setup_confusion_matrix_files(
             val_dataloader=val_dataloader,
@@ -1479,7 +1206,7 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             orient_pred=orient_pred
         )          
 
-    # GLOBAL TIME VARIABLES / RESUMABLE TRAINING STATE
+    # Resumable timing and early-stopping state
     restored_training_runtime = _apply_resume_training_runtime_state(resume_training_runtime)
     total_epoch_time = float(restored_training_runtime['total_epoch_time'])
     num_completed_epochs = int(restored_training_runtime['num_completed_epochs'])
@@ -1497,9 +1224,8 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             "Best-metric / early-stopping bookkeeping will restart from scratch for this resumed run."
         )
 
-    # --- SWA runtime state (optional) ---
-    # SWA is implemented as a final training tail. During that tail we keep training the base
-    # model normally while maintaining an AveragedModel shadow copy and an SWALR scheduler.
+    # SWA runtime state
+    # Train the base model during the SWA tail while maintaining an averaged shadow.
     swa_model: Optional[AveragedModel] = None
     swa_scheduler: Optional[SWALR] = None
     resumed_swa_state = False
@@ -1534,32 +1260,30 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
         )
 
     if start_epoch >= effective_num_epochs:
-        print(f"No epochs to run: start_epoch={start_epoch} >= effective_num_epochs={effective_num_epochs}. Exiting.")
-        file.close()
-        return
+        print(f"No epochs to run: start_epoch={start_epoch} >= effective_num_epochs={effective_num_epochs}.")
+        if not (swa_mode and resumed_swa_state):
+            file.close()
+            return
+        print('[SWA] Completing final validation and publication from the saved average.')
 
-    # MAIN TRAINING LOOP
+    # Training loop
     for epoch in range(start_epoch, effective_num_epochs):
         epoch_start_time = time.time()
         
         current_lr = [pg['lr'] for pg in optimizer.param_groups]
 
-        # Determine whether we're in the SWA phase for this epoch.
         in_swa_phase = bool(swa_mode and (swa_start is not None) and (epoch >= swa_start))
 
-        # Lazily initialize SWA objects the moment we enter the SWA phase.
         if in_swa_phase and swa_model is None:
             print(f"[SWA] Starting SWA phase at epoch {epoch + 1} (0-index={epoch}, swa_start={swa_start}).")
             swa_model = AveragedModel(model)
             swa_model.to(device)
             swa_scheduler = SWALR(optimizer, swa_lr=swa_lr, anneal_epochs=swa_anneal_epochs)
 
-        # Pick the active scheduler for this epoch.
         active_scheduler = swa_scheduler if in_swa_phase else scheduler
 
-        # Training
         # The 'plateau' scheduler needs a manual warmup, handled by this flag.
-        # The other schedulers have warmup built into their SequentialLR wrapper.
+        # Other batch schedulers handle their own warmup.
         is_plateau_warmup_epoch = (not in_swa_phase) and (epoch == 0 and start_epoch == 0 and scheduler_type == 'plateau')
 
         (train_pose_accuracy, train_orient_accuracy, train_recon_loss_avg, train_weighted_recon_loss_avg, 
@@ -1574,7 +1298,6 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
         )
         total_inputs += epoch_inputs
 
-        # Validation
         if not noval:
             (val_pose_accuracy, val_orient_accuracy, val_recon_loss_avg, val_pose_loss_avg, val_weighted_pose_loss_avg,
             val_orient_loss_avg, val_weighted_orient_loss_avg, val_total_loss_avg, pose_conf_matrix, orient_conf_matrix, pose_macro_f1, orient_macro_f1,
@@ -1596,26 +1319,18 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                 noise_level,
             )
         else:
-            # Substitute training metrics for validation metrics when noval=True
-            print("noval=True: Substituting training metrics for validation metrics.")
-            val_pose_accuracy = train_pose_accuracy
-            val_orient_accuracy = train_orient_accuracy
-            val_recon_loss_avg = train_recon_loss_avg
-            val_pose_loss_avg = train_pose_loss_avg
-            val_weighted_pose_loss_avg = train_weighted_pose_loss_avg
-            val_orient_loss_avg = train_orient_loss_avg
-            val_weighted_orient_loss_avg = train_weighted_orient_loss_avg
-            val_total_loss_avg = train_total_loss_avg
-            # Set metrics without training equivalents to default values
+            print("noval=True: Validation metrics are unavailable; training loss controls checkpoint selection.")
+            val_pose_accuracy = val_orient_accuracy = float('nan')
+            val_recon_loss_avg = val_pose_loss_avg = val_weighted_pose_loss_avg = float('nan')
+            val_orient_loss_avg = val_weighted_orient_loss_avg = val_total_loss_avg = float('nan')
             pose_conf_matrix = None
             orient_conf_matrix = None
-            pose_macro_f1 = 0.0  # Default to 0 as it's used for comparison
-            orient_macro_f1 = 0.0
+            pose_macro_f1 = None
+            orient_macro_f1 = None
             combined_conf_matrix = None
-            combined_macro_f1 = 0.0
+            combined_macro_f1 = None
 
 
-        # Step the scheduler(s) after validation / epoch end
         if in_swa_phase:
             # SWA phase: update the running average model and step SWALR *per epoch*.
             if swa_model is None or swa_scheduler is None:
@@ -1623,14 +1338,10 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             swa_model.update_parameters(model)
             swa_scheduler.step()
         else:
-            # Normal (non-SWA) training phase: keep existing scheduler behavior.
             if scheduler_type == 'plateau' and not is_plateau_warmup_epoch:
                 # The plateau scheduler is always stepped per-epoch, but only after its warmup is complete.
                 if noval:
-                    # When noval is true, we need a metric to step the scheduler.
-                    # If pose_pred is on, we'll use training loss as a proxy.
-                    # A more robust approach could be to calculate F1 on the training set,
-                    # but that would add overhead. Using loss is a reasonable default.
+                    # Without validation, step the plateau scheduler using training loss.
                     metric_for_scheduler = train_total_loss_avg
                     scheduler.step(train_total_loss_avg)
                 else:
@@ -1638,16 +1349,13 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                         scheduler.step(-pose_macro_f1)
                     else:
                         scheduler.step(val_total_loss_avg)
-        # The per-batch schedulers are stepped in train_one_epoch, so no 'else' block is needed here.
 
-        # Log confusion matrices
         if not noval:
             if pose_pred:
                 log_confusion_matrix(pose_conf_matrix, val_dataloader.dataset.dataset.pose_dict.keys(), epoch+1, pose_conf_matrix_path)
             if orient_pred:
                 log_confusion_matrix(orient_conf_matrix, val_dataloader.dataset.dataset.orient_dict.keys(), epoch+1, orient_conf_matrix_path)
 
-            # Log combined confusion matrix
             if pose_pred and orient_pred:
                 pose_class_names = sorted(val_dataloader.dataset.dataset.pose_dict.keys())
                 orient_class_names = sorted(val_dataloader.dataset.dataset.orient_dict.keys())
@@ -1658,6 +1366,7 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
         epoch_time = epoch_end_time - epoch_start_time
         total_epoch_time += epoch_time
         num_completed_epochs += 1
+        record_work("supervised_epochs", completed=1)
         avg_time_per_epoch = total_epoch_time / num_completed_epochs
 
 
@@ -1674,8 +1383,8 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             orient_pred=bool(orient_pred),
             train_total_loss_avg=float(train_total_loss_avg),
             val_total_loss_avg=float(val_total_loss_avg),
-            pose_macro_f1=float(pose_macro_f1),
-            orient_macro_f1=float(orient_macro_f1),
+            pose_macro_f1=pose_macro_f1,
+            orient_macro_f1=orient_macro_f1,
         )
         if metric_name == 'pose_macro_f1':
             best_metric = best_pose_macro_f1
@@ -1691,14 +1400,8 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                 best_orient_macro_f1 = float(early_stopping_metric)
             else:
                 best_val_loss = -float(early_stopping_metric)
-            epochs_since_improvement = 0  # Reset epochs since improvement
-            # Save best model checkpoint (only keep one)
-            if best_model_path is not None and os.path.exists(best_model_path):
-                try:
-                    os.remove(best_model_path)
-                except Exception as e:
-                    print(f"Warning: Could not delete previous best model checkpoint: {best_model_path}. Error: {e}")
-            # Save new best model
+            epochs_since_improvement = 0  
+            previous_best_path = best_model_path
             best_model_filename = f"{run_name}_best_model_epoch_{epoch+1}.pth"
             best_model_path = os.path.join(checkpoint_dir, best_model_filename)
             save_checkpoint(
@@ -1728,14 +1431,16 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                     total_inputs=total_inputs,
                 ),
             )
+            if previous_best_path and previous_best_path != best_model_path and os.path.exists(previous_best_path):
+                try:
+                    os.remove(previous_best_path)
+                except OSError as exc:
+                    print(f'Warning: previous best checkpoint retained at {previous_best_path}: {exc}')
         else:
-            epochs_since_improvement += 1  # Increment epochs since improvement
+            epochs_since_improvement += 1
 
-        if (not swa_mode) and epochs_since_improvement >= patience:
-            print(f"No improvement in {patience} epochs. Stopping training.")
-            break
+        stop_requested = (not swa_mode) and epochs_since_improvement >= patience
 
-        # Prepare a dictionary of metrics for logging
         if in_swa_phase:
             lr_phase = 'swa'
         elif is_plateau_warmup_epoch or (scheduler_type != 'plateau' and warmup_steps > 0 and global_step < warmup_steps):
@@ -1784,13 +1489,12 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             'epochs_since_improvement': epochs_since_improvement
         }
 
-        # Log epoch results
+        metrics['validation_available'] = not noval
         log_epoch_results(
             file, writer, epoch, metrics, headers,
             pose_pred, orient_pred, recon
         )
 
-        # Also log to wandb
         if wandb_log:
             log_wandb_metrics(epoch, metrics, pose_pred, orient_pred, recon)
 
@@ -1803,7 +1507,8 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             print(f'Recon: Train Loss: {train_recon_loss_avg:.4f}, Val Loss: {val_recon_loss_avg:.4f}')
 
 
-        if (epoch + 1) % checkpoint_interval == 0:
+        if ((checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0)
+                or stop_requested or epoch + 1 == effective_num_epochs):
             save_checkpoint(
                 epoch, global_step, model, optimizer, scheduler, pose_dict, orient_dict, scaler, checkpoint_dir, run_name,
                 pose_pred, orient_pred, recon, split_filenames,
@@ -1830,14 +1535,17 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                 ),
             )
 
-        # Periodic memory cleanup.
+        if stop_requested:
+            print(f"No improvement in {patience} epochs. Stopping after recording/checkpointing epoch {epoch + 1}.")
+            break
+
         if MEMORY_CLEANUP_EVERY_EPOCHS and ((epoch + 1) % int(MEMORY_CLEANUP_EVERY_EPOCHS) == 0):
             print(f"[Memory cleanup] epoch {epoch + 1} (every {MEMORY_CLEANUP_EVERY_EPOCHS} epochs)")
             cleanup_memory()
 
 
 
-    # --- Finalize + save SWA checkpoint (optional) ---
+    # Final averaged-weight artifact.
     if swa_mode:
         if swa_model is None:
             print("[SWA] swa_mode enabled but SWA phase never initialized; skipping SWA checkpoint.")
@@ -1850,7 +1558,6 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             except Exception as e:
                 print(f"[SWA] Warning: update_bn failed (continuing anyway): {e}")
 
-            # Optional SWA validation
             if not noval:
                 (swa_val_pose_accuracy, swa_val_orient_accuracy, swa_val_recon_loss_avg, swa_val_pose_loss_avg, swa_val_weighted_pose_loss_avg,
                 swa_val_orient_loss_avg, swa_val_weighted_orient_loss_avg, swa_val_total_loss_avg, swa_pose_conf_matrix, swa_orient_conf_matrix, swa_pose_macro_f1, swa_orient_macro_f1,
@@ -1868,6 +1575,8 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                     pose_weight,
                     orient_weight,
                     recon_weight,
+                    mask_p,
+                    noise_level,
                 )
 
                 # Log SWA confusion matrices using a sentinel epoch label
@@ -1882,7 +1591,6 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                     combined_class_names = [f"{p}-{o}" for p in pose_class_names for o in orient_class_names]
                     log_confusion_matrix(swa_combined_conf_matrix, combined_class_names, swa_epoch_label, combined_conf_matrix_path)
 
-                # Append a final SWA summary row to the training record
                 swa_n_averaged = getattr(swa_model, 'n_averaged', 0)
                 if torch.is_tensor(swa_n_averaged):
                     swa_n_averaged = int(swa_n_averaged.item())
@@ -1894,6 +1602,7 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                     'LR Phase': 'swa',
                     'SWA Active': 1,
                     'SWA Snapshots Averaged': swa_n_averaged,
+                    'Validation Available': 1,
                     'Val Total Loss Avg': swa_val_total_loss_avg,
                     'Val Pose Accuracy': swa_val_pose_accuracy,
                     'Val Orient Accuracy': swa_val_orient_accuracy,
@@ -1912,11 +1621,11 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
                 except Exception as e:
                     print(f"[SWA] Warning: failed to append SWA row to records CSV (continuing): {e}")
 
-                print(f"[SWA] Validation summary: total_loss={swa_val_total_loss_avg:.4f} | pose_F1={swa_pose_macro_f1:.4f} | orient_F1={swa_orient_macro_f1:.4f}")
+                print(f"[SWA] Validation summary: total_loss={swa_val_total_loss_avg:.4f} | pose_F1={swa_pose_macro_f1} | orient_F1={swa_orient_macro_f1}")
             else:
                 print("[SWA] noval=True: Skipping SWA validation.")
 
-            # Save SWA checkpoint (weights + metadata; no optimizer/scheduler state because this is a final averaged artifact)
+            # Final SWA weights omit optimizer/scheduler state.
             swa_checkpoint_path = os.path.join(checkpoint_dir, f"{run_name}_swa_model.pth")
             global_vars = build_checkpoint_global_vars(
                 pose_pred=pose_pred,
@@ -1949,12 +1658,15 @@ def main_worker(train_dataset: Subset, val_dataset: Subset, pose_dict: Optional[
             if orient_pred:
                 checkpoint_data['orient_dict'] = orient_dict
 
-            torch.save(checkpoint_data, swa_checkpoint_path)
+            if split_filenames:
+                checkpoint_data.update({key: split_filenames[key] for key in
+                    ('train_filenames', 'val_filenames', 'training_data_identity')
+                    if key in split_filenames})
+
+            atomic_save_checkpoint(checkpoint_data, swa_checkpoint_path)
             print(f"[SWA] Checkpoint saved to {swa_checkpoint_path}")
 
 
 
     file.close()
     print("Training loop completed")
-
-

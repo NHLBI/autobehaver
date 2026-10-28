@@ -1,17 +1,7 @@
-"""Optimized subset-level workers for FeatureImp committee training.
+"""Train all folds of one FeatureImp subset in a worker.
 
-This module preserves the committee-design analysis while reducing hot-path
-redundancy for the common binary case.
-
-Key differences versus the per-fold worker path:
-- one worker task trains all folds for a given feature subset;
-- each fold computes predictions/SHAP on the all-groups matrix once, then slices
-  train/test rows from that result;
-- worker payloads return per-subset aggregated sums/counts instead of separate
-  large arrays for every fold; and
-- DataFrame cleaning / feature-name lookup is done once per worker process.
-
-The per-fold worker remains in :mod:`committee` for low-level regression tests.
+Evaluate each fold on the all-groups matrix once and return subset-level sums and counts
+for aggregation.
 """
 
 from __future__ import annotations
@@ -21,6 +11,7 @@ import os
 import traceback
 from typing import Any, Mapping
 
+from .integrity import strict_bool
 import numpy as np
 import pandas as pd
 import shap
@@ -41,6 +32,10 @@ def _prepare_feature_matrix_and_index(df_or_array):
     """Return a clean ndarray plus feature->column mapping."""
     if df_or_array is None:
         return None, None
+    if isinstance(df_or_array, dict) and 'memmap_path' in df_or_array:
+        arr = np.load(df_or_array['memmap_path'], mmap_mode='r', allow_pickle=False)
+        arr.flags.writeable = False
+        return arr, {feat: idx for idx, feat in enumerate(df_or_array['feature_columns'])}
     if isinstance(df_or_array, pd.DataFrame):
         clean = df_or_array
         if clean.columns.duplicated().any():
@@ -56,7 +51,7 @@ def _prepare_feature_matrix_and_index(df_or_array):
 
 
 def _init_fast_pool_worker(X_train_full, X_shap_full, y_encoded_train, le):
-    """Initializer for optimized subset-level workers."""
+    """Prepare ordered feature arrays and label metadata once per subset worker."""
     global _FAST_WORKER_Y_ENCODED_TRAIN, _FAST_WORKER_LE
     global _FAST_WORKER_X_TRAIN_NP, _FAST_WORKER_X_SHAP_NP
     global _FAST_WORKER_FEATURE_INDEX_TRAIN, _FAST_WORKER_FEATURE_INDEX_SHAP
@@ -74,6 +69,15 @@ def _init_fast_pool_worker(X_train_full, X_shap_full, y_encoded_train, le):
         _FAST_WORKER_FEATURE_INDEX_SHAP = _FAST_WORKER_FEATURE_INDEX_TRAIN
 
 
+def _clear_fast_pool_worker():
+    """Release task-owned memory maps before successful scratch cleanup."""
+    global _FAST_WORKER_X_TRAIN_NP, _FAST_WORKER_X_SHAP_NP
+    for array in (_FAST_WORKER_X_TRAIN_NP, _FAST_WORKER_X_SHAP_NP):
+        if isinstance(array, np.memmap) and not array._mmap.closed:
+            array._mmap.close()
+    _FAST_WORKER_X_TRAIN_NP = _FAST_WORKER_X_SHAP_NP = None
+
+
 def _build_worker_error(
     *,
     h_hit: int,
@@ -83,6 +87,7 @@ def _build_worker_error(
     permutation_idx: int | None,
     exc: BaseException,
 ) -> dict[str, Any]:
+    """Record the failed task identity, exception, and traceback."""
     return {
         '__worker_error__': True,
         'h_hit': h_hit,
@@ -97,25 +102,38 @@ def _build_worker_error(
 
 
 def _save_model_path(*, model, paths, h_hit, subset_idx, fold_idx, is_permuted, permutation_idx):
+    """Write and verify one fold model atomically in its real or permutation-specific
+    directory.
+    """
     if not paths or 'models_folder' not in paths:
         return None
+    import tempfile
+    folder = paths['models_folder']
+    if is_permuted:
+        folder = os.path.join(folder, f"perm{permutation_idx}" if permutation_idx is not None else 'perm')
+    os.makedirs(folder, exist_ok=True)
+    destination = os.path.join(folder, f'h{h_hit}_s{subset_idx}_f{fold_idx}.json')
+    fd, temporary = tempfile.mkstemp(dir=folder, suffix='.json')
+    os.close(fd)
     try:
-        base_models_folder = paths['models_folder']
-        os.makedirs(base_models_folder, exist_ok=True)
-        if is_permuted:
-            perm_tag = f"perm{permutation_idx}" if permutation_idx is not None else "perm"
-            model_folder = os.path.join(base_models_folder, perm_tag)
-            os.makedirs(model_folder, exist_ok=True)
-        else:
-            model_folder = base_models_folder
-        model_path = os.path.join(model_folder, f'h{h_hit}_s{subset_idx}_f{fold_idx}.json')
-        model.save_model(model_path)
-        return model_path
-    except Exception:
-        return None
+        booster = model.get_booster()
+        # Persist the same sklearn classifier metadata using the native booster;
+        # this also works when sklearn changed its estimator-tag mixin API.
+        booster.set_attr(scikit_learn='{"_estimator_type": "classifier"}')
+        booster.save_model(temporary)
+        verified = xgb.Booster()
+        verified.load_model(temporary)
+        if booster.num_features() != verified.num_features() or booster.feature_names != verified.feature_names:
+            raise ValueError('Persisted model feature width differs')
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return destination
 
 
 def _positive_class_shap(explainer: shap.TreeExplainer, X: np.ndarray) -> np.ndarray:
+    """Return positive-class SHAP as a sample-by-feature array."""
     shap_values = explainer.shap_values(X)
     if isinstance(shap_values, list):
         shap_values = shap_values[1]
@@ -139,7 +157,7 @@ def _train_subset_worker(task: Mapping[str, Any]) -> dict[str, Any]:
     max_depth = int(task['max_depth'])
     global_random_seed = task.get('global_random_seed', None)
     paths = task.get('paths', None)
-    is_permuted = bool(task.get('is_permuted', False))
+    is_permuted = strict_bool(task.get('is_permuted', False))
     permutation_idx = task.get('permutation_idx', None)
     y_permuted_by_fold = task.get('y_permuted_by_fold', None)
     y_original_full = task.get('y_original_full', None)

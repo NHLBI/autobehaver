@@ -1,15 +1,14 @@
-"""Schema utilities for keyprenorm.
+"""Read feature headers and identify KeyPreNorm schema mismatches.
 
-Key behaviors:
-  - Canonical columns are defined either by the first CSV header or by the Header
-    column in norm_params.csv.
-  - Files whose column set differs from the canonical schema are skipped.
-  - Files with the same set but different order are reindexed during normalization.
+Canonical order comes from the first input or normalization parameters.
+The coordinator rejects mismatched column sets before normalization; matching
+sets in a different order are reindexed.
 """
 
 from __future__ import annotations
 
 import logging
+import csv
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -34,12 +33,12 @@ def find_processing_log(input_dir: str) -> Optional[str]:
 
 
 def read_csv_header_columns(csv_path: str) -> Tuple[Optional[List[str]], Optional[str]]:
-    """Read only the header row from a CSV and return columns.
-
-    Returns (columns, error_string). If error_string is not None, columns will be None.
-    """
+    """Read a CSV header and return (columns, error), with columns None on failure."""
     try:
-        cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+        with open(csv_path, newline='', encoding='utf-8-sig') as handle:
+            cols = next(csv.reader(handle))
+        if not cols or any(not c.strip() for c in cols) or len(cols) != len(set(cols)):
+            raise ValueError('Blank or duplicate feature headers are not a valid schema.')
         return cols, None
     except Exception as e:
         return None, str(e)
@@ -50,13 +49,10 @@ def filter_files_by_schema(
     canonical_columns: Sequence[str],
     max_examples: int = 10,
 ) -> Tuple[List[str], List[Dict[str, object]]]:
-    """Filter out CSVs whose column set differs from canonical_columns.
+    """Select files with the canonical column set and report every rejected input.
 
-    Same set, different order is OK (we reindex). Missing/extra columns (or unreadable headers)
-    cause the file to be skipped.
-
-    Returns:
-        good_files, bad_details
+    Accept different column ordering because normalization reindexes it. Return
+    (good_files, bad_details) for the coordinator to enforce the stage contract.
     """
     canonical_set = set(canonical_columns)
     good: List[str] = []
@@ -140,7 +136,7 @@ def resolve_glob_pattern(input_folder: str, pattern: str) -> str:
 
 
 def summarize_bad_schema(bad_schema: List[Dict[str, object]], max_items: int = 50) -> List[Dict[str, object]]:
-    """Compact schema-mismatch details for manifests (avoid huge JSON)."""
+    """Limit schema-rejection details for run records."""
     out: List[Dict[str, object]] = []
     for item in bad_schema[:max_items]:
         missing = item.get("missing", []) or []

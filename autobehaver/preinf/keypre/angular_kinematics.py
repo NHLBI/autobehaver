@@ -1,4 +1,4 @@
-"""Angular kinematics + curvature features for keypre."""
+"""Derive body-angle kinematics and path curvature for KeyPre."""
 
 from __future__ import annotations
 
@@ -10,18 +10,21 @@ rolling_windows = settings.rolling_windows
 
 
 def calculate_angular_velocity_features(dataframe, intervals):
-    # Calculate the difference in angle from the previous and next frames
+    """Average adjacent wrapped angle changes into degrees per frame.
+
+    Wrap changes to [-180, 180), fill missing differences with zero, and add
+    centered rolling means and standard deviations.
+    """
     angle_diff_prev = dataframe["angle"].diff().fillna(0)
     angle_diff_next = (dataframe["angle"].shift(-1) - dataframe["angle"]).fillna(0)
 
-    # Normalize the angle changes to be within the range [-180, 180]
+    # Wrap angle changes to [-180, 180).
     angle_diff_prev = (angle_diff_prev + 180) % 360 - 180
     angle_diff_next = (angle_diff_next + 180) % 360 - 180
 
     # Compute the instantaneous angular velocity by averaging the neighboring differences
     angular_velocity_inst = (angle_diff_prev + angle_diff_next) / 2
 
-    # Store the instantaneous angular velocity in the DataFrame with _inst tag
     dataframe["angular_velocity_inst"] = angular_velocity_inst
 
     # If intervals are provided, compute the rolling average for each interval
@@ -42,7 +45,10 @@ def calculate_angular_velocity_features(dataframe, intervals):
 
 
 def calculate_angular_acceleration_features(dataframe, intervals):
-    """Calculates the angular acceleration as the rate of change of angular velocity."""
+    """Differentiate angular velocity centrally into degrees per frame squared.
+
+    Fill missing derivatives with zero and add centered rolling means.
+    """
     # Calculate as the central difference of the instantaneous angular velocity
     dataframe["angular_acceleration_inst"] = (
         (dataframe["angular_velocity_inst"].shift(-1) - dataframe["angular_velocity_inst"].shift(1))
@@ -60,7 +66,10 @@ def calculate_angular_acceleration_features(dataframe, intervals):
 
 
 def calculate_angular_jerk_features(dataframe, intervals):
-    """Calculates the angular jerk as the rate of change of angular acceleration."""
+    """Differentiate angular acceleration centrally into degrees per frame cubed.
+
+    Fill missing derivatives with zero and add centered rolling means.
+    """
     # Calculate as the central difference of the instantaneous angular acceleration
     dataframe["angular_jerk_inst"] = (
         (dataframe["angular_acceleration_inst"].shift(-1) - dataframe["angular_acceleration_inst"].shift(1))
@@ -78,16 +87,16 @@ def calculate_angular_jerk_features(dataframe, intervals):
 
 
 def calculate_curvature_features(dataframe):
-    """Calculates path curvature (rad/pixel) as (angular velocity) divided by speed."""
+    """Calculate curvature in radians per pixel as deg2rad(angular_velocity)/(speed + 1e-6)."""
 
     epsilon = 1e-6  # Small constant to prevent division by zero
 
-    # --- 1. Instantaneous Curvature ---
+    # 1. Instantaneous Curvature
     if "angular_velocity_inst" in dataframe.columns and "speed_inst" in dataframe.columns:
         omega_rad = np.deg2rad(dataframe["angular_velocity_inst"])
         dataframe["curvature_inst"] = omega_rad / (dataframe["speed_inst"] + epsilon)
 
-    # --- 2. Rolling Interval Curvature ---
+    # 2. Rolling Interval Curvature
     # Use the velocity intervals as the reference for which smoothed features to calculate
     for interval in rolling_windows:
         ang_vel_col = f"angular_velocity_{interval}"
@@ -100,7 +109,7 @@ def calculate_curvature_features(dataframe):
 
 
 def add_angular_kinematics_and_curvature(input_df, poscorr_dict):
-    """Body orientation angular velocity/accel/jerk + curvature features."""
+    """Add body-angle kinematics and curvature to the ordered feature mapping."""
     input_df = calculate_angular_velocity_features(input_df, rolling_windows)
     if "angular_velocity_inst" in input_df.columns:
         poscorr_dict["angular_velocity_inst"] = input_df["angular_velocity_inst"]

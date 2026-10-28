@@ -1,4 +1,4 @@
-"""Smoke tests ensuring feature_matrix constants are defined consistently."""
+"""Check feature-matrix constants and derived relationships."""
 
 
 import unittest
@@ -20,12 +20,12 @@ class TestFeatureMatrixConstants(unittest.TestCase):
         ]:
             self.assertTrue(hasattr(fm, name), f"Missing constant: {name}")
 
-        # Relationship checks (catches stale derived constants)
+        # Derived constants must agree with their source definitions.
         self.assertEqual(int(fm.MIN_CONTEXT_FRAMES), round(float(fm.MIN_CONTEXT_DURATION_S) * float(fm.DEFAULT_VIDEO_FPS)))
         self.assertEqual(int(fm.GROOM_EPISODE_MAX_GAP_FRAMES), round(float(fm.GROOM_EPISODE_MAX_NON_GROOM_GAP_S) * float(fm.DEFAULT_VIDEO_FPS)))
 
     def test_re_imported(self):
-        # feature_matrix should import re (used for parsing sheet names)
+        # Sheet-name parsing requires the regular-expression module.
         self.assertTrue(hasattr(fm, "re"))
         self.assertIsInstance(fm.re, types.ModuleType)
 

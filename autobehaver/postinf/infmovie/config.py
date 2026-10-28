@@ -1,3 +1,5 @@
+"""Define InfMovie clip selection, rendering, and optional registry settings."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,15 +7,13 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class InfMoviePipelineConfig:
-    """Configuration for infmovie in the registry+config pipeline workflow.
+    """Typed runtime options for inference overlays.
 
-    The primary interface is the top-level pipeline YAML config (``config.yaml``)
-    under the ``infmovie:`` section.
+    The command-line interface accepts these options directly and records the
+    resolved values in each run log. Folder and registry discovery are supported.
     """
 
-    # ------------------------------------------------------------------
     # Paths
-    # ------------------------------------------------------------------
     # Folder containing inference CSVs when registry discovery is disabled.
     inference_csv_dir: str | None = None
 
@@ -26,9 +26,7 @@ class InfMoviePipelineConfig:
     # Optional substring filter applied to recording_id / filenames (case-insensitive)
     file_filter: str | None = None
 
-    # ------------------------------------------------------------------
     # Mode
-    # ------------------------------------------------------------------
     # manual | interesting | qc | full
     mode: str = "manual"
 
@@ -60,11 +58,10 @@ class InfMoviePipelineConfig:
     interesting_min_unique_labels: int = 3
     interesting_min_changes: int = 2
 
-    # ------------------------------------------------------------------
     # Rendering
-    # ------------------------------------------------------------------
     num_workers: int = 8
     skip_first_n_frames: int = 5
+    source_frame_offset: int | None = None
 
     timeline: str = "both"  # none|pose|orient|both
     timeline_compare: bool = False
@@ -92,9 +89,7 @@ class InfMoviePipelineConfig:
     write_plan_csv: bool = True
     write_run_log: bool = True
 
-    # ------------------------------------------------------------------
     # Project registry (optional)
-    # ------------------------------------------------------------------
     registry_enabled: bool = False
     registry_csv: str | None = None
     registry_lock_timeout_sec: int = 120

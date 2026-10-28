@@ -1,7 +1,5 @@
-"""Shared helpers for FeatureImp comparison baselines.
-
-This module contains reusable label, probability, prediction, and SHAP-summary
-helpers used by the retained comparison baselines.
+"""Shared label, probability, prediction, and SHAP-summary helpers for FeatureImp
+comparison baselines.
 """
 
 from __future__ import annotations
@@ -20,6 +18,9 @@ _LOG_LOSS_EPS = 1e-15
 
 
 def _make_group_labels_binary(df_for_training: pd.DataFrame, group_a: str, group_b: str) -> np.ndarray:
+    """Encode the declared training groups as class 0 and class 1, rejecting other
+    labels.
+    """
     groups = df_for_training["group"].astype(str).to_numpy(copy=False)
     out = np.empty(len(groups), dtype=np.int32)
     for idx, g in enumerate(groups.tolist()):
@@ -35,6 +36,7 @@ def _make_group_labels_binary(df_for_training: pd.DataFrame, group_a: str, group
     return out
 
 def _sigmoid(logits: np.ndarray) -> np.ndarray:
+    """Convert margins to probabilities with a numerically stable sigmoid."""
     arr = np.asarray(logits, dtype=np.float64)
     out = np.empty_like(arr, dtype=np.float64)
     pos_mask = arr >= 0
@@ -45,10 +47,12 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
     return out
 
 def _probabilities_from_logits(logits: np.ndarray) -> np.ndarray:
+    """Convert margins to bounded class-1 probabilities."""
     probs = _sigmoid(np.asarray(logits, dtype=np.float64))
     return np.clip(probs, _LOG_LOSS_EPS, 1.0 - _LOG_LOSS_EPS)
 
 def _compute_binary_metrics(y_true: np.ndarray, prob_class1: np.ndarray) -> Dict[str, float]:
+    """Calculate binary metrics from finite class-1 probabilities and aligned labels."""
     from sklearn.metrics import (
         accuracy_score,
         balanced_accuracy_score,
@@ -95,6 +99,7 @@ def _compute_binary_metrics(y_true: np.ndarray, prob_class1: np.ndarray) -> Dict
     }
 
 def _resolve_feature_matrix(df_or_array: pd.DataFrame | np.ndarray, feature_names: Sequence[str]) -> np.ndarray:
+    """Select ordered feature columns or validate the width of an array input."""
     if isinstance(df_or_array, pd.DataFrame):
         return np.asarray(df_or_array.loc[:, list(feature_names)], dtype=np.float64)
     arr = np.asarray(df_or_array, dtype=np.float64)
@@ -108,6 +113,9 @@ def _resolve_feature_matrix(df_or_array: pd.DataFrame | np.ndarray, feature_name
     return arr
 
 def _build_training_to_all_positions(df_for_training: pd.DataFrame, df_for_shap_and_agg: pd.DataFrame) -> np.ndarray:
+    """Resolve training rows in the all-groups matrix and reject ambiguous animal
+    identities.
+    """
     if len(df_for_training) == len(df_for_shap_and_agg):
         same_order = False
         if "individual" in df_for_training.columns and "individual" in df_for_shap_and_agg.columns:
@@ -161,6 +169,9 @@ def _build_predictions_dataframe(
     insample_prob_group_b: np.ndarray,
     all_prob_group_b: np.ndarray,
 ) -> pd.DataFrame:
+    """Build prediction tables with out-of-fold values for training rows and averaged
+    values for other groups.
+    """
     prob_cols = [f"Prob_{training_group_a}", f"Prob_{training_group_b}"]
     train_base = df_for_training[["individual", "group"]].reset_index(drop=True).copy() if "individual" in df_for_training.columns else df_for_training[["group"]].reset_index(drop=True).copy()
     if "individual" not in train_base.columns:
@@ -222,6 +233,9 @@ def _build_shap_summary_frames(
     insample_shap_values: np.ndarray,
     all_groups_avg_shap_values: np.ndarray,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Summarize signed and absolute positive-class SHAP by training group and all-group
+    view.
+    """
     oof_shap = np.asarray(oof_shap_values, dtype=np.float64)
     insample_shap = np.asarray(insample_shap_values, dtype=np.float64)
     all_shap = np.asarray(all_groups_avg_shap_values, dtype=np.float64)
@@ -291,6 +305,7 @@ def _write_shap_outputs(
     summary_df: pd.DataFrame,
     combined_df: pd.DataFrame,
 ) -> Tuple[str, str]:
+    """Write consolidated and in-sample/out-of-fold SHAP workbooks."""
     summary_path = os.path.join(out_dir, SHAP_SUMMARY_FILENAME)
     combined_path = os.path.join(out_dir, SHAP_COMBINED_FILENAME)
     save_consolidated_summary_with_formatting(summary_df, summary_path)

@@ -1,12 +1,7 @@
-"""DeepLabCut inference wrapper.
+"""Wrap DeepLabCut inference as a pipeline stage.
 
-This stage is intentionally a thin wrapper around DeepLabCut (DLC) so that DLC
-inference can live inside the Autobehaver pipeline.
-
-Notes:
-  - Heavy dependencies (deeplabcut, tensorflow) are imported lazily at runtime so
-    that the rest of Autobehaver can be imported in environments where DLC is
-    not installed.
+Load DeepLabCut and TensorFlow when inference runs so other stages can
+be imported without those optional dependencies.
 """
 
 from __future__ import annotations

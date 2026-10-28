@@ -1,11 +1,5 @@
-"""autobehaver.postinf.featureimp.committee
-
-Committee (K-Fold) model training + SHAP extraction.
-
-This module contains the multiprocessing initializer/worker and specialist model
-training utilities used by the feature-importance analysis ("committee design").
-
-It provides the per-fold committee worker implementation.
+"""Train individual specialist folds and extract predictions and positive-class SHAP
+values for FeatureImp.
 """
 
 from __future__ import annotations
@@ -28,25 +22,13 @@ from .config import DEFAULT_SETTINGS
 from .prep import filter_data_by_sex
 
 
-# --------------------------------------------------------------------------------------
 # Binary label encoder + fixed index constants
-# --------------------------------------------------------------------------------------
 
 
 class FixedBinaryLabelEncoder:
-    """
-    Fixed mapping between two class labels and integer codes ``{0, 1}``.
+    """Encode group A as class 0 and group B as class 1.
 
-    Unlike ``sklearn.preprocessing.LabelEncoder``, this encoder preserves an explicit ordering:
-        ``class0 -> 0`` and ``class1 -> 1``.
-
-    The pipeline relies on this stable mapping so that:
-    - probability columns are interpreted consistently, and
-    - SHAP values for the positive class always correspond to ``training_group_b``.
-
-    Args:
-        class0: Label for class 0 (training_group_a).
-        class1: Label for class 1 (training_group_b).
+    This fixed order defines probability columns and the positive-class SHAP direction.
     """
 
     def __init__(self, class0, class1):
@@ -79,11 +61,8 @@ NEGATIVE_CLASS_INDEX = 0
 POSITIVE_CLASS_INDEX = 1
 
 
-# --------------------------------------------------------------------------------------
 # XGBoost committee training
-# --------------------------------------------------------------------------------------
 # Multiprocessing shared state
-# ---------------------------------------------------------------------
 # These are populated once per worker process via the Pool initializer
 _WORKER_X_TRAIN_FULL = None
 _WORKER_X_SHAP_FULL = None
@@ -91,21 +70,7 @@ _WORKER_Y_ENCODED_TRAIN = None
 _WORKER_LE = None
 
 def _init_pool_worker(X_train_full, X_shap_full, y_encoded_train, le):
-    """
-    Pool initializer for multiprocessing workers.
-    
-    Large read-only objects are cached in module-level globals inside each worker process so that
-    individual tasks can pass ``None`` for these arguments and avoid repeated pickling / IPC overhead.
-    
-    Args:
-        X_train_full: Full training feature matrix (DataFrame) used for specialist model fitting.
-        X_shap_full: Feature matrix (DataFrame) used for SHAP evaluation (typically all groups).
-        y_encoded_train: Encoded integer labels aligned with ``X_train_full``.
-        le: Label encoder used for mapping group labels <-> integers.
-    
-    Returns:
-        None
-    """
+    """Cache read-only matrices and label metadata once per worker process."""
     global _WORKER_X_TRAIN_FULL, _WORKER_X_SHAP_FULL, _WORKER_Y_ENCODED_TRAIN, _WORKER_LE
     _WORKER_X_TRAIN_FULL = X_train_full
     _WORKER_X_SHAP_FULL = X_shap_full
@@ -114,28 +79,12 @@ def _init_pool_worker(X_train_full, X_shap_full, y_encoded_train, le):
 
 
 def _train_subset_fold_worker(args):
+    """Train one specialist fold and return its predictions, SHAP arrays, and task
+    metadata.
+
+    The task tuple identifies the coverage round, subset, fold, feature order, and
+    optional permutation. Failures return a structured worker-error dictionary.
     """
-    Train a single model for a specific (h_hit, feature_subset, fold) combination.
-    
-    Args:
-        args: Tuple of (
-            h_hit, subset_idx, fold_idx, selected_features,
-            train_indices, test_indices,
-            X_train_full, X_shap_full, y_encoded_train,
-            df_train_fold, df_test_fold, df_for_shap_and_agg,
-            num_classes, le, model_subsample, n_estimators,
-            learning_rate, max_depth, paths,
-            is_permuted, permutation_idx, y_permuted_train, df_for_training
-        )
-        - is_permuted: If True, use permuted labels for training
-        - permutation_idx: Index of permutation iteration (if is_permuted=True)
-        - y_permuted_train: Permuted labels array (full length, will be indexed by train_indices)
-        - df_for_training: Full training DataFrame (for reference, can be None if not permuted)
-    
-    Returns:
-        dict with results or None if failed
-    """
-    # Unpack args
     if len(args) not in {23, 24}:
         raise ValueError(
             f"Unexpected number of arguments: {len(args)}. Expected 23 or 24."
@@ -160,10 +109,8 @@ def _train_subset_fold_worker(args):
          is_permuted, permutation_idx, y_permuted_train, df_for_training,
          global_random_seed) = args
 
-    # ---------------------------------------------------------------------
-    # Speed: avoid per-task pickling of huge matrices
+    # Reuse the read-only matrices initialized in each worker.
     # Allow these to be None and pull from Pool initializer globals instead.
-    # ---------------------------------------------------------------------
     global _WORKER_X_TRAIN_FULL, _WORKER_X_SHAP_FULL, _WORKER_Y_ENCODED_TRAIN, _WORKER_LE
 
     if X_train_full is None:
@@ -175,7 +122,7 @@ def _train_subset_fold_worker(args):
     if le is None:
         le = _WORKER_LE
 
-    # Hard fail fast if someone forgot to wire the initializer
+    # Require initialized matrices before accessing fold indices.
     if X_train_full is None:
         raise RuntimeError(
             "Worker missing X_train_full. Did you forget to create the Pool with "
@@ -187,16 +134,14 @@ def _train_subset_fold_worker(args):
             "initializer=_init_pool_worker and initargs=(X_train_full, X_shap_full, y_encoded_train, le)?"
         )
     try:
-        # NORMAL MODE: Train single model (existing code)
-        # Prepare data for this fold and feature subset
+        # Train the selected real or permuted specialist fold.
         X_train_subset = X_train_full.iloc[train_indices][selected_features]
         X_test_subset = X_train_full.iloc[test_indices][selected_features]
         
-        # Handle permuted labels
         if is_permuted and y_permuted_train is not None:
             # Use permuted labels for training (encode them)
-            y_train_fold_raw = y_permuted_train[train_indices]  # String labels
-            y_train_fold = le.transform(y_train_fold_raw)  # Encode permuted labels
+            y_train_fold_raw = y_permuted_train[train_indices]  
+            y_train_fold = le.transform(y_train_fold_raw)  
             # Test set: always use true labels (not permuted)
             y_test_fold = y_encoded_train[test_indices]
         else:
@@ -204,7 +149,6 @@ def _train_subset_fold_worker(args):
             y_train_fold = y_encoded_train[train_indices]
             y_test_fold = y_encoded_train[test_indices]
     
-        # Clean DataFrames
         if isinstance(X_train_subset, pd.DataFrame):
             if X_train_subset.columns.duplicated().any():
                 X_train_subset = X_train_subset.loc[:, ~X_train_subset.columns.duplicated()]
@@ -219,7 +163,6 @@ def _train_subset_fold_worker(args):
                 X_test_subset.columns = X_test_subset.columns.get_level_values(-1)
             X_test_subset = X_test_subset.values
         
-        # Train model
         model = xgb.XGBClassifier(
             n_estimators=n_estimators,
             learning_rate=learning_rate,
@@ -245,7 +188,6 @@ def _train_subset_fold_worker(args):
         if isinstance(shap_test, list):
             shap_test = shap_test[1]
         
-        # Get predictions
         probas_train = model.predict_proba(X_train_subset).astype(np.float32)
         probas_test = model.predict_proba(X_test_subset).astype(np.float32)
         
@@ -276,7 +218,6 @@ def _train_subset_fold_worker(args):
             probas_all_groups = model.predict_proba(X_shap_subset).astype(np.float32)
         
         # Save model
-        # IMPORTANT:
         # - Real models are reloaded later for logit aggregation and (optionally) weighted SHAP.
         # - Permuted models must never overwrite real models; save them into a perm-specific folder.
         model_path = None
@@ -303,7 +244,6 @@ def _train_subset_fold_worker(args):
             except Exception:
                 model_path = None
         
-        # Clean up
         del model, explainer
         gc.collect()
         

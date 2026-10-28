@@ -1,4 +1,4 @@
-"""Pairwise angular kinematics between selected keypoint pairs."""
+"""Derive angular kinematics between selected rotated keypoint pairs."""
 
 from __future__ import annotations
 
@@ -16,23 +16,11 @@ rolling_windows = settings.rolling_windows
 
 
 def calculate_pairwise_angular_velocities(dataframe, intervals, pairs):
-    """
-    Calculates angular velocity features for multiple pairs of keypoints.
+    """Calculate rotated base-to-moving vector angular velocity in degrees per frame.
 
-    For each specified pair (a base keypoint and a moving keypoint), this computes the
-    orientation (in degrees) of the vector from base -> moving for each frame using
-    the rotated keypoint coordinates.
-
-    Angular velocity is computed using a central-difference style estimate based on
-    backward and forward angular differences, with wrap-around normalized into [-180, 180].
-
-    Parameters:
-        dataframe (pd.DataFrame): DataFrame containing rotated coordinate columns.
-        intervals (list): Rolling window sizes for smoothing.
-        pairs (list or dict): Keypoint pairs to compute angles for.
-
-    Returns:
-        pd.DataFrame: Input dataframe with added pairwise angular velocity feature columns.
+    Average backward and forward changes wrapped to [-180, 180). Require valid
+    current and neighboring coordinates; retain NaNs where those are missing.
+    Add centered rolling means and standard deviations for each pair.
     """
 
     if intervals is None:
@@ -52,7 +40,7 @@ def calculate_pairwise_angular_velocities(dataframe, intervals, pairs):
         new_column_name = f"partangular_velocity_{feature_suffix}"
         
         # Use rotated coordinates for all keypoints.
-        # IMPORTANT: rotated coordinates are already centered on the fly centroid,
+        # Rotated coordinates are already centered on the fly centroid,
         # so the centroid is (0, 0) in this frame.
         if base_key.lower() == 'centroid':
             base_x = base_y = None  # origin
@@ -81,7 +69,6 @@ def calculate_pairwise_angular_velocities(dataframe, intervals, pairs):
             logger.warning(f"Warning: Missing required columns for '{base_key}' and '{moving_key}'. Skipping pair.")
             continue
 
-        # Compute dx, dy and valid frames consistently
         if base_x is None:
             # Vector from centroid(origin) -> moving keypoint
             valid_mask = dataframe[moving_x].notna() & dataframe[moving_y].notna()
@@ -101,11 +88,10 @@ def calculate_pairwise_angular_velocities(dataframe, intervals, pairs):
         pair_angle = np.degrees(np.arctan2(dy, dx))
         pair_angle_series = pd.Series(pair_angle, index=dataframe.index).where(valid_mask, np.nan)
 
-        # Compute backward and forward differences.
         angle_diff_prev = pair_angle_series.diff()
         angle_diff_next = (pair_angle_series.shift(-1) - pair_angle_series).fillna(0)
 
-        # Normalize differences to the range [-180, 180].
+        # Wrap angular changes to [-180, 180).
         angle_diff_prev = (angle_diff_prev + 180) % 360 - 180
         angle_diff_next = (angle_diff_next + 180) % 360 - 180
 
@@ -114,29 +100,23 @@ def calculate_pairwise_angular_velocities(dataframe, intervals, pairs):
         avg_angular_velocity = (angle_diff_prev + angle_diff_next) / 2.0
         avg_angular_velocity = avg_angular_velocity.where(valid_for_change, np.nan)
 
-        # Store computed angular velocity with _inst suffix for consistency
         inst_column_name = f"{new_column_name}_inst"
         new_columns[inst_column_name] = avg_angular_velocity
 
-        # Compute rolling mean angular velocity over each specified interval.
         for interval in intervals:
             interval_col = f"{new_column_name}_{interval}"
             new_columns[interval_col] = avg_angular_velocity.rolling(window=interval, min_periods=1, center=True).mean()
-        # Compute rolling standard deviation over each specified interval
         for interval in intervals:
             interval_std_col = f"partangular_velocitystd_{feature_suffix}_{interval}"
             new_columns[interval_std_col] = avg_angular_velocity.rolling(window=interval, min_periods=1, center=True).std()
 
-    # Concatenate the new columns with the source DataFrame.
     dataframe = pd.concat([dataframe, pd.DataFrame(new_columns, index=dataframe.index)], axis=1)
     
     return dataframe
 
 
 def calculate_pairwise_angular_acceleration(dataframe, intervals, pairs):
-    """
-    Calculates angular acceleration for multiple pairs of keypoints.
-    """
+    """Differentiate pairwise angular velocity into degrees per frame squared."""
     if isinstance(pairs, dict):
         pair_items = pairs.items()
     elif isinstance(pairs, list):
@@ -150,7 +130,6 @@ def calculate_pairwise_angular_acceleration(dataframe, intervals, pairs):
         velocity_col = f'partangular_velocity_{feature_suffix}_inst'
         
         if velocity_col in dataframe.columns:
-            # Compute instantaneous acceleration
             basic_accel = ((dataframe[velocity_col].shift(-1) - dataframe[velocity_col].shift(1)) / 2.0)
             valid_rows = dataframe[velocity_col].notna() & dataframe[velocity_col].shift(1).notna() & dataframe[velocity_col].shift(-1).notna()
             basic_accel = basic_accel.where(valid_rows, np.nan)
@@ -168,9 +147,7 @@ def calculate_pairwise_angular_acceleration(dataframe, intervals, pairs):
 
 
 def calculate_pairwise_angular_jerk(dataframe, intervals, pairs):
-    """
-    Calculates angular jerk for multiple pairs of keypoints.
-    """
+    """Differentiate pairwise angular acceleration into degrees per frame cubed."""
     if isinstance(pairs, dict):
         pair_items = pairs.items()
     elif isinstance(pairs, list):
@@ -201,7 +178,7 @@ def calculate_pairwise_angular_jerk(dataframe, intervals, pairs):
 
 
 def add_pairwise_angular_kinematics_features(input_df, poscorr_dict):
-    """Pairwise angular velocity/accel/jerk between selected keypoint pairs."""
+    """Add pairwise angular velocity, acceleration, and jerk to the feature mapping."""
     input_df = calculate_pairwise_angular_velocities(input_df, rolling_windows, angular_velocity_pairs)
     cols = [c for c in input_df.columns if c.startswith('partangular_velocity_') or c.startswith('partangular_velocitystd_')]
     for c in cols:

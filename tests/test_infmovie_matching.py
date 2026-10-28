@@ -43,3 +43,22 @@ def test_infmovie_extracts_multi_digit_chamber_number(tmp_path):
 
     filename_part = extract_inf_csv_filename_part(str(tmp_path / csv_name))
     assert filename_part.endswith("_chamber12")
+
+
+def test_discovery_ignores_reports_but_accepts_renamed_predictions(tmp_path):
+    from autobehaver.postinf.infmovie.pipeline import discover_pairs_from_folders
+    (tmp_path / "fly.mp4").touch()
+    (tmp_path / "fly.csv").write_text("Frame Number,Predicted Pose Label\n1,Standing\n")
+    (tmp_path / "report.csv").write_text("metric,value\naccuracy,0.9\n")
+    (tmp_path / "fly_bouts.csv").write_text("start,end,label\n1,10,Standing\n")
+    pairs = discover_pairs_from_folders(inference_csv_dir=tmp_path, movie_dir=tmp_path)
+    assert len(pairs) == 1
+    assert pairs[0]["inf_csv_path"] == str((tmp_path / "fly.csv").resolve())
+
+
+def test_discovery_still_reports_missing_prediction_movie(tmp_path):
+    import pytest
+    from autobehaver.postinf.infmovie.pipeline import discover_pairs_from_folders
+    (tmp_path / "missing_inference.csv").write_text("malformed")
+    with pytest.raises(FileNotFoundError, match="missing_inference.csv"):
+        discover_pairs_from_folders(inference_csv_dir=tmp_path, movie_dir=tmp_path)

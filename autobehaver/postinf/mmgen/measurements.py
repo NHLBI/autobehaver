@@ -1,13 +1,8 @@
-"""Standardized measurement extraction and pooling.
+"""Select orientation- and pose-qualified measurement samples across each animal's
+recordings.
 
-This module contains the standardized measurement routines used during
-mmgen finalization. It keeps the measurement extraction and pooling logic in one
-place while exposing explicit calibration/runtime arguments.
-
-Notes
------
-- Unit conversion uses an explicit ``mm_per_px`` argument.
-- Reproducible pooling/sampling uses an explicit ``random_seed`` argument.
+Use explicit calibration and sampling seeds, retaining raw-input compatibility and
+unitless ratios.
 """
 
 from __future__ import annotations
@@ -23,49 +18,122 @@ from .naming import collapse_individual_id
 DEFAULT_MM_PER_PX: float = 0.0169896744624207
 DEFAULT_RANDOM_SEED: int = 42
 
+MEASUREMENT_POSES = ['Standing',
+ 'Walking',
+ 'Groom-FrontLegs',
+ 'Groom-Head',
+ 'Groom-SideLeg',
+ 'Groom-Wings',
+ 'Groom-Abdomen',
+ 'Groom-BackLegs']
+
+MEASUREMENT_DEFINITIONS = {'abdomenheight_side': (['Wall-Side'],
+                        ('AbdomenTop_x', 'AbdomenTop_y', 'AbdomenBottom_x', 'AbdomenBottom_y')),
+ 'abdomenwidth_bottom': (['Ceiling'],
+                         ('AbdomenLeft_x', 'AbdomenLeft_y', 'AbdomenRight_x', 'AbdomenRight_y')),
+ 'abdomenwidth_top': (['Floor'], ('AbdomenLeft_x', 'AbdomenLeft_y', 'AbdomenRight_x', 'AbdomenRight_y')),
+ 'body_area_side': (['Wall-Side'], ('body_area_side', None, None, None)),
+ 'body_area_top': (['Floor'], ('body_area_top', None, None, None)),
+ 'headheight_side': (['Wall-Side'], ('Ocelli_x', 'Ocelli_y', 'Mouthparts_x', 'Mouthparts_y')),
+ 'headwidth_bottom': (['Ceiling'], ('EyeRight_x', 'EyeRight_y', 'EyeLeft_x', 'EyeLeft_y')),
+ 'headwidth_top': (['Floor'], ('EyeRight_x', 'EyeRight_y', 'EyeLeft_x', 'EyeLeft_y')),
+ 'length_bottom': (['Ceiling'], ('Antennae_x', 'Antennae_y', 'AbdomenTip_x', 'AbdomenTip_y')),
+ 'length_side': (['Wall-Side'], ('Antennae_x', 'Antennae_y', 'AbdomenTip_x', 'AbdomenTip_y')),
+ 'length_top': (['Floor'], ('Antennae_x', 'Antennae_y', 'AbdomenTip_x', 'AbdomenTip_y')),
+ 'thoraxheight_side': (['Wall-Side'],
+                       ('ThoraxTop_x', 'ThoraxTop_y', 'ThoraxBottom_x', 'ThoraxBottom_y')),
+ 'thoraxwidth_bottom': (['Ceiling'], ('ThoraxLeft_x', 'ThoraxLeft_y', 'ThoraxRight_x', 'ThoraxRight_y')),
+ 'thoraxwidth_top': (['Floor'], ('ThoraxLeft_x', 'ThoraxLeft_y', 'ThoraxRight_x', 'ThoraxRight_y')),
+ 'wingLeftlength_top': (['Floor'], ('WingLeft_x', 'WingLeft_y', 'ThoraxLeft_x', 'ThoraxLeft_y')),
+ 'wingRightlength_top': (['Floor'], ('WingRight_x', 'WingRight_y', 'ThoraxRight_x', 'ThoraxRight_y'))}
+
+
+def extract_measurement_candidates(masked_poses, masked_orients, poscalc_df,
+                                   individual_id, group_label, sex, *, max_samples=100,
+                                   random_seed=DEFAULT_RANDOM_SEED):
+    """Keep a bounded uniform-priority candidate sample for each measurement.
+
+    Local best poses suffice: the best of these is the per-animal best pose.
+    Keeping each recording's lowest K random priorities guarantees the global
+    lowest K can be selected without retaining every frame or loading movies.
+    """
+    import hashlib
+    if int(max_samples) < 1:
+        raise ValueError('Measurement sample size must be positive')
+    seed = DEFAULT_RANDOM_SEED if random_seed is None else int(random_seed)
+    poses = pd.Series(masked_poses).reset_index(drop=True)
+    orients = pd.Series(masked_orients).reset_index(drop=True)
+    source = poscalc_df.reset_index(drop=True)
+    rows = []
+    for name, (orientations, points) in MEASUREMENT_DEFINITIONS.items():
+        candidates = None
+        rank = -1
+        for rank, pose in enumerate(MEASUREMENT_POSES):
+            columns = [c for c in points if c is not None]
+            if not all(c in source for c in columns):
+                break
+            selected = source.loc[(poses == pose) & orients.isin(orientations), columns]
+            selected = selected[np.isfinite(selected.to_numpy(dtype=float)).all(axis=1)]
+            if selected.empty:
+                continue
+            if points[1] is None:
+                values = selected[points[0]].to_numpy(dtype=float)
+            else:
+                values = np.hypot(selected[points[0]] - selected[points[2]],
+                                  selected[points[1]] - selected[points[3]]).to_numpy()
+            identity = f'{seed}|{individual_id}|{name}'.encode('utf-8')
+            local_seed = int.from_bytes(hashlib.blake2b(identity, digest_size=8).digest(), 'little')
+            priorities = np.random.default_rng(local_seed).random(len(values))
+            keep = np.argsort(priorities, kind='stable')[:int(max_samples)]
+            candidates = zip(priorities[keep], values[keep], selected.index.to_numpy()[keep])
+            break
+        if candidates is None:
+            candidates = [(1.0, np.nan, -1)]
+            rank = -1
+        for priority, value, frame in candidates:
+            rows.append(dict(individual_id=individual_id, group_label=group_label, sex=sex,
+                             measurement=name, pose_rank=int(rank), priority=float(priority),
+                             value=float(value), frame_idx=int(frame)))
+    return pd.DataFrame(rows)
+
+
+def summarize_measurement_candidates(candidates, max_samples=100):
+    """Choose one pose and one sample per measurement and animal across recordings."""
+    data = candidates.copy()
+    data['animal_id'] = data['individual_id'].map(collapse_individual_id)
+    results = []
+    for (animal, group, sex), block in data.groupby(['animal_id', 'group_label', 'sex'], sort=True):
+        row = dict(individual_id=animal, group_label=group, sex=sex)
+        for name in MEASUREMENT_DEFINITIONS:
+            eligible = block[(block['measurement'] == name) & np.isfinite(block['value'])]
+            if not eligible.empty:
+                eligible = eligible[eligible['pose_rank'] == eligible['pose_rank'].min()]
+                order = ['priority', 'individual_id', 'frame_idx']
+                if 'source_file' in eligible:
+                    order.insert(1, 'source_file')
+                values = eligible.sort_values(order, kind='stable').head(int(max_samples))['value']
+            else:
+                values = pd.Series(dtype=float)
+            row[f'{name}_mean'] = float(values.mean()) if len(values) else np.nan
+            row[f'{name}_std'] = float(values.std(ddof=1)) if len(values) > 1 else np.nan
+            row[f'{name}_n_samples'] = int(len(values))
+        results.append(row)
+    return pd.DataFrame(results)
+
+
 def extract_standardized_measurements_raw(masked_poses, masked_orients, poscalc_df, individual_id, group_label, sex):
-    """
-    Extracts raw data for standardized animal measurements under controlled conditions.
-    Uses a pose hierarchy to find valid frames.
-    """
+    """Select raw measurement frames using the declared orientation and pose hierarchy."""
     masked_poses = pd.Series(masked_poses).reset_index(drop=True)
     masked_orients = pd.Series(masked_orients).reset_index(drop=True)
     poscalc_df = poscalc_df.reset_index(drop=True)
 
     raw_data = {'individual_id': individual_id, 'group_label': group_label, 'sex': sex}
 
-    # 1. Define the pose hierarchy as requested
-    pose_priority = [
-        "Standing",
-        "Walking",
-        "Groom-FrontLegs",
-        "Groom-Head",
-        "Groom-SideLeg",
-        "Groom-Wings",
-        "Groom-Abdomen",
-        "Groom-BackLegs"
-    ]
+    # Prefer poses in the declared measurement hierarchy.
+    pose_priority = MEASUREMENT_POSES
 
-    # 2. Redefine definitions to store orientations and keypoints
-    measurement_definitions = {
-        # name: ([orient_list], (kps...))
-        'length_top':         (["Floor"],       ('Antennae_x', 'Antennae_y', 'AbdomenTip_x', 'AbdomenTip_y')),
-        'length_side':        (["Wall-Side"],   ('Antennae_x', 'Antennae_y', 'AbdomenTip_x', 'AbdomenTip_y')),
-        'length_bottom':      (["Ceiling"],     ('Antennae_x', 'Antennae_y', 'AbdomenTip_x', 'AbdomenTip_y')),
-        'headwidth_top':      (["Floor"],       ('EyeRight_x', 'EyeRight_y', 'EyeLeft_x', 'EyeLeft_y')),
-        'headwidth_bottom':   (["Ceiling"],     ('EyeRight_x', 'EyeRight_y', 'EyeLeft_x', 'EyeLeft_y')),
-        'headheight_side':    (["Wall-Side"],   ('Ocelli_x', 'Ocelli_y', 'Mouthparts_x', 'Mouthparts_y')),
-        'thoraxwidth_top':    (["Floor"],       ('ThoraxLeft_x', 'ThoraxLeft_y', 'ThoraxRight_x', 'ThoraxRight_y')),
-        'thoraxwidth_bottom': (["Ceiling"],     ('ThoraxLeft_x', 'ThoraxLeft_y', 'ThoraxRight_x', 'ThoraxRight_y')),
-        'thoraxheight_side':  (["Wall-Side"],   ('ThoraxTop_x', 'ThoraxTop_y', 'ThoraxBottom_x', 'ThoraxBottom_y')),
-        'abdomenwidth_top':   (["Floor"],       ('AbdomenLeft_x', 'AbdomenLeft_y', 'AbdomenRight_x', 'AbdomenRight_y')),
-        'abdomenwidth_bottom':(["Ceiling"],     ('AbdomenLeft_x', 'AbdomenLeft_y', 'AbdomenRight_x', 'AbdomenRight_y')),
-        'abdomenheight_side': (["Wall-Side"],   ('AbdomenTop_x', 'AbdomenTop_y', 'AbdomenBottom_x', 'AbdomenBottom_y')),
-        'wingLeftlength_top': (["Floor"],       ('WingLeft_x', 'WingLeft_y', 'ThoraxLeft_x', 'ThoraxLeft_y')),
-        'wingRightlength_top':(["Floor"],       ('WingRight_x', 'WingRight_y', 'ThoraxRight_x', 'ThoraxRight_y')),
-        'body_area_top':      (["Floor"],       ('body_area_top', None, None, None)),
-        'body_area_side':     (["Wall-Side"],   ('body_area_side', None, None, None)),
-    }
+    # Define eligible orientations and keypoints for each measurement.
+    measurement_definitions = MEASUREMENT_DEFINITIONS
 
     # 3. Iterate through measurements, applying the pose hierarchy
     for name, (orient_list, keypoints) in measurement_definitions.items():
@@ -112,20 +180,10 @@ def extract_standardized_measurements_summary(
     max_samples: int = 100,
     random_seed: int = DEFAULT_RANDOM_SEED,
 ):
-    """Extract per-recording summary statistics for standardized measurements.
+    """Return one recording's measurement means, sample deviations, and sample counts.
 
-    This is a memory-safe alternative to :func:`extract_standardized_measurements_raw`.
-    Instead of returning frame-level DataFrames (which can be very large and
-    cause long-run memory accumulation in mmgen), this returns a single dict
-    containing mean/std/n_samples for each measurement.
-
-    The selection logic follows the current raw-extraction contract:
-      - use a pose hierarchy to find valid frames
-      - restrict to required orientations per measurement
-      - stop at the first pose in the hierarchy that yields valid samples
-
-    Sampling is performed *within each recording* to cap compute and keep
-    deterministic behavior.
+    For each measurement, select the first qualifying pose in the hierarchy and restrict
+    to its supported orientations. Sample within the recording using the supplied seed.
     """
 
     masked_poses = pd.Series(masked_poses).reset_index(drop=True)
@@ -133,37 +191,10 @@ def extract_standardized_measurements_summary(
     poscalc_df = poscalc_df.reset_index(drop=True)
 
     # Pose hierarchy used by the raw extractor
-    pose_priority = [
-        "Standing",
-        "Walking",
-        "Groom-FrontLegs",
-        "Groom-Head",
-        "Groom-SideLeg",
-        "Groom-Wings",
-        "Groom-Abdomen",
-        "Groom-BackLegs",
-    ]
+    pose_priority = MEASUREMENT_POSES
 
     # Measurement definitions used by the raw extractor
-    measurement_definitions = {
-        # name: ([orient_list], (kps...))
-        "length_top": (["Floor"], ("Antennae_x", "Antennae_y", "AbdomenTip_x", "AbdomenTip_y")),
-        "length_side": (["Wall-Side"], ("Antennae_x", "Antennae_y", "AbdomenTip_x", "AbdomenTip_y")),
-        "length_bottom": (["Ceiling"], ("Antennae_x", "Antennae_y", "AbdomenTip_x", "AbdomenTip_y")),
-        "headwidth_top": (["Floor"], ("EyeRight_x", "EyeRight_y", "EyeLeft_x", "EyeLeft_y")),
-        "headwidth_bottom": (["Ceiling"], ("EyeRight_x", "EyeRight_y", "EyeLeft_x", "EyeLeft_y")),
-        "headheight_side": (["Wall-Side"], ("Ocelli_x", "Ocelli_y", "Mouthparts_x", "Mouthparts_y")),
-        "thoraxwidth_top": (["Floor"], ("ThoraxLeft_x", "ThoraxLeft_y", "ThoraxRight_x", "ThoraxRight_y")),
-        "thoraxwidth_bottom": (["Ceiling"], ("ThoraxLeft_x", "ThoraxLeft_y", "ThoraxRight_x", "ThoraxRight_y")),
-        "thoraxheight_side": (["Wall-Side"], ("ThoraxTop_x", "ThoraxTop_y", "ThoraxBottom_x", "ThoraxBottom_y")),
-        "abdomenwidth_top": (["Floor"], ("AbdomenLeft_x", "AbdomenLeft_y", "AbdomenRight_x", "AbdomenRight_y")),
-        "abdomenwidth_bottom": (["Ceiling"], ("AbdomenLeft_x", "AbdomenLeft_y", "AbdomenRight_x", "AbdomenRight_y")),
-        "abdomenheight_side": (["Wall-Side"], ("AbdomenTop_x", "AbdomenTop_y", "AbdomenBottom_x", "AbdomenBottom_y")),
-        "wingLeftlength_top": (["Floor"], ("WingLeft_x", "WingLeft_y", "ThoraxLeft_x", "ThoraxLeft_y")),
-        "wingRightlength_top": (["Floor"], ("WingRight_x", "WingRight_y", "ThoraxRight_x", "ThoraxRight_y")),
-        "body_area_top": (["Floor"], ("body_area_top", None, None, None)),
-        "body_area_side": (["Wall-Side"], ("body_area_side", None, None, None)),
-    }
+    measurement_definitions = MEASUREMENT_DEFINITIONS
 
     row = {"individual_id": individual_id, "group_label": group_label, "sex": sex}
 
@@ -219,8 +250,8 @@ def extract_standardized_measurements_summary(
 
 
 def _calculate_formatted_sex_separated_df(measurements_df, measurement_order, spacer_columns):
-    """
-    Creates a formatted standardized measurement summary with sex-separated columns and returns a DataFrame.
+    """Create a formatted standardized measurement summary with sex-separated columns
+    and returns a DataFrame.
     """
     if 'sex' not in measurements_df.columns:
         print("Sex column not found in measurement data. Skipping sex-separated summary.")
@@ -278,8 +309,7 @@ def _calculate_formatted_sex_separated_df(measurements_df, measurement_order, sp
 
 
 def _calculate_sex_ratio_df(measurements_df, measurement_order):
-    """
-    Calculates a summary of female-to-male size ratios for each group,
+    """Calculate a summary of female-to-male size ratios for each group,
     including averaged and normalized features.
     """
     print("Calculating sex-based size ratios...")
@@ -311,30 +341,27 @@ def _calculate_sex_ratio_df(measurements_df, measurement_order):
 
 
 def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max_samples=100, *, mm_per_px: float = DEFAULT_MM_PER_PX, random_seed: int = DEFAULT_RANDOM_SEED, save_outputs: bool = True):
+    """Combine measurement inputs by animal and export calibrated summaries and ratios.
+
+    Native inputs are bounded frame candidates, pooled once per animal. Older
+    recording-summary inputs retain their compatibility estimator. Apply the
+    existing view fallbacks and calibrate dimensional outputs.
     """
-    Pools raw measurement data, calculates base statistics, computes averaged and 
-    normalized features, saves a consolidated Excel summary, and returns the full feature DataFrame.
-    """
-    # ------------------------------------------------------------------
+    # Accept compact recording summaries and compatible raw measurement tables.
     # INPUT NORMALIZATION
     #
-    # Earlier mmgen paths passed a list[dict] where each dict contains
-    # frame-level DataFrames for each measurement (output of
-    # ``extract_standardized_measurements_raw``). That approach can cause
-    # long-run memory accumulation on large datasets.
-    #
-    # Newer mmgen runs may instead pass per-recording *summary rows* produced
-    # by ``extract_standardized_measurements_summary``.
-    #
-    # We support both formats here.
-    # ------------------------------------------------------------------
 
     if all_measurements_raw is None:
         return pd.DataFrame()
 
-    # Case 1: already a table of summary rows
+    pooled_candidates = False
+    # Native candidates or older summary rows.
     if isinstance(all_measurements_raw, pd.DataFrame):
-        measurements_df = all_measurements_raw.copy()
+        if {'measurement', 'pose_rank', 'priority', 'value'}.issubset(all_measurements_raw.columns):
+            pooled_candidates = True
+            measurements_df = summarize_measurement_candidates(all_measurements_raw, max_samples=max_samples)
+        else:
+            measurements_df = all_measurements_raw.copy()
 
     # Case 2: list of dict summary rows
     elif isinstance(all_measurements_raw, list) and all_measurements_raw and isinstance(all_measurements_raw[0], dict) and any(
@@ -344,7 +371,7 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
 
     # Case 3: raw frame-level dict payloads
     else:
-        # --- 1. Pool raw data by individual and measurement type ---
+        # 1. Pool raw data by individual and measurement type
         pooled_data = {}
         for video_data in all_measurements_raw:
             individual_id = video_data['individual_id']
@@ -406,14 +433,15 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     # Collapse individual_id to animal_id and aggregate per animal (not per movie)
     # This ensures consistency with other outputs that use collapsed animal IDs
     measurements_df['animal_id'] = measurements_df['individual_id'].map(collapse_individual_id)
-    # Aggregate by animal_id, taking mean of all measurement features
+    # Candidate inputs already contain one row per animal. Legacy summary inputs
+    # retain their explicit compatibility path below.
     # Keep group_label and sex (they should be consistent per animal)
     id_cols = ['animal_id', 'group_label', 'sex']
     feature_cols = [col for col in measurements_df.columns if col not in id_cols]
     measurements_df = measurements_df.groupby(id_cols)[feature_cols].mean(numeric_only=True).reset_index()
     measurements_df.rename(columns={'animal_id': 'individual_id'}, inplace=True)
 
-    # --- Calculate Averaged and Normalized Features (with fallbacks) ---
+    # Calculate Averaged and Normalized Features (with fallbacks)
 
     # 1. Calculate Averages for top/bottom views.
     #    .mean(axis=1) automatically ignores NaNs.
@@ -425,7 +453,7 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     measurements_df['thorax_width_avg_mean'] = measurements_df[['thoraxwidth_top_mean', 'thoraxwidth_bottom_mean']].mean(axis=1)
     measurements_df['abdomenwidth_avg_mean'] = measurements_df[['abdomenwidth_top_mean', 'abdomenwidth_bottom_mean']].mean(axis=1)
 
-    # 2. Implement the backup plan.
+    # Use the side-view measurement when top/bottom views are unavailable.
     #    If the average is still NaN (meaning both top/bottom failed),
     #    fill it with the corresponding side/height measurement.
     measurements_df['length_avg_mean'] = measurements_df['length_avg_mean'].fillna(measurements_df['length_side_mean'])
@@ -434,11 +462,10 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     measurements_df['abdomenwidth_avg_mean'] = measurements_df['abdomenwidth_avg_mean'].fillna(measurements_df['abdomenheight_side_mean'])
     
     # Calculate Stdevs for Averages (by averaging variances)
-    # This logic remains the same
     measurements_df['winglength_avg_std'] = np.sqrt((measurements_df['wingLeftlength_top_std']**2 + measurements_df['wingRightlength_top_std']**2) / 2)
-    # (Add std calculations for other averages if needed)
+    # Keep the established variance-averaging convention.
 
-    # *** ASSERT CHECK: Ensure thorax width is positive ***
+    # Check the thorax-width normalizer before forming ratios.
     valid_thorax_widths = measurements_df['thorax_width_avg_mean'].dropna()
     if not valid_thorax_widths.empty:
         assert (valid_thorax_widths > 0).all(), "Thorax width average (normalizer) must be positive."
@@ -455,14 +482,14 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     measurements_df['bodyarea_top_norm_mean'] = np.sqrt(measurements_df['body_area_top_mean']) / normalizer
     measurements_df['bodyarea_side_norm_mean'] = np.sqrt(measurements_df['body_area_side_mean']) / normalizer
     
-    # *** ASSERT CHECK: Ensure thorax width is positive ***
+    # Check the thorax-width normalizer before forming ratios.
     norm_cols = [col for col in measurements_df.columns if '_norm_mean' in col]
     for col in norm_cols:
         # Check specifically for positive infinity, as negative infinity is less likely here
         assert not (measurements_df[col] == np.inf).any(), f"Infinite values found in normalized feature: {col}"
     print(" - Assert Check Passed: No infinite values in normalized measurement features.")
 
-    # --- UNIT CONVERSION: pixels -> mm (lengths) and px^2 -> mm^2 (areas) ---
+    # UNIT CONVERSION: pixels -> mm (lengths) and px^2 -> mm^2 (areas)
     # Convert only base mean/std measurement features. Normalized features (*_norm_mean) are unitless and remain unchanged.
     length_scale = float(mm_per_px)
     area_scale = float(mm_per_px) ** 2
@@ -483,7 +510,7 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
             # All other measurement means/stds in this table are lengths
             measurements_df[col] = measurements_df[col] * length_scale
 
-    # --- 3. Generate all three DataFrames for the Excel sheets ---
+    # 3. Generate all three DataFrames for the Excel sheets
     measurement_order = [
         # Averaged Features
         'length_avg', 'headwidth_avg', 'thorax_width_avg', 'abdomenwidth_avg', 'winglength_avg',
@@ -496,13 +523,13 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     ]
     blank_spacer_cols = [' ', '  ']
 
-    # --- DF for Tab 1: Sex Ratios ---
+    # DF for Tab 1: Sex Ratios
     ratio_df = _calculate_sex_ratio_df(measurements_df, measurement_order)
 
-    # --- DF for Tab 2: Sex-Specific Measurements ---
+    # DF for Tab 2: Sex-Specific Measurements
     formatted_sex_separated_df = _calculate_formatted_sex_separated_df(measurements_df, measurement_order, blank_spacer_cols)
 
-    # --- DF for Tab 3: Combined Measurements ---
+    # DF for Tab 3: Combined Measurements
     combined_df = measurements_df.drop(columns=['sex'], errors='ignore')
     means_cols = [f'{name}_mean' for name in measurement_order if f'{name}_mean' in combined_df.columns]
     std_cols = [f'{name}_std' for name in measurement_order if f'{name}_std' in combined_df.columns]
@@ -512,7 +539,7 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     combined_df.rename(columns={'individual_id': 'individual', 'group_label': 'group'}, inplace=True)
     formatted_combined_df = format_summary_df(combined_df, desired_order)
 
-    # --- 4. Save all DataFrames to a single Excel file ---
+    # 4. Save all DataFrames to a single Excel file
     sheets_to_save = {
         'Combined Measurements': formatted_combined_df,
         'Sex-Specific Measurements': formatted_sex_separated_df,
@@ -520,10 +547,16 @@ def calculate_and_save_pooled_measurements(all_measurements_raw, output_dir, max
     }
     if save_outputs:
         excel_path = os.path.join(output_dir, '3_Standardized_Measurements.xlsx')
-        save_to_excel_sheets(sheets_to_save, excel_path)
+        report_sheets = sheets_to_save
+        if not pooled_candidates:
+            # Legacy summary-only inputs cannot reconstruct a pooled frame sample.
+            report_sheets = {name: frame.rename(columns=lambda column:
+                str(column)[:-len('_n_samples')] + '_mean_samples_per_recording'
+                if str(column).endswith('_n_samples') else column)
+                for name, frame in sheets_to_save.items()}
+        save_to_excel_sheets(report_sheets, excel_path)
 
-    # --- 5. Return the full DataFrame for downstream use ---
+    # 5. Return the full DataFrame for downstream use
     return measurements_df
 
 
-# 4 Postural Analysis

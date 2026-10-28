@@ -1,12 +1,6 @@
-"""Postural feature extraction and summary.
+"""Extract standing-frame posture and summarize it by animal and orientation.
 
-This module contains the postural feature routines used during mmgen
-finalization. It keeps postural extraction and summary logic separate from the
-worker/orchestration code while preserving the current output contract.
-
-Notes
------
-- Unit conversion uses an explicit ``mm_per_px`` argument.
+Use centered KeyPre keypoints and explicit millimeters-per-pixel calibration.
 """
 
 from __future__ import annotations
@@ -17,12 +11,12 @@ import numpy as np
 import pandas as pd
 
 from .naming import collapse_individual_id
+from .feature_schema import feature_columns
 
 DEFAULT_MM_PER_PX: float = 0.0169896744624207
 
 def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video_path, group, individual, *, mm_per_px: float = DEFAULT_MM_PER_PX, likelihood_threshold=0.25, verbose_debug=False):
-    """
-    Extracts pre-calculated postural features and calculates summary metrics.
+    """Extract pre-calculated postural features and calculates summary metrics.
     - Calculates average leg extensions for front, mid, and back pairs.
     - Reads pre-calculated stance_area and detailed asymmetry indices.
     - Calculates combined asymmetry magnitudes and overall asymmetry scores.
@@ -31,7 +25,7 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
         print(f"\n--- Postural Analysis for: {os.path.basename(video_path)} ---")
         print(f"Total frames received: {len(poscalc_df)}")
 
-    # --- 1. Define Keypoints & Feature Columns ---
+    # 1. Define Keypoints & Feature Columns
     leg_tip_kps = ['FrontTarsusLeft', 'FrontTarsusRight', 'MidTarsusLeft', 'MidTarsusRight', 'BackTarsusLeft', 'BackTarsusRight']
     body_axis_kps = ['Antennae', 'AbdomenTip']
     
@@ -53,8 +47,7 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
     
     extension_req_cols = [f"{kp}_x" for kp in leg_tip_kps + body_axis_kps] + \
                          [f"{kp}_y" for kp in leg_tip_kps + body_axis_kps] + \
-                         [f"{kp}_likelihood" for kp in leg_tip_kps + body_axis_kps] + \
-                         ['centroid_x', 'centroid_y']
+                         [f"{kp}_likelihood" for kp in leg_tip_kps + body_axis_kps] 
     
     missing_cols = [col for col in extension_req_cols + precalc_features if col not in poscalc_df.columns]
     if missing_cols:
@@ -63,11 +56,21 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
             print(f"Missing columns: {missing_cols}")
         return None
 
-    # --- 2. Filter for High-Quality "Standing" Frames (Floor, Ceiling, and Wall-Side) ---
+    # Only these inputs can contribute to postural output. Avoid copying the
+    # entire engineered-feature table for every Standing/orientation subset.
+    needed = set(extension_req_cols + precalc_features)
+    needed.update(c for c in poscalc_df if c.endswith('_likelihood'))
+    needed.add('orient_Wall-Side')
+    poscalc_df = poscalc_df[[c for c in poscalc_df if c in needed]]
+
+    # 2. Filter for High-Quality "Standing" Frames (Floor, Ceiling, and Wall-Side)
     likelihood_cols = [f"{kp}_likelihood" for kp in leg_tip_kps + body_axis_kps]
     
     # Helper function to calculate features for Floor or Ceiling (stance and leg extensions)
     def calculate_stance_and_extensions(orient_filter):
+        """Extract eligible standing-frame stance and paired-leg extension features for
+        one orientation.
+        """
         behavior_mask = (masked_poses == 'Standing') & (masked_orients == orient_filter)
         valid_indices = np.where(behavior_mask)[0]
         
@@ -86,10 +89,12 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
                         if col not in ['body_area_top', 'body_area_side']]
         results_df = final_poscalc_df[cols_to_keep].copy()
 
-        # Calculate and average RAW Leg Extensions
+        # KeyPre exports centered/rotated keypoints: the centroid is (0, 0).
+        # Absolute image centroid columns must never be subtracted here.
+        # Average tarsus-to-centroid distance in this common coordinate frame.
         for pair_name, (kp_left, kp_right) in leg_pairs.items():
-            dist_left = np.sqrt((results_df[f'{kp_left}_x'] - results_df['centroid_x'])**2 + (results_df[f'{kp_left}_y'] - results_df['centroid_y'])**2)
-            dist_right = np.sqrt((results_df[f'{kp_right}_x'] - results_df['centroid_x'])**2 + (results_df[f'{kp_right}_y'] - results_df['centroid_y'])**2)
+            dist_left = np.hypot(results_df[f'{kp_left}_x'], results_df[f'{kp_left}_y'])
+            dist_right = np.hypot(results_df[f'{kp_right}_x'], results_df[f'{kp_right}_y'])
             results_df[f'extension_raw_{pair_name}_avg'] = (dist_left + dist_right) / 2
 
         # Add orientation column
@@ -99,6 +104,7 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
     
     # Helper function to calculate LR asymmetry for Floor (top-down view)
     def calculate_lr_asymmetry():
+        """Extract standing Floor left/right asymmetries and their aggregate magnitudes."""
         behavior_mask = (masked_poses == 'Standing') & (masked_orients == 'Floor')
         valid_indices = np.where(behavior_mask)[0]
         
@@ -142,6 +148,9 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
     # Helper function to calculate TB asymmetry for Wall-Side (side view)
     def calculate_tb_asymmetry():
         # First, check if orientation probability column exists
+        """Extract standing Wall-Side top/bottom asymmetries and their aggregate
+        magnitudes.
+        """
         orient_prob_col = 'orient_Wall-Side'
         has_orient_prob = orient_prob_col in poscalc_df.columns
         
@@ -187,7 +196,7 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
 
         # Exclude body_area features
         cols_to_keep = [col for col in final_poscalc_df.columns 
-                        if col not in ['body_area_top', 'body_area_side']]
+                        if col not in ['body_area_top', 'body_area_side', 'stance_area']]
         results_df = final_poscalc_df[cols_to_keep].copy()
 
         # Calculate TB Asymmetry Magnitudes (Top-Bottom, from side view)
@@ -265,7 +274,7 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
     
     mm_per_px = float(DEFAULT_MM_PER_PX if mm_per_px is None else mm_per_px)
 
-    # --- 3. Finalize and Return DataFrame ---
+    # 3. Finalize and Return DataFrame
     # Define base feature columns (stance and extensions - may exist for Floor/Ceiling)
     final_feature_cols = []
     if 'stance_area' in results_df.columns:
@@ -296,7 +305,7 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
     final_results_df['group'] = group
     final_results_df['individual'] = individual
 
-    # --- UNIT CONVERSION: pixels -> mm (distances) and px^2 -> mm^2 (areas) ---
+    # UNIT CONVERSION: pixels -> mm (distances) and px^2 -> mm^2 (areas)
     # stance_area: px^2 -> mm^2
     if 'stance_area' in final_results_df.columns:
         final_results_df['stance_area'] = final_results_df['stance_area'] * (mm_per_px ** 2)
@@ -317,10 +326,8 @@ def _calculate_postural_features(poscalc_df, masked_poses, masked_orients, video
 
 
 def calculate_and_save_postural_summary(master_postural_df, output_dir, *, save_outputs: bool = True):
-    """
-    Saves the raw postural feature data and calculates/saves summary statistics
-    for comprehensive postural features.
-    Handles both Floor and Ceiling orientations.
+    """Summarize numeric posture features by animal and Floor, Ceiling, or Wall-Side
+    orientation.
     """
     if master_postural_df is None or master_postural_df.empty:
         print("\nNo postural features were extracted. Skipping postural summary.")
@@ -328,12 +335,13 @@ def calculate_and_save_postural_summary(master_postural_df, output_dir, *, save_
 
     print("\nCalculating and saving postural feature summary...")
 
-    # --- 1. Aggregate Data by Animal and Orientation ---
+    # 1. Aggregate Data by Animal and Orientation
     df = master_postural_df.copy()
     # Use collapse function for consistency (mapping not available in this function scope)
     # This function is called after mapping is created, but we need to use the collapse function
     # since we don't have access to the mapping here
-    df['animal_id'] = df['individual'].map(lambda x: collapse_individual_id(x))
+    identities = {value: collapse_individual_id(value) for value in df['individual'].unique()}
+    df['animal_id'] = df['individual'].map(identities)
     
     # Ensure masked_orient column exists (should be added by _calculate_postural_features)
     if 'masked_orient' not in df.columns:
@@ -341,16 +349,27 @@ def calculate_and_save_postural_summary(master_postural_df, output_dir, *, save_
         df['masked_orient'] = 'Floor'
         print("Warning: 'masked_orient' column not found. Assuming all rows are 'Floor'.")
 
-    feature_cols = [col for col in df.columns 
-                    if col not in ['group', 'individual', 'animal_id', 'masked_pose', 'masked_orient',
-                                  'body_area_top', 'body_area_side', 'normalizer']]
+    # Per-recording identities support safe resume/purge and are metadata,
+    # never measurements. Restrict summary inputs to numeric feature columns.
+    excluded = {'group', 'individual', 'animal_id', 'source_file', 'sex',
+                'frame_idx', 'Frame Number', 'masked_pose', 'masked_orient',
+                'body_area_top', 'body_area_side', 'normalizer'}
+    feature_cols = [col for col in df.select_dtypes(include=np.number).columns
+                    if col not in excluded]
     
     # Group by group, animal_id, and masked_orient
     summary_df = df.groupby(['group', 'animal_id', 'masked_orient'])[feature_cols].agg(['mean', 'std']).reset_index()
     
+    return _format_postural_summary(summary_df, output_dir, save_outputs=save_outputs)
+
+
+def _format_postural_summary(summary_df, output_dir, *, save_outputs=True):
     # Pivot/unstack the masked_orient level to create separate columns for Floor and Ceiling
     # After groupby.agg, columns are MultiIndex: (feature_name, stat)
     # Set index to group, animal_id, masked_orient
+    """Format posture statistics into orientation-prefixed feature columns and
+    optionally write the workbook.
+    """
     summary_df_indexed = summary_df.set_index(['group', 'animal_id', 'masked_orient'])
     
     # Unstack the masked_orient level
@@ -413,6 +432,18 @@ def calculate_and_save_postural_summary(master_postural_df, output_dir, *, save_
     
     summary_df.rename(columns=rename_dict, inplace=True)
     summary_df.rename(columns={'animal_id': 'individual'}, inplace=True)
+
+    # Unstack creates empty feature/orientation combinations that do not apply,
+    # such as top/bottom asymmetry on Floor. Keep declared but unavailable
+    # features; reject undeclared measurements instead of discarding their data.
+    declared = {name.removeprefix('Postural_') for name in feature_columns()
+                if name.startswith('Postural_')}
+    unexpected = sorted(set(summary_df.columns) - {'group', 'individual'} - declared)
+    populated = [name for name in unexpected if summary_df[name].notna().any()]
+    if populated:
+        raise ValueError('Postural summary contains measurements for undeclared features: '
+                         f'{["Postural_" + name for name in populated]}')
+    summary_df.drop(columns=unexpected, inplace=True)
     
     # Ensure the identifier column keeps its unprefixed name.
     assert 'group' in summary_df.columns, "ERROR: 'group' column missing from postural summary"
@@ -436,7 +467,7 @@ def calculate_and_save_postural_summary(master_postural_df, output_dir, *, save_
              assert (summary_df[std_cols].dropna() >= 0).all().all(), f"Negative standard deviations found in columns: {std_cols}"
         print(" - Assert Checks Passed: Basic sanity checks on final postural summary (non-negative means/stds).")
 
-    # --- 2. Save Formatted Summary File ---
+    # 2. Save Formatted Summary File
     if save_outputs:
         summary_output_path = os.path.join(output_dir, '4_Postural_Features.csv')
         summary_df.to_csv(summary_output_path, index=False)
@@ -444,4 +475,72 @@ def calculate_and_save_postural_summary(master_postural_df, output_dir, *, save_
     return summary_df
 
 
-# 5 Kinematic Analysis
+def calculate_postural_summary_from_store(store_path, output_dir, *, normalizer_map=None,
+                                         individual_to_animal=None, save_outputs=True,
+                                         chunk_rows=4096):
+    """Calculate animal-level postural means and sample deviations from bounded HDF
+    chunks.
+    """
+    from .hdf_store import HDF_KEYS, open_store
+    from autobehaver.preinf.keyprenorm.normparams import merge_centered_moments
+
+    excluded = {'group', 'individual', 'animal_id', 'source_file', 'sex', 'frame_idx',
+                'Frame Number', 'masked_pose', 'masked_orient', 'body_area_top',
+                'body_area_side', 'normalizer'}
+    moments = {}
+    feature_cols = None
+    identities = {}
+    mapped_normalizers = 0
+    with open_store(store_path, 'r') as store:
+        key = HDF_KEYS['postural']
+        if key not in store:
+            return None
+        for frame in store.select(key, iterator=True, chunksize=int(chunk_rows)):
+            for value in frame['individual'].unique():
+                identities.setdefault(value, collapse_individual_id(value))
+            frame['animal_id'] = frame['individual'].map(identities)
+            if normalizer_map is not None:
+                norm_ids = frame['individual'].map({value: (individual_to_animal or {}).get(
+                    str(value), identities[value]) for value in frame['individual'].unique()})
+                normalizers = norm_ids.map(normalizer_map)
+                valid = normalizers.dropna()
+                mapped_normalizers += len(valid)
+                if len(valid) and not (valid > 0).all():
+                    raise ValueError('Mapped normalizer values must be positive.')
+                for col in list(frame.columns):
+                    if col.startswith('extension_raw_'):
+                        frame[col.replace('_raw_', '_norm_')] = frame[col] / normalizers
+            if feature_cols is None:
+                feature_cols = [col for col in frame.select_dtypes(include=np.number)
+                                if col not in excluded]
+            for group, block in frame.groupby(['group', 'animal_id', 'masked_orient'],
+                                              sort=False, observed=True):
+                values = block[feature_cols].to_numpy(dtype=np.float64, copy=True)
+                if np.isinf(values).any():
+                    raise ValueError('Postural summary contains infinite feature values.')
+                count = np.sum(np.isfinite(values), axis=0, dtype=np.int64)
+                mean = np.divide(np.nansum(values, axis=0), count,
+                                 out=np.zeros(len(feature_cols)), where=count > 0)
+                np.subtract(values, mean, out=values)
+                np.square(values, out=values)
+                m2 = np.nansum(values, axis=0)
+                if group in moments:
+                    mean, m2, count = merge_centered_moments(*moments[group], mean, m2, count)
+                moments[group] = (mean, m2, count)
+    if not moments:
+        return None
+    if normalizer_map is not None and not mapped_normalizers:
+        raise ValueError('Normalizer mapping failed for ALL animals!')
+    groups = sorted(moments)
+    rows = []
+    for group in groups:
+        mean, m2, count = moments[group]
+        mean = np.where(count > 0, mean, np.nan)
+        variance = np.divide(m2, count-1, out=np.full(len(count), np.nan), where=count > 1)
+        rows.append(np.column_stack([mean, np.sqrt(variance)]).ravel())
+    summary = pd.DataFrame(rows,
+        index=pd.MultiIndex.from_tuples(groups, names=['group', 'animal_id', 'masked_orient']),
+        columns=pd.MultiIndex.from_product([feature_cols, ['mean', 'std']])).reset_index()
+    return _format_postural_summary(summary, output_dir, save_outputs=save_outputs)
+
+

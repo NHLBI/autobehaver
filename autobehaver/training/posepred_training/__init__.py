@@ -1,8 +1,4 @@
-"""Pose prediction training entrypoint namespace.
-
-The CLI is imported eagerly, while core training functions are exposed lazily so
-``python -m autobehaver.training.posepred_training --help`` remains lightweight.
-"""
+"""Expose the PosePred CLI and lazily load core training helpers."""
 
 from __future__ import annotations
 

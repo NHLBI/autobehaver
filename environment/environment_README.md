@@ -1,34 +1,32 @@
 # Autobehaver environments
 
-Autobehaver uses one main environment plus an optional DeepLabCut environment.
-This split is intentional: DeepLabCut/TensorFlow is the most version-sensitive
-part of the workflow, while the rest of Autobehaver can run without it once DLC
-keypoint CSVs already exist.
+The main environment runs MovieChecker, Autocropper and all stages after keypoint
+extraction. DeepLabCut uses a separate environment because its TensorFlow/system
+dependencies differ from the core scientific stack.
 
 ## Main environment
 
-Use this for the standard Autobehaver pipeline after DLC keypoints are available:
+From the repository root:
 
 ```bash
 conda env create -f environment/environment.yml
 conda activate autobehaver
-python -m pip install -e .
-python environment/check_environment.py
+python -m pip install -e ".[monitoring]"
+python environment/check_environment.py --require-monitoring
 python -m autobehaver
 ```
 
-This environment is used for autocropper, keypre, keyprenorm, PosePred training
-and inference, MMGen, FeatureImp, and InfMovie. It intentionally does not install
-DeepLabCut or TensorFlow.
+Local and container environments share `requirements-core.txt`, Python 3.12,
+PyTorch 2.10.0 and OpenCV 4.10.0.84. Local OpenCV supports review windows; the CPU
+container uses headless OpenCV. For GPU workstations, select an official CUDA
+wheel for the same PyTorch version after creating the environment.
 
-The provided main Conda environment is intended primarily for Linux systems with
-CUDA-capable PyTorch. CPU-only, macOS, or different-CUDA users may need to
-replace the PyTorch lines in `environment/environment.yml` with the install
-recipe recommended by PyTorch for their platform.
+The monitoring extra supplies process CPU/RAM and optional NVIDIA telemetry for
+the maintained benchmark-enabled job templates. It does not enable monitoring
+for ordinary commands. Existing environments can install this extra in place;
+the check reports unavailable backends before a long run.
 
-## Optional DLC/TensorFlow environment
-
-Use this only when you need to run the DLC extraction stage yourself:
+## DeepLabCut environment
 
 ```bash
 conda env create -f environment/environment-dlc-tf.yml
@@ -38,33 +36,32 @@ python environment/check_environment.py --dlc-only --require-dlc
 python -m autobehaver.preinf.dlc --help
 ```
 
-On HPC systems, an existing DeepLabCut module can be used instead of creating the
-Conda environment. For example:
+An existing cluster DeepLabCut module can be used instead:
 
 ```bash
 module load DeepLabCut/2.3.9
 cd /path/to/autobehaver
-python-DLC -m autobehaver.preinf.dlc --help
+conda activate autobehaver
+python -m autobehaver.preinf.dlc --main_dir /path/to/project --dlc_python python-DLC
 ```
 
-If the package is not installed into the module's Python environment, run DLC
-commands from the repository root or set `PYTHONPATH` to the repository root.
+Run the Autobehaver CLI in the supported main environment. `--dlc_python` uses
+the module's existing interpreter only for TensorFlow and DeepLabCut API calls;
+it supports older cluster containers without requiring Autobehaver to run there.
+The main process retains output validation, processing records, and resource
+monitoring of backend children. Both environments must see the project, model,
+repository, and job scratch paths. Without this option, DeepLabCut runs in the
+CLI's own environment, which must meet Autobehaver's Python requirement.
 
-## Why separate environments?
-
-DLC 2.x workflows depend on TensorFlow and GPU/system libraries that can conflict
-with or complicate the main scientific environment. Separating DLC keeps the
-main environment easier to create and makes it clear that downstream Autobehaver
-stages can be tested from existing DLC CSV outputs.
-
-## Pip requirement files
-
-The text requirement files are lightweight references for users who cannot use
-the Conda environment files directly:
+## Dependency files
 
 ```text
-environment/requirements-core.txt
-environment/requirements-dlc-tf.txt
+environment/requirements-core.txt          shared scientific dependencies
+environment/requirements-local-core.txt    local PyTorch/OpenCV variants
+environment/requirements-dlc-tf.txt        separate DeepLabCut stack
 ```
 
-The Conda YAML files are the recommended installation path.
+Keep scientific dependency versions pinned in the shared dependency file.
+After changing dependencies, rebuild the relevant environments, run
+`python -m pip check`, and verify the package tests. The supplied DeepLabCut
+environment uses Python 3.10 separately from the Python 3.12 main environment.

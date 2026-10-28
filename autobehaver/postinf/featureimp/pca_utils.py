@@ -1,4 +1,4 @@
-"""PCA utilities for the retained FeatureImp PCA reference-axis analysis."""
+"""Fit or reuse fixed-component reference PCA projections for FeatureImp."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 import hashlib
 import json
 import os
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,8 @@ def _as_float32_matrix(X: Any) -> np.ndarray:
         arr = X.to_numpy(dtype=np.float32, copy=True)
     else:
         arr = np.asarray(X, dtype=np.float32)
+    if np.isinf(arr).any():
+        raise ValueError("PCA inputs contain infinite values")
     if np.isnan(arr).any():
         arr = np.nan_to_num(arr, nan=0.0)
     return arr
@@ -55,12 +58,29 @@ def _joblib_load(path: str) -> Any:
 
 
 def _joblib_dump(obj: Any, path: str) -> bool:
+    temporary = None
     try:
         import joblib  # type: ignore
-        joblib.dump(obj, path)
+        fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), suffix='.joblib')
+        os.close(fd)
+        joblib.dump(obj, temporary)
+        os.replace(temporary, path)
         return True
     except Exception:
         return False
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def _matrix_identity(X: Any, array: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(array.shape).encode())
+    digest.update(np.ascontiguousarray(array, dtype='<f4').tobytes())
+    if isinstance(X, pd.DataFrame):
+        digest.update(json.dumps([str(c) for c in X.columns]).encode())
+        digest.update(json.dumps([str(i) for i in X.index]).encode())
+    return digest.hexdigest()
 
 
 def _fit_project_reference_pca(
@@ -77,9 +97,9 @@ def _fit_project_reference_pca(
     X_all_scaled = scaler.transform(X_all_array)
 
     n_ref_samples, n_features = X_ref_scaled.shape
-    max_possible = int(min(n_ref_samples, n_features))
+    max_possible = int(min(n_ref_samples - 1, n_features))
     if max_possible <= 0:
-        raise ValueError("PCA requires at least one reference sample and one feature.")
+        raise ValueError("Centered PCA requires at least two reference samples and one feature.")
 
     try:
         requested_k = int(pca_fixed_k) if pca_fixed_k is not None else 50
@@ -106,6 +126,14 @@ def get_cached_pca_projection(
     """Compute or reuse the fixed-k reference PCA projection."""
 
     analysis_folder = str(paths.get("analysis_folder", "") or "")
+    ref_array = _as_float32_matrix(X_ref)
+    all_array = _as_float32_matrix(X_all)
+    if ref_array.ndim != 2 or all_array.ndim != 2 or ref_array.shape[1] != all_array.shape[1]:
+        raise ValueError("PCA reference/projection matrices must have the same feature width")
+    if not np.isfinite(ref_array).all() or not np.isfinite(all_array).all():
+        raise ValueError("PCA inputs contain infinite values")
+    if isinstance(X_ref, pd.DataFrame) and isinstance(X_all, pd.DataFrame) and list(X_ref.columns) != list(X_all.columns):
+        raise ValueError("PCA reference/projection feature order differs")
     try:
         fixed_k_i = int(pca_fixed_k) if pca_fixed_k is not None else 50
     except Exception:
@@ -134,6 +162,9 @@ def get_cached_pca_projection(
         "n_all": n_all,
         "n_feat": n_feat,
         "feature_name_hash": _feature_name_hash(X_ref),
+        "fit_identity": _matrix_identity(X_ref, ref_array),
+        "projection_identity": _matrix_identity(X_all, all_array),
+        "calculation_version": 3,
     }
     key = tuple(sorted(meta.items()))
     cache = paths.setdefault("_pca_cache", {})

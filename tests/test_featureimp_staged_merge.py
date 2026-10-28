@@ -8,8 +8,8 @@ from autobehaver.postinf.featureimp.shap_tasks import load_shap_task_archive
 
 def _write_small_master_matrix(matrix_path: Path) -> None:
     rows = []
-    for i in range(12):
-        group = "A" if i < 6 else "B"
+    for i in range(20):
+        group = "A" if i < 10 else "B"
         sex = "M" if i % 2 == 0 else "F"
         rows.append(
             {
@@ -17,7 +17,7 @@ def _write_small_master_matrix(matrix_path: Path) -> None:
                 "group": group,
                 "sex": sex,
                 "BoutSummary_feat1": float(i + 1),
-                "StdMeasure_feat2": float((i % 4) + 0.5),
+                "StdMeasure_feat2": float(i + 0.5),
                 "Kinematic_turn_inst": float((i // 2) + 0.25),
                 "Spatial_feat4": float(20 - i),
                 "Constant_feat0": 1.0,
@@ -50,6 +50,7 @@ def test_featureimp_staged_core_outputs(tmp_path: Path):
         "training_group_b": "B",
         "num_workers": 1,
         "n_estimators": 4,
+        "model_subsample": 1.0,
         "learning_rate": 0.2,
         "max_depth": 2,
         "n_splits": 2,
@@ -59,6 +60,7 @@ def test_featureimp_staged_core_outputs(tmp_path: Path):
         "n_permutations": 1,
         "run_fsea_analysis": False,
         "run_pca_analysis": False,
+        "subset_weight_tau_quantile": 0.5,
         "num_shards": 3,
     }
     core.apply_settings(settings, propagate=False)
@@ -135,13 +137,29 @@ def test_featureimp_staged_core_outputs(tmp_path: Path):
     assert (analysis_dir / "SHAP_CONSOLIDATED_SUMMARY_MALE_VS_FEMALE.xlsx").exists()
     assert (analysis_dir / "COMMITTEE_SUBSETS" / "SHAP_WEIGHTING_MANIFEST.json").exists()
     assert (analysis_dir / "PERMUTED_0_RESULTS" / "SHAP_CONSOLIDATED_SUMMARY_INSAMPLE_VS_OUTOFSAMPLE_PERMUTED_0.xlsx").exists()
-    assert (analysis_dir / "PERMUTED_0_RESULTS" / "AVERAGED_PREDICTIONS_PERMUTED_0.xlsx").exists()
+    assert (analysis_dir / "PERMUTED_RESULTS" / "AVERAGED_PREDICTIONS_PERMUTED_0.xlsx").exists()
 
     weighted_df = pd.read_excel(analysis_dir / "AVERAGED_PREDICTIONS_FULL.xlsx", sheet_name="WeightedPredictions")
     unweighted_df = pd.read_excel(analysis_dir / "AVERAGED_PREDICTIONS_FULL.xlsx", sheet_name="UnweightedPredictions")
     assert set(["individual", "group"]).issubset(set(weighted_df.columns))
     assert set(["individual", "group"]).issubset(set(unweighted_df.columns))
     assert any(col.startswith("Prob_A") or col.startswith("Prob_B") for col in weighted_df.columns)
+
+    # Every requested auxiliary family must remain verifiable after completion.
+    import pytest
+    from autobehaver.postinf.featureimp.integrity import validate_receipt
+    validate_receipt(str(merge_done_path), str(analysis_dir))
+    for relative in (
+        "PERMUTED_0_RESULTS/GLOBAL_IMPORTANCE_RANKING_PERMUTED_0.csv",
+        "FEATUREIMP_REFERENCE/FROZEN_FEATURE_COLUMNS.json",
+    ):
+        target = analysis_dir / relative
+        original = target.read_bytes()
+        target.unlink()
+        with pytest.raises(ValueError, match="Missing scientific artifact"):
+            validate_receipt(str(merge_done_path), str(analysis_dir))
+        target.write_bytes(original)
+        validate_receipt(str(merge_done_path), str(analysis_dir))
 
 
 def test_featureimp_merge_shards_serial_tail(tmp_path: Path):
@@ -166,6 +184,7 @@ def test_featureimp_merge_shards_serial_tail(tmp_path: Path):
         "training_group_b": "B",
         "num_workers": 1,
         "n_estimators": 4,
+        "model_subsample": 1.0,
         "learning_rate": 0.2,
         "max_depth": 2,
         "n_splits": 2,
@@ -175,6 +194,7 @@ def test_featureimp_merge_shards_serial_tail(tmp_path: Path):
         "n_permutations": 1,
         "run_fsea_analysis": False,
         "run_pca_analysis": False,
+        "subset_weight_tau_quantile": 0.5,
         "num_shards": 3,
     }
     core.apply_settings(settings, propagate=False)

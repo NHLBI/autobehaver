@@ -1,11 +1,5 @@
-"""Animal mapping helpers for mmgen.
-
-mmgen aggregates multiple recordings (e.g., movie0/movie1) into a single
-"animal" identity. The mapping is derived from filenames and written out for
-human inspection.
-
-This logic is shared by orchestration and append/finalization code so that
-recording-to-animal collapsing is implemented in one place.
+"""Map filename-derived recording identities to MMGen animals and write the mapping for
+inspection.
 """
 
 from __future__ import annotations
@@ -39,7 +33,7 @@ def create_animal_mapping(
     file_to_animal = {}  # Reverse lookup: file path -> animal_id
 
     def extract_recording_number(individual_id):
-        """Extract movie number from individual ID. Trial is identity, not recording."""
+        """Extract the movie number used to distinguish recordings of one animal."""
 
         match = re.search(r"movie(\d+)", individual_id)
         if match:
@@ -64,7 +58,7 @@ def create_animal_mapping(
 
     for filename in inf_files:
         try:
-            group, individual_id, sex = parse_group_and_individual(filename)
+            group, individual_id, sex = parse_group_and_individual(os.path.join(inference_csv_dir, filename))
             animal_id = collapse_individual_id(individual_id)
 
             # Extract trial as part of identity (not a recording)
@@ -98,7 +92,7 @@ def create_animal_mapping(
             animal_mapping[animal_id]["n_recordings"] += 1
 
             # Add movie recording info (only movies, not trials)
-            if recording_info:  # only movies now
+            if recording_info:  
                 animal_mapping[animal_id]["recordings"].append(
                     {
                         "individual_id": individual_id,
@@ -132,7 +126,7 @@ def create_animal_mapping(
         sexes = set()
         for filename in data["files"]:
             try:
-                group, _, sex = parse_group_and_individual(os.path.basename(filename))
+                group, _, sex = parse_group_and_individual(filename)
                 groups.add(group)
                 sexes.add(sex)
             except Exception:

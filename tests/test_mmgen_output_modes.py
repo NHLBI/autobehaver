@@ -4,7 +4,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
-import yaml
 
 from autobehaver.postinf.mmgen import cli
 from autobehaver.postinf.mmgen.time_budgets import calculate_and_save_time_budgets
@@ -39,7 +38,7 @@ class TestMMGenCliOutputModes(unittest.TestCase):
             self.assertTrue(captured[0].emit_master_matrix)
             self.assertFalse(captured[0].emit_full_outputs)
 
-    def test_config_no_full_outputs_sets_emit_flags(self):
+    def test_hyphenated_no_full_outputs_sets_emit_flags(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             inf = base / "inf"
@@ -48,23 +47,14 @@ class TestMMGenCliOutputModes(unittest.TestCase):
             inf.mkdir()
             pos.mkdir()
             out.mkdir()
-            cfg_path = base / "config.yaml"
-            cfg_path.write_text(yaml.safe_dump({
-                "mmgen": {
-                    "inference_csv_dir": str(inf),
-                    "poscalc_dir": str(pos),
-                    "output_dir": str(out),
-                    "full_outputs": False,
-                }
-            }))
-
             captured = []
 
             def _fake_run(cfg):
                 captured.append(cfg)
 
             with patch("autobehaver.postinf.mmgen.core.run_mmgen", side_effect=_fake_run):
-                cli.main(["--config", str(cfg_path)])
+                cli.main(["--inference-csv-dir", str(inf), "--poscalc-dir", str(pos),
+                          "--output-dir", str(out), "--no-full-outputs"])
 
             self.assertEqual(len(captured), 1)
             self.assertTrue(captured[0].emit_master_matrix)

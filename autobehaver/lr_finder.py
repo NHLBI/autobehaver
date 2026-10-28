@@ -1,15 +1,7 @@
-"""Learning-rate range test (LR Finder).
+"""Sweep learning rates using the PosePred model, augmentation and training losses.
 
-This module provides a lightweight LR range test that does *not* depend on
-external libraries (e.g. torch-lr-finder). It runs a short training loop while
-increasing the learning rate exponentially and records the loss.
-
-Design goals:
-  - Uses the *same* model + loss composition as normal training (pose/orient
-    heads and optional reconstruction), including augmentation (noise+mask).
-  - Works on headless HPC nodes (saves CSV, optionally saves a PNG if
-    matplotlib is available).
-  - Avoids adding new runtime dependencies.
+Write loss/LR records to CSV and optionally plot them when matplotlib is
+available. Checkpoints supply weights with a fresh optimizer.
 """
 
 from __future__ import annotations
@@ -24,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .augmentation import augment_features
-from .checkpoint import load_checkpoint_model, is_pretrain_checkpoint_path
+from .checkpoint import load_checkpoint_model, is_pretrain_checkpoint_path, load_checkpoint_variables
 from .datasets import build_dataloader
 from .io import get_headers_from_first_hdf5
 from .losses import masked_mse_loss
@@ -34,7 +26,7 @@ from .feature_selection import resolve_feature_plan
 
 @dataclass(frozen=True)
 class LRFinderResult:
-    """Outputs produced by an LR range test."""
+    """Store output CSV/plot paths and the estimated learning rate."""
 
     csv_path: str
     plot_path: Optional[str]
@@ -70,21 +62,12 @@ def _maybe_save_plot(df: pd.DataFrame, out_path: str) -> Optional[str]:
 
 
 def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
-    """Run an LR range test.
+    """Run a learning-rate sweep on normalized HDF5 files and training metadata.
 
-    Parameters
-    ----------
-    args
-        Parsed CLI args Namespace from :mod:`autobehaver.cli`.
-    directory
-        Dataset directory containing normalized HDF5 files.
-    metadata
-        Metadata dataframe (same one used for training).
-
-    Returns
-    -------
-    LRFinderResult
-        Paths to saved outputs.
+    Use the CLI namespace for model/loss settings. Return output paths and
+    the estimated learning rate; checkpoint preparation uses current inputs
+    and splits with weights-only loading. The sweep measures training loss only;
+    it does not compute or claim a validation score.
     """
 
     if metadata is None or len(metadata) == 0:
@@ -93,7 +76,6 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
             "No usable metadata rows were provided."
         )
 
-    # Resolve feature schema (match supervised training defaults)
     raw_headers = get_headers_from_first_hdf5(directory)
     feature_plan = resolve_feature_plan(
         raw_headers,
@@ -104,6 +86,10 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
         case_sensitive=bool(getattr(args, 'ablation_case_sensitive', False)),
     )
     num_features = len(feature_plan.included_columns)
+    load_checkpoint_variables(args, getattr(args, 'pretrained_model_path', None),
+        use_restart_optimizer=True, current_num_features=num_features,
+        current_feature_schema_hash=feature_plan.schema_hash,
+        current_feature_columns_included=list(feature_plan.included_columns))
     print(f"[LRFinder] Features: raw={len(raw_headers)} included={num_features} hash={feature_plan.schema_hash}")
 
     (
@@ -122,6 +108,8 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
         num_workers=args.num_workers,
         random_seed=args.random_seed,
         pretrained_model_path=getattr(args, "pretrained_model_path", None),
+        restart_optimizer=True,  # LR sweeps load checkpoint weights with a fresh optimizer.
+        preserve_checkpoint_split=False,  # No validation score is computed by the sweep.
         pose_pred=args.pose_pred,
         orient_pred=args.orient_pred,
         recon=args.recon,
@@ -151,8 +139,7 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
     end_lr = min(max(base_lr_guess * 100.0, base_lr_guess), 1.0)
     print(f"[LRFinder] LR sweep: start_lr={start_lr:g} -> end_lr={end_lr:g}")
 
-    # Build model using the same explicit optimizer/scheduler hyperparameters as the
-    # supervised training path, without relying on any CLI-mutated module globals.
+    # Use supervised model/loss settings without implicit checkpoint state restoration.
 
     pretrained_model_path = getattr(args, "pretrained_model_path", None)
     is_handoff = False
@@ -213,9 +200,11 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
                 scaler=None,
                 load_optimizer_state=False,
                 strict=False,
+                pose_dict=pose_dict,
+                orient_dict=orient_dict,
             )
         except Exception as e:
-            print(f"[LRFinder] WARNING: Could not load pretrained weights: {e}")
+            raise RuntimeError(f"LR finder could not load requested pretrained weights: {pretrained_path}") from e
 
     initial_group_lrs = [pg.get("lr", start_lr) for pg in optimizer.param_groups]
     group_lr_ratios = [lr / start_lr for lr in initial_group_lrs]
@@ -257,14 +246,7 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
         pose_targets = pose_targets.to(device, non_blocking=True)
         orient_targets = orient_targets.to(device, non_blocking=True)
 
-        # Augmentation interface note:
-        # `augment_features()` does not take a `recon=` flag; instead it can optionally
-        # return the elementwise keep-mask (True=kept, False=masked) via `return_mask=True`.
-        #
-        # LR-finder should mimic the *actual* training objective:
-        #   - For supervised-only runs, we don't need the mask.
-        #   - For recon/denoising runs, we need the keep-mask so we can compute masked-MSE
-        #     only on masked elements.
+        # Reconstruction requires the elementwise keep-mask and clean target sequence.
         if args.recon:
             sequences_aug, keep_mask = augment_features(
                 sequences,
@@ -292,16 +274,16 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
             pose_logits, orient_logits, recon_out, _ctx = model(sequences_aug)
             total_loss = torch.tensor(0.0, device=device)
 
-            combined_targets = pose_targets * len(orient_dict) + orient_targets
-            sample_weights = train_class_weights[combined_targets]
+            sample_indices = _idx.to(device=train_class_weights.device, dtype=torch.long)
+            sample_weights = train_class_weights[sample_indices].to(device)
 
             if args.pose_pred:
-                pose_loss = F.cross_entropy(pose_logits, pose_targets, reduction="none")
+                pose_loss = F.cross_entropy(pose_logits, pose_targets, reduction="none", label_smoothing=0.1)
                 pose_loss = (pose_loss * sample_weights).mean()
                 total_loss = total_loss + float(args.pose_weight) * pose_loss
 
             if args.orient_pred:
-                orient_loss = F.cross_entropy(orient_logits, orient_targets, reduction="none")
+                orient_loss = F.cross_entropy(orient_logits, orient_targets, reduction="none", label_smoothing=0.1)
                 orient_loss = (orient_loss * sample_weights).mean()
                 total_loss = total_loss + float(args.orient_weight) * orient_loss
 
@@ -342,7 +324,7 @@ def find_lr(*, args, directory: str, metadata: pd.DataFrame) -> LRFinderResult:
         if (step + 1) % 25 == 0:
             print(f"[LRFinder] step {step+1:>4}/{num_iter} | lr={lr:g} | loss={loss_val:g}")
 
-    records_dir = os.path.join(directory, "Records")
+    records_dir = os.path.join(getattr(args, 'output_directory', None) or directory, "Records")
     _safe_mkdir(records_dir)
 
     df = pd.DataFrame({"lr": lrs, "loss": losses})

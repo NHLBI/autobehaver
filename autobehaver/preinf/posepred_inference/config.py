@@ -1,30 +1,41 @@
-"""Config dataclass for the PosePred inference pipeline stage."""
+"""Define model, averaging, smoothing, and output options for PosePred inference."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+from pathlib import Path
+
+def default_models():
+    """Return the bundled final nh16/32/64 epoch-301 checkpoint paths."""
+    root = Path(__file__).resolve().parents[2] / "resources" / "posepred"
+    return [str(root / f"nh{n}_e301.pth") for n in (16,32,64)]
+
 
 
 @dataclass
 class PosePredInferenceConfig:
-    """Runtime configuration for posepred inference (pipeline stage)."""
+    """Store runtime options for the PosePred inference stage."""
 
     # I/O
     input_dir: str
     output_dir: Optional[str] = None
 
     # Models (one or more; multiple implies ensembling)
-    inference_model: List[str] = field(default_factory=list)
+    inference_model: List[str] = field(default_factory=default_models)
 
     # Inference performance
-    num_workers: int = 14
-    batch: int = 1024
+    num_workers: int = -1
+    batch: int = 0
+    memory_gb: Optional[float] = None
+    noise_workers: int = 0
+    vram_fraction: float = .8
 
     # Test-time averaging / augmentation
     inf_average: int = 10
-    use_tta: bool = False
+    use_tta: bool = True
     tta_noise_level: float = 0.01
+    tta_seed: int = 42
 
     # Smoothing (bout-length in frames)
     min_pose_bout: int = 5
@@ -53,3 +64,4 @@ class PosePredInferenceConfig:
 
     # Optional: write a small run summary/manifest
     write_run_log: bool = True
+    file_list: str | None = None

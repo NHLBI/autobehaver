@@ -1,8 +1,5 @@
-"""Reference/provenance-bundle helpers for completed FeatureImp runs.
-
-A completed FeatureImp analysis records the frozen feature set, normalization
-schema, model inventory, and run metadata needed to audit the FeatureImp
-analysis.  These helpers write that provenance bundle explicitly.
+"""Write the frozen features, normalization schema, model inventory, and provenance
+bundle for a completed FeatureImp run.
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 import pandas as pd
 
 from autobehaver import __version__ as AUTOBEHAVER_VERSION
+from autobehaver.io import portable_relpath
 
 from .matrix import compute_feature_schema_sha256, load_normalization_params
 
@@ -26,6 +24,7 @@ REFERENCE_MANIFEST_NAME = "FEATUREIMP_REFERENCE_MANIFEST.json"
 
 
 def ensure_reference_folder(analysis_folder: str) -> str:
+    """Create and return the analysis provenance directory."""
     folder = os.path.join(str(analysis_folder), REFERENCE_DIRNAME)
     os.makedirs(folder, exist_ok=True)
     return folder
@@ -36,20 +35,20 @@ def _safe_relpath(path: Optional[str], root: str) -> Optional[str]:
     if not path:
         return None
     try:
-        return os.path.relpath(str(path), str(root))
+        return portable_relpath(str(path), str(root))
     except Exception:
         return str(path)
 
 
 
 def _write_json(path: str, payload: Mapping[str, Any]) -> None:
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, default=str)
 
 
 
 def _write_json_list(path: str, values: Sequence[Any]) -> None:
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(list(values), f, indent=2, default=str)
 
 
@@ -108,6 +107,9 @@ def _build_model_inventory_rows(
     *,
     analysis_folder: str,
 ) -> List[Dict[str, Any]]:
+    """Record model paths, task identities, feature lists, and file availability in
+    stable order.
+    """
     rows: List[Dict[str, Any]] = []
     for rec in performance_records:
         if not isinstance(rec, Mapping):
@@ -177,7 +179,7 @@ def write_featureimp_reference_bundle(
     _write_json_list(normalization_features_path, normalization_feature_columns)
 
     compositional_sets_path = os.path.join(ref_dir, 'COMPOSITIONAL_SETS.json')
-    _write_json(compositional_sets_path, norm_params.get('compositional_sets', {}))
+    _write_json(compositional_sets_path, norm_params.get('clr_input_compositional_sets', norm_params.get('compositional_sets', {})))
 
     inventory_rows = _build_model_inventory_rows(
         performance_records or [],
@@ -187,7 +189,7 @@ def write_featureimp_reference_bundle(
     if inventory_rows:
         pd.DataFrame(inventory_rows).to_csv(inventory_path, index=False)
     else:
-        with open(inventory_path, 'w', newline='') as f:
+        with open(inventory_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
                 'h_hit', 'subset_idx', 'fold_idx', 'is_permuted',
@@ -211,10 +213,10 @@ def write_featureimp_reference_bundle(
             'normalization_params_json': _safe_relpath(params_path, analysis_folder),
             'featureimp_run_settings_json': 'FEATUREIMP_RUN_SETTINGS.json' if os.path.exists(os.path.join(analysis_folder, 'FEATUREIMP_RUN_SETTINGS.json')) else None,
             'group_label_mapping_json': _safe_relpath(group_label_mapping_path, analysis_folder),
-            'selected_feature_columns_json': os.path.join(REFERENCE_DIRNAME, os.path.basename(selected_features_path)),
-            'normalization_feature_columns_json': os.path.join(REFERENCE_DIRNAME, os.path.basename(normalization_features_path)),
-            'compositional_sets_json': os.path.join(REFERENCE_DIRNAME, os.path.basename(compositional_sets_path)),
-            'model_inventory_csv': os.path.join(REFERENCE_DIRNAME, os.path.basename(inventory_path)),
+            'selected_feature_columns_json': f'{REFERENCE_DIRNAME}/{os.path.basename(selected_features_path)}',
+            'normalization_feature_columns_json': f'{REFERENCE_DIRNAME}/{os.path.basename(normalization_features_path)}',
+            'compositional_sets_json': f'{REFERENCE_DIRNAME}/{os.path.basename(compositional_sets_path)}',
+            'model_inventory_csv': f'{REFERENCE_DIRNAME}/{os.path.basename(inventory_path)}',
             'subset_weights_csv': _safe_relpath(subset_weights_path, analysis_folder),
             'weighting_manifest_json': _safe_relpath(weighting_manifest_path, analysis_folder),
             'models_folder': _safe_relpath(models_folder, analysis_folder) if os.path.isdir(models_folder) else None,

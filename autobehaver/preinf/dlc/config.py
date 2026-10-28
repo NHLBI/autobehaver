@@ -1,11 +1,4 @@
-"""Configuration for DeepLabCut inference (DLC wrapper stage).
-
-This stage can optionally participate in the **project registry** workflow.
-When enabled, DLC will:
-  * use the registry as the authoritative list of cropped chamber movies
-    (animals) to process, and
-  * upsert the DLC output CSV path for each animal into the registry.
-"""
+"""Define video selection, model, and rendering options for DeepLabCut inference."""
 
 from __future__ import annotations
 
@@ -16,12 +9,12 @@ from pathlib import Path
 
 
 def default_dlc_config_path() -> str:
-    """Return the bundled portable DLC project config path."""
+    """Return the bundled portable DeepLabCut project config path."""
     return str(
         Path(__file__).resolve().parents[2]
         / "resources"
         / "dlc"
-        / "trial#3-mixed-training-na-2024-11-29"
+        / "m1"
         / "config.yaml"
     )
 
@@ -31,7 +24,7 @@ DEFAULT_DLC_CONFIG_PATH: str | None = default_dlc_config_path()
 
 @dataclass(frozen=True)
 class DLCInferencerConfig:
-    """Runtime configuration for DLC inference."""
+    """Store runtime options for DeepLabCut inference."""
 
     # Required
     input_dir: str
@@ -51,19 +44,17 @@ class DLCInferencerConfig:
     # Inference options
     shuffle: int = 1
     max_retries: int = 10
+    dlc_python: str | None = None
     output_dir: str | None = None
+    scratch_dir: str | None = None
 
     # Pipeline behavior
     clobber: bool = False
 
-    # Optional: after inference, strip a user-provided DLC tag substring from DLC CSV filenames.
-    # This is the long model-specific suffix DLC appends to output CSVs.
-    # Example tag:
-    #   DLC_resnet50_trial#3-mixed-trainingNov29shuffle1_1000000
+    # Optional exact scorer-tag substring to remove from CSV filenames.
     dlc_tag_to_remove: str | None = None
 
-    # If True, keep the DLC tag in filenames even if dlc_tag_to_remove is set.
-    # Default behavior is to strip the tag when dlc_tag_to_remove is provided.
+    # Keep scorer tags when explicitly requested despite dlc_tag_to_remove.
     keep_dlc_tag: bool = False
 
     # Labeled movie options
@@ -79,21 +70,15 @@ class DLCInferencerConfig:
     codec: str = "mp4v"
     overwrite: bool = True
 
-    # ----------------------
     # Project registry (single CSV at project root)
-    # ----------------------
     registry_enabled: bool = False
     registry_csv: str | None = None
     registry_lock_timeout_sec: int = 120
     registry_lock_stale_sec: int = 60 * 60
+    file_list: str | None = None
 
     def resolved_registry_csv(self) -> str | None:
-        """Path to the project-wide registry CSV (or None if disabled).
-
-        If ``registry_csv`` is not provided, we infer the project root from the
-        numbered pipeline folders (e.g., 2_cropped_movies and 3_dlc) and default
-        to ``<project_root>/registry.csv``.
-        """
+        """Return the explicit or inferred registry path, or None when disabled."""
 
         if not bool(self.registry_enabled):
             return None

@@ -1,20 +1,12 @@
-"""Registry-driven infmovie pipeline.
+"""Discover InfMovie input pairs, select clips, and render overlays.
 
-This module implements the registry-aware infmovie pipeline stage. It can:
-  * resolve movie/inference pairs from the project registry
-  * generate *clips* for presentations/QC instead of full-length movies
-  * support multiple modes:
-      - manual: render a user-specified clip for a single recording_id
-      - interesting: sample clips with multiple behaviors in a sequence
-      - qc: sample clips where the model is uncertain or labels switch rapidly
-      - full: render full-length overlay movies (usually not recommended)
-
-It intentionally avoids writing per-movie sidecar metadata files.
-Instead, it writes a single per-run plan CSV (and optional JSON run log) into
-7_infmovies/plans/.
+Support manual, uncertainty, behavior-diversity, and full-movie plans from folders or an
+optional recording registry.
 """
 
 from __future__ import annotations
+
+from autobehaver.progress import progress
 
 import csv
 import json
@@ -23,7 +15,7 @@ import os
 import random
 import re
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from multiprocessing import Pool
 from pathlib import Path
@@ -32,16 +24,17 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from autobehaver.registry import read_registry, relpath_str
+from autobehaver.validation import StageValidationReport
 
 from .config import InfMoviePipelineConfig
 from .movies import render_overlay_movie
+from .frame_map import load_source_frames, source_aligned, read_csv_summary
+from .io import open_video_capture, worker_count, resolve_movie_fps
 
 logger = logging.getLogger(__name__)
 
 
-# -----------------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
 
 def _is_active(val: object) -> bool:
     """Interpret the registry 'active' column permissively."""
@@ -112,13 +105,13 @@ def _ensure_dir(path: Path) -> None:
 def _get_video_info(movie_path: Path, *, default_fps: float = 40.0) -> Tuple[float, int]:
     """Return (fps, frame_count) with a safe fallback."""
 
-    fps = float(default_fps)
+    fps = resolve_movie_fps(None, default_fps)
     n_frames = 0
 
     try:
         import cv2
 
-        cap = cv2.VideoCapture(str(movie_path))
+        cap = open_video_capture(str(movie_path))
         if cap.isOpened():
             fps2 = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
             n2 = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -179,19 +172,19 @@ def _load_labels_for_selection(
     *,
     source: str,
     limit_frames: Optional[int] = None,
+    summary=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Load label arrays for selection.
+    """Load pose and orientation labels from a checked summary or selected CSV columns.
 
-    Returns:
-        pose_labels: np.ndarray[str]
-        orient_labels: np.ndarray[str]
-
-    Missing columns yield empty arrays.
-
-    Implementation note:
-        We intentionally use pandas for robustness + speed.
+    Use blank labels for missing columns; unreadable inputs or inputs without either
+    label column return empty arrays.
     """
 
+    if summary is not None:
+        pose_col, orient_col = _pick_label_columns(list(summary.headers), source=source)
+        count = len(summary.frames) if limit_frames is None else min(len(summary.frames), int(limit_frames))
+        missing = np.full(count, '', dtype=object)
+        return (summary.columns.get(pose_col, missing)[:count], summary.columns.get(orient_col, missing)[:count])
     headers = _read_csv_headers(csv_path)
     pose_col, orient_col = _pick_label_columns(headers, source=source)
 
@@ -232,12 +225,26 @@ def _load_labels_for_selection(
     return pose_arr, orient_arr
 
 
-def _load_confidence_for_qc(csv_path: Path, *, limit_frames: Optional[int] = None) -> Optional[np.ndarray]:
+def _load_confidence_for_qc(csv_path: Path, *, limit_frames: Optional[int] = None, summary=None) -> Optional[np.ndarray]:
     """Compute per-frame confidence from max pose/orient probabilities.
 
-    Returns an array of shape (N,) in [0,1], or None if probability columns are missing.
+    Returns (N,) confidence in [0,1], NaN for missing predictions, or None when
+    probability columns are absent.
     """
 
+    if summary is not None:
+        count = len(summary.frames) if limit_frames is None else min(len(summary.frames), int(limit_frames))
+        maxima = []
+        for prefix in ('Pose-', 'Orient-'):
+            columns = [values[:count] for name, values in summary.columns.items()
+                       if name.startswith(prefix) and name.endswith('-Prob')]
+            if columns:
+                matrix = np.column_stack(columns)
+                maxima.append(np.where(np.isnan(matrix), -np.inf, matrix).max(axis=1))
+        if not maxima:
+            return None
+        conf = np.minimum(*maxima) if len(maxima) == 2 else maxima[0]
+        return np.clip(np.where(np.isfinite(conf), conf, np.nan), 0.0, 1.0)
     headers = _read_csv_headers(csv_path)
     pose_prob_cols = [h for h in headers if h.startswith("Pose-") and h.endswith("-Prob")]
     orient_prob_cols = [h for h in headers if h.startswith("Orient-") and h.endswith("-Prob")]
@@ -287,9 +294,9 @@ def _load_confidence_for_qc(csv_path: Path, *, limit_frames: Optional[int] = Non
     else:
         conf = orient_max.to_numpy()  # type: ignore
 
-    # NaN -> 0 (treat as uncertain)
+    # Keep missing predictions distinct from finite model confidence.
     conf = np.asarray(conf, dtype=float)
-    conf = np.where(np.isfinite(conf), conf, 0.0)
+    conf = np.where(np.isfinite(conf), conf, np.nan)
     conf = np.clip(conf, 0.0, 1.0)
 
     return conf
@@ -370,9 +377,7 @@ def _fixed_len_clip_from_event(
     return int(start), int(end)
 
 
-# -----------------------------------------------------------------------------
 # Pair discovery
-# -----------------------------------------------------------------------------
 
 def discover_pairs_from_registry(
     *,
@@ -403,25 +408,8 @@ def discover_pairs_from_registry(
     except Exception:
         df2 = df.copy()
 
-    if file_filter:
-        needle = str(file_filter).lower()
-
-        def _row_has(r) -> bool:
-            for k in ("recording_id", "animal_id", "cropped_movie_relpath", "posepred_inference_csv_relpath"):
-                try:
-                    v = r.get(k)
-                except Exception:
-                    v = None
-                if isinstance(v, str) and needle in v.lower():
-                    return True
-            return False
-
-        try:
-            df2 = df2[df2.apply(_row_has, axis=1)].copy()
-        except Exception:
-            pass
-
     pairs: List[Dict[str, Any]] = []
+    missing_artifacts: List[str] = []
 
     for _, r in df2.iterrows():
         rid = r.get("recording_id")
@@ -434,10 +422,21 @@ def discover_pairs_from_registry(
         if not isinstance(irel, str) or not irel.strip():
             continue
 
-        movie_path = (project_root / mrel.replace("\\", "/")).resolve()
-        inf_path = (project_root / irel.replace("\\", "/")).resolve()
+        from autobehaver.registry import resolve_registry_path
+        movie_path = resolve_registry_path(project_root, r, "cropped_movie_relpath")
+        inf_path = resolve_registry_path(project_root, r, "posepred_inference_csv_relpath")
+        if file_filter:
+            from autobehaver.portable_paths import original_name
+            needle = str(file_filter).lower()
+            values = [r.get(key) for key in ('recording_id', 'animal_id', 'genotype', 'sex')]
+            values.extend([original_name(movie_path), original_name(inf_path)])
+            if not any(isinstance(value, str) and needle in value.lower() for value in values):
+                continue
 
         if not movie_path.exists() or not inf_path.exists():
+            missing_artifacts.append(
+                f"{rid}: movie_exists={movie_path.exists()}, inference_exists={inf_path.exists()}"
+            )
             continue
 
         pairs.append(
@@ -453,6 +452,11 @@ def discover_pairs_from_registry(
             }
         )
 
+    if missing_artifacts:
+        raise FileNotFoundError(
+            "Registry declares infmovie artifacts that are missing: "
+            f"{missing_artifacts[:25]}"
+        )
     return pairs
 
 
@@ -468,19 +472,36 @@ def discover_pairs_from_folders(
     from .io import find_movie_file
 
     pairs: List[Dict[str, Any]] = []
+    unmatched_csvs: List[str] = []
 
     csv_files = sorted([p for p in inference_csv_dir.glob("*.csv")])
+    from autobehaver.portable_paths import original_name
+    from autobehaver.preinf.autocropper.selection import filter_included_paths
+    csv_files = filter_included_paths(csv_files)
 
     if file_filter:
         needle = str(file_filter).lower()
-        csv_files = [p for p in csv_files if needle in p.name.lower()]
+        csv_files = [p for p in csv_files if needle in original_name(p).lower()]
 
     for csv_path in csv_files:
-        filename_part = extract_inf_csv_filename_part(csv_path.name)
+        # Keep named prediction files even if malformed: downstream validation
+        # must report their errors rather than silently dropping a recording.
+        if not original_name(csv_path).lower().endswith("_inference.csv"):
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                fields = set(next(csv.reader(stream), []))
+            if not ("Frame Number" in fields and fields.intersection({
+                "Predicted Pose Label", "Predicted Orient Label",
+                "Smoothed Pose Label", "Smoothed Orient Label",
+            })):
+                logger.info("Skipping non-prediction CSV: %s", csv_path.name)
+                continue
+        filename_part = extract_inf_csv_filename_part(str(csv_path))
         movie_file = find_movie_file(str(movie_dir), filename_part)
         if not movie_file:
+            unmatched_csvs.append(csv_path.name)
             continue
-        rid = Path(movie_file).stem
+        from autobehaver.portable_paths import original_name
+        rid = Path(original_name(movie_file)).stem
         pairs.append(
             {
                 "recording_id": rid,
@@ -494,43 +515,45 @@ def discover_pairs_from_folders(
             }
         )
 
+    if unmatched_csvs:
+        raise FileNotFoundError(
+            "Inference CSV files have no unambiguous matching movie: "
+            f"{unmatched_csvs[:25]}"
+        )
     return pairs
 
 
-# -----------------------------------------------------------------------------
 # Plan generation
-# -----------------------------------------------------------------------------
 
 def build_plan_manual(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Select the requested recording and convert its clip times to original-frame
+    bounds.
+    """
     if not cfg.recording_id:
         raise ValueError("manual mode requires recording_id")
 
     rid = str(cfg.recording_id).strip()
-    match = None
-    for p in pairs:
-        if str(p.get("recording_id", "")) == rid:
-            match = p
-            break
-    if match is None:
-        # allow substring match as convenience
-        for p in pairs:
-            if rid.lower() in str(p.get("recording_id", "")).lower():
-                match = p
-                break
-
-    if match is None:
+    matches = [p for p in pairs if str(p.get("recording_id", "")).casefold() == rid.casefold()]
+    if not matches:
+        matches = [p for p in pairs if rid.casefold() in str(p.get("recording_id", "")).casefold()]
+    if not matches:
         raise FileNotFoundError(f"recording_id not found in discovered pairs: {rid}")
+    if len(matches) != 1:
+        raise ValueError(f"Ambiguous recording_id {rid!r}; matches: "
+                         f"{[(p.get('recording_id'), p.get('movie_path')) for p in matches]}")
+    match = matches[0]
 
     movie_path = Path(str(match["movie_path"]))
     csv_path = Path(str(match["inf_csv_path"]))
 
     fps, n_vid = _get_video_info(movie_path, default_fps=float(cfg.default_movie_fps))
-    n_csv = _count_csv_rows(csv_path)
-    n_total = min(n_vid, n_csv) if (n_vid > 0 and n_csv > 0) else max(n_vid, n_csv)
+    summary = read_csv_summary(csv_path, source_frame_offset=cfg.source_frame_offset, video_frames=n_vid)
+    source_frames = summary.frames
+    n_total = int(source_frames[-1]) + 1
 
     clip_len = int(round(float(cfg.duration_sec) * float(fps)))
     start_frame = int(round(float(cfg.start_sec) * float(fps)))
-    start_frame = max(0, start_frame)
+    start_frame = max(int(source_frames[0]), start_frame)
     if n_total > 0:
         start_frame = min(start_frame, max(0, n_total - 1))
 
@@ -565,6 +588,7 @@ def build_plan_manual(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]
 
 
 def _summarize_labels(labels: np.ndarray) -> Dict[str, Any]:
+    """Count observed labels and return their dominant label and fraction."""
     if labels.size == 0:
         return {"unique_labels": 0, "n_changes": 0, "dominant_label": None}
 
@@ -643,7 +667,7 @@ def build_candidates_interesting(
         # Score: prioritize many unique labels and some switching.
         score = float(uniq) + 0.05 * float(n_changes)
 
-        # Penalty for extreme dominance (boring windows).
+        # Penalize windows dominated by one label.
         # Compute dominant fraction roughly from bouts.
         try:
             import collections
@@ -693,11 +717,15 @@ def build_candidates_qc(
 
     cands: List[Dict[str, Any]] = []
 
-    # --- Uncertainty candidates ---
+    # Uncertainty candidates
     if use_uncertainty and confidence is not None and confidence.size:
         conf = np.asarray(confidence[:n_total], dtype=float)
         thr = float(uncertainty_threshold)
-        uncertain = conf < thr
+        missing = ~np.isfinite(conf)
+        # Preserve the existing review priority for absent predictions while
+        # identifying them explicitly, rather than calling them model uncertainty.
+        ranking_conf = np.where(missing, 0.0, conf)
+        uncertain = ranking_conf < thr
 
         # Find contiguous uncertain segments.
         i = 0
@@ -710,7 +738,10 @@ def build_candidates_qc(
                 j += 1
             seg_len = j - i
             if seg_len >= int(min_uncertain_frames):
-                seg_conf = conf[i:j]
+                seg_conf = ranking_conf[i:j]
+                missing_count = int(missing[i:j].sum())
+                category = ('qc_missing_predictions' if missing_count == seg_len else
+                            'qc_uncertainty_with_missing_predictions' if missing_count else 'qc_uncertainty')
                 # Score: lower confidence -> higher score.
                 score = float(1.0 - float(np.nanmin(seg_conf)))
                 start, end = _fixed_len_clip_from_event(
@@ -725,12 +756,13 @@ def build_candidates_qc(
                         "start_frame": int(start),
                         "end_frame_exclusive": int(end),
                         "score": float(score),
-                        "reason": f"qc_uncertainty: seg={seg_len} frames",
+                        "reason": f"{category}: seg={seg_len} frames",
+                        "missing_prediction_frames": missing_count,
                     }
                 )
             i = j
 
-    # --- Rapid switching candidates ---
+    # Rapid switching candidates
     if use_switching and labels.size:
         # Transitions array length n_total-1.
         trans = (labels[1:] != labels[:-1]).astype(np.int32)
@@ -743,10 +775,8 @@ def build_candidates_qc(
         if trans.size:
             csum[1:] = np.cumsum(trans)
 
-        counts = np.zeros(n_total, dtype=np.int64)
-        for idx in range(n_total):
-            left = max(0, idx - win)
-            counts[idx] = csum[idx] - csum[left]
+        positions = np.arange(n_total)
+        counts = csum - csum[np.maximum(0, positions - win)]
 
         # Pick top indices.
         order = np.argsort(-counts)
@@ -762,12 +792,15 @@ def build_candidates_qc(
                 padding=padding,
             )
             score = float(counts[idx])
+            missing_count = int(np.count_nonzero(labels[max(0, int(idx) - win):int(idx) + 1] == ''))
+            category = 'qc_switching_with_missing_predictions' if missing_count else 'qc_switching'
             cands.append(
                 {
                     "start_frame": int(start),
                     "end_frame_exclusive": int(end),
                     "score": float(score),
-                    "reason": f"qc_switching: {int(counts[idx])} changes in ~{switch_window_sec:g}s",
+                    "reason": f"{category}: {int(counts[idx])} changes in ~{switch_window_sec:g}s",
+                    "missing_prediction_frames": missing_count,
                 }
             )
             picked += 1
@@ -781,7 +814,7 @@ def _dedupe_and_select(
     candidates: List[Dict[str, Any]],
     *,
     n_select: int,
-    min_gap_frames: int,
+    min_gap_sec: float,
     max_per_recording: int,
     rng: random.Random,
 ) -> List[Dict[str, Any]]:
@@ -814,10 +847,11 @@ def _dedupe_and_select(
             continue
 
         s = int(c.get("start_frame", 0))
+        min_gap_frames = max(1.0, float(min_gap_sec) * float(c['fps_in']))
 
         ok = True
         for prev in starts_by_rec.get(rid, []):
-            if abs(int(prev) - int(s)) < int(min_gap_frames):
+            if abs(int(prev) - int(s)) < min_gap_frames:
                 ok = False
                 break
 
@@ -835,6 +869,7 @@ def _dedupe_and_select(
 
 
 def build_plan_interesting(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rank behavior-diversity candidates and select spaced clips per recording."""
     rng = random.Random(int(cfg.random_seed) if cfg.random_seed is not None else None)
 
     all_candidates: List[Dict[str, Any]] = []
@@ -845,8 +880,9 @@ def build_plan_interesting(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str,
         csv_path = Path(str(p["inf_csv_path"]))
 
         fps, n_vid = _get_video_info(movie_path, default_fps=float(cfg.default_movie_fps))
-        n_csv = _count_csv_rows(csv_path)
-        n_total = min(n_vid, n_csv) if (n_vid > 0 and n_csv > 0) else max(n_vid, n_csv)
+        summary = read_csv_summary(csv_path, source_frame_offset=cfg.source_frame_offset, video_frames=n_vid, include_selection=True)
+        source_frames = summary.frames
+        n_total = int(source_frames[-1]) + 1
         if n_total <= 0:
             continue
 
@@ -855,12 +891,12 @@ def build_plan_interesting(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str,
         if clip_len >= n_total:
             continue
 
-        pose, orient = _load_labels_for_selection(csv_path, source=str(cfg.selection_label_source), limit_frames=n_total)
+        pose, orient = _load_labels_for_selection(csv_path, source=str(cfg.selection_label_source), limit_frames=len(source_frames), summary=summary)
         combined = _combine_pose_orient(pose, orient)
 
         cands = build_candidates_interesting(
             combined_labels=combined,
-            n_total=n_total,
+            n_total=len(source_frames),
             clip_len=clip_len,
             min_unique=int(cfg.interesting_min_unique_labels),
             min_changes=int(cfg.interesting_min_changes),
@@ -872,6 +908,10 @@ def build_plan_interesting(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str,
 
         for c in cands:
             c2 = dict(c)
+            c2.update(_summarize_labels(combined[int(c["start_frame"]):int(c["end_frame_exclusive"])]))
+            c2["start_frame"] = int(c2["start_frame"]) + int(source_frames[0])
+            c2["end_frame_exclusive"] = int(c2["end_frame_exclusive"]) + int(source_frames[0])
+            c2["source_frame_offset"] = cfg.source_frame_offset
             c2.update(
                 {
                     "mode": "interesting",
@@ -886,14 +926,10 @@ def build_plan_interesting(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str,
             )
             all_candidates.append(c2)
 
-    min_gap_frames = int(round(float(cfg.min_gap_sec) * float(cfg.default_movie_fps)))
-    if min_gap_frames <= 0:
-        min_gap_frames = 1
-
     selected = _dedupe_and_select(
         all_candidates,
         n_select=int(cfg.num_clips),
-        min_gap_frames=int(min_gap_frames),
+        min_gap_sec=float(cfg.min_gap_sec),
         max_per_recording=int(cfg.max_clips_per_recording),
         rng=rng,
     )
@@ -907,20 +943,14 @@ def build_plan_interesting(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str,
         c["end_sec"] = float(e) / fps
         c["duration_sec"] = float(e - s) / fps
 
-        # Summary labels
-        try:
-            pose, orient = _load_labels_for_selection(Path(str(c["inf_csv_path"])), source=str(cfg.selection_label_source), limit_frames=e)
-            comb = _combine_pose_orient(pose, orient)
-            sub = comb[s:e]
-            summ = _summarize_labels(sub)
-            c.update(summ)
-        except Exception:
-            pass
 
     return selected
 
 
 def build_plan_qc(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rank uncertainty and rapid-switching candidates and select spaced clips per
+    recording.
+    """
     rng = random.Random(int(cfg.random_seed) if cfg.random_seed is not None else None)
 
     all_candidates: List[Dict[str, Any]] = []
@@ -931,8 +961,9 @@ def build_plan_qc(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -
         csv_path = Path(str(p["inf_csv_path"]))
 
         fps, n_vid = _get_video_info(movie_path, default_fps=float(cfg.default_movie_fps))
-        n_csv = _count_csv_rows(csv_path)
-        n_total = min(n_vid, n_csv) if (n_vid > 0 and n_csv > 0) else max(n_vid, n_csv)
+        summary = read_csv_summary(csv_path, source_frame_offset=cfg.source_frame_offset, video_frames=n_vid, include_selection=True)
+        source_frames = summary.frames
+        n_total = int(source_frames[-1]) + 1
         if n_total <= 0:
             continue
 
@@ -943,15 +974,15 @@ def build_plan_qc(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -
 
         padding = int(round(float(cfg.clip_padding_sec) * float(fps)))
 
-        pose, orient = _load_labels_for_selection(csv_path, source=str(cfg.selection_label_source), limit_frames=n_total)
+        pose, orient = _load_labels_for_selection(csv_path, source=str(cfg.selection_label_source), limit_frames=len(source_frames), summary=summary)
         combined = _combine_pose_orient(pose, orient)
 
-        conf = _load_confidence_for_qc(csv_path, limit_frames=n_total)
+        conf = _load_confidence_for_qc(csv_path, limit_frames=len(source_frames), summary=summary)
 
         cands = build_candidates_qc(
             combined_labels=combined,
             confidence=conf,
-            n_total=n_total,
+            n_total=len(source_frames),
             fps=float(fps),
             clip_len=clip_len,
             padding=padding,
@@ -969,6 +1000,10 @@ def build_plan_qc(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -
 
         for c in cands:
             c2 = dict(c)
+            c2.update(_summarize_labels(combined[int(c["start_frame"]):int(c["end_frame_exclusive"])]))
+            c2["start_frame"] = int(c2["start_frame"]) + int(source_frames[0])
+            c2["end_frame_exclusive"] = int(c2["end_frame_exclusive"]) + int(source_frames[0])
+            c2["source_frame_offset"] = cfg.source_frame_offset
             c2.update(
                 {
                     "mode": "qc",
@@ -983,14 +1018,10 @@ def build_plan_qc(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -
             )
             all_candidates.append(c2)
 
-    min_gap_frames = int(round(float(cfg.min_gap_sec) * float(cfg.default_movie_fps)))
-    if min_gap_frames <= 0:
-        min_gap_frames = 1
-
     selected = _dedupe_and_select(
         all_candidates,
         n_select=int(cfg.num_clips),
-        min_gap_frames=int(min_gap_frames),
+        min_gap_sec=float(cfg.min_gap_sec),
         max_per_recording=int(cfg.max_clips_per_recording),
         rng=rng,
     )
@@ -1003,27 +1034,20 @@ def build_plan_qc(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -
         c["end_sec"] = float(e) / fps
         c["duration_sec"] = float(e - s) / fps
 
-        # Summary labels
-        try:
-            pose, orient = _load_labels_for_selection(Path(str(c["inf_csv_path"])), source=str(cfg.selection_label_source), limit_frames=e)
-            comb = _combine_pose_orient(pose, orient)
-            sub = comb[s:e]
-            summ = _summarize_labels(sub)
-            c.update(summ)
-        except Exception:
-            pass
 
     return selected
 
 
 def build_plan_full(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Plan the valid original-frame range of each discovered recording."""
     plan: List[Dict[str, Any]] = []
     for p in pairs:
         movie_path = Path(str(p["movie_path"]))
         csv_path = Path(str(p["inf_csv_path"]))
         fps, n_vid = _get_video_info(movie_path, default_fps=float(cfg.default_movie_fps))
-        n_csv = _count_csv_rows(csv_path)
-        n_total = min(n_vid, n_csv) if (n_vid > 0 and n_csv > 0) else max(n_vid, n_csv)
+        summary = read_csv_summary(csv_path, source_frame_offset=cfg.source_frame_offset, video_frames=n_vid)
+        source_frames = summary.frames
+        n_total = int(source_frames[-1]) + 1
         if n_total <= 0:
             continue
         plan.append(
@@ -1036,11 +1060,11 @@ def build_plan_full(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]])
                 "movie_path": str(movie_path),
                 "inf_csv_path": str(csv_path),
                 "fps_in": float(fps),
-                "start_frame": 0,
+                "start_frame": int(source_frames[0]),
                 "end_frame_exclusive": int(n_total),
-                "start_sec": 0.0,
+                "start_sec": float(source_frames[0]) / float(fps),
                 "end_sec": float(n_total) / float(fps) if fps > 0 else None,
-                "duration_sec": float(n_total) / float(fps) if fps > 0 else None,
+                "duration_sec": float(n_total - source_frames[0]) / float(fps) if fps > 0 else None,
                 "reason": "full",
                 "score": None,
             }
@@ -1049,6 +1073,7 @@ def build_plan_full(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]])
 
 
 def build_plan(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Dispatch clip planning for the requested selection mode."""
     mode = (cfg.mode or "manual").strip().lower()
     if mode == "manual":
         return build_plan_manual(cfg, pairs=pairs)
@@ -1061,23 +1086,46 @@ def build_plan(cfg: InfMoviePipelineConfig, *, pairs: List[Dict[str, Any]]) -> L
     raise ValueError(f"Unknown infmovie mode: {cfg.mode}")
 
 
-# -----------------------------------------------------------------------------
 # Rendering
-# -----------------------------------------------------------------------------
+
+def _render_identity(payload):
+    """Identify the sources, original frame range and display used for an overlay."""
+    from autobehaver.completion import request_identity
+    inputs = [payload['inf_csv_path'], payload['movie_path']]
+    provenance = Path(str(payload['inf_csv_path']) + '.provenance.json')
+    if provenance.is_file():
+        inputs.append(provenance)
+    defaults = {
+        'start_frame': 0, 'end_frame_exclusive': None, 'source_frame_offset': None,
+        'skip_first_n_frames': 5, 'timeline': 'none', 'timeline_compare': False,
+        'timeline_labels': 'predicted', 'timeline_height': 18, 'white_mode': False,
+        'speed_factor': 1.0, 'max_output_fps': 40.0, 'show_timestamp': False,
+        'timestamp_position': 'top_right', 'timestamp_decimals': 1,
+        'timestamp_reference': 'movie',
+        'fps_in': None, 'default_movie_fps': 40.0,
+    }
+    settings = {key: payload.get(key, value) for key, value in defaults.items()}
+    folder = Path(__file__).resolve().parent
+    return request_identity('infmovie', inputs, settings,
+                            code_paths=[folder/'movies.py', folder/'frame_map.py'])
+
 
 def _render_worker(payload: Dict[str, Any]) -> Tuple[str, bool, str]:
-    """Worker entrypoint."""
+    """Worker entrypoint returning ``(output_path, ok, message)``."""
 
     try:
-        rid = str(payload.get("recording_id") or "")
         out_path = str(payload.get("output_movie_path") or "")
+        requested_identity = payload.get('_render_identity') or _render_identity(payload)
+        if _render_identity(payload) != requested_identity:
+            raise RuntimeError('Overlay inputs changed after this render was planned')
 
-        render_overlay_movie(
+        produced = render_overlay_movie(
             str(payload["inf_csv_path"]),
             str(payload["movie_path"]),
             str(payload["output_movie_path"]),
             start_frame=int(payload.get("start_frame", 0)),
             end_frame_exclusive=int(payload.get("end_frame_exclusive")) if payload.get("end_frame_exclusive") is not None else None,
+            source_frame_offset=payload.get("source_frame_offset"),
             skip_first_n_frames=int(payload.get("skip_first_n_frames", 5)),
             timeline=str(payload.get("timeline", "none")),
             timeline_compare=bool(payload.get("timeline_compare", False)),
@@ -1091,10 +1139,40 @@ def _render_worker(payload: Dict[str, Any]) -> Tuple[str, bool, str]:
             timestamp_decimals=int(payload.get("timestamp_decimals", 1)),
             timestamp_reference=str(payload.get("timestamp_reference", "movie")),
             atomic_write=True,
+            csv_summary=payload.get('_csv_summary'),
+            resolved_fps=payload.get('fps_in'),
+            default_movie_fps=float(payload.get('default_movie_fps', 40.0)),
         )
-        return rid, True, out_path
+        if not isinstance(produced, dict) or produced.get('output_movie_path') != out_path or produced.get('frames', 0) < 1:
+            raise RuntimeError('Overlay renderer did not produce the requested artifact')
+        ok, reason, _details = _inspect_rendered_movie(Path(out_path))
+        if not ok:
+            raise RuntimeError(reason)
+        if _details['frames'] != produced['frames']:
+            raise RuntimeError('Rendered movie differs from its completed frame schedule')
+        if _render_identity(payload) != requested_identity:
+            raise RuntimeError('Overlay inputs changed during rendering')
+        from autobehaver.completion import write_receipt
+        write_receipt(out_path, requested_identity, status='complete')
+        return out_path, True, out_path
     except Exception as e:
-        return str(payload.get("recording_id") or ""), False, str(e)
+        return str(payload.get("output_movie_path") or ""), False, str(e)
+
+
+from autobehaver.completion import verified_run
+
+
+@verified_run
+def _render_recording_group(payloads):
+    """Render a recording's selected clips using one checked CSV row index."""
+    from autobehaver.preinf.autocropper.thread_limits import configure_native_threading
+    configure_native_threading(1)
+    try:
+        first = payloads[0]
+        summary = read_csv_summary(first['inf_csv_path'], source_frame_offset=first.get('source_frame_offset'))
+        return [_render_worker({**payload, '_csv_summary': summary}) for payload in payloads]
+    except Exception as exc:
+        return [(str(payload.get('output_movie_path') or ''), False, str(exc)) for payload in payloads]
 
 
 def _default_plan_paths(output_dir: Path) -> Tuple[Path, Path]:
@@ -1122,13 +1200,28 @@ def _write_plan_csv(plan_rows: List[Dict[str, Any]], path: Path) -> None:
             w.writerow(r)
 
 
-def _write_run_log(cfg: InfMoviePipelineConfig, *, plan_csv: Path, path: Path, n_pairs: int, n_plan: int) -> None:
+def _write_run_log(
+    cfg: InfMoviePipelineConfig,
+    *,
+    plan_csv: Path,
+    path: Path,
+    n_pairs: int,
+    n_plan: int,
+    validation: StageValidationReport | None = None,
+) -> None:
+    """Write resolved overlay settings, selected-plan identity, and recorded validation
+    outcomes.
+    """
     payload = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "infmovie_config": asdict(cfg),
         "plan_csv": str(plan_csv),
         "n_pairs": int(n_pairs),
         "n_plan": int(n_plan),
+        "status": validation.status if validation is not None else "planned",
+        "validation_report": str(path.parent.parent / "INFMOVIE_VALIDATION.json")
+        if validation is not None
+        else None,
     }
     try:
         with path.open("w") as f:
@@ -1138,6 +1231,8 @@ def _write_run_log(cfg: InfMoviePipelineConfig, *, plan_csv: Path, path: Path, n
 
 
 def _assign_output_paths(cfg: InfMoviePipelineConfig, *, output_dir: Path, plan_rows: List[Dict[str, Any]]) -> None:
+    """Assign portable clip names and output paths to the selected plan."""
+    from autobehaver.portable_paths import generated_path, original_name
     """Set output_movie_path for each plan row."""
 
     mode = (cfg.mode or "manual").strip().lower()
@@ -1145,7 +1240,7 @@ def _assign_output_paths(cfg: InfMoviePipelineConfig, *, output_dir: Path, plan_
     _ensure_dir(mode_dir)
 
     for idx, r in enumerate(plan_rows):
-        rid = _sanitize_filename_component(str(r.get("recording_id") or f"rec{idx}"))
+        rid = _sanitize_filename_component(str(r.get("recording_id") or f"rec{idx}"), max_len=4096)
         s = _sec_tag(float(r.get("start_sec") or 0.0), decimals=1)
         e = _sec_tag(float(r.get("end_sec") or 0.0), decimals=1)
         speed_tag = ""
@@ -1155,13 +1250,18 @@ def _assign_output_paths(cfg: InfMoviePipelineConfig, *, output_dir: Path, plan_
         except Exception:
             speed_tag = ""
 
-        name = f"{rid}__t{s}-{e}s{speed_tag}__{mode}.mp4"
-        # Keep filenames from exploding.
-        name = _sanitize_filename_component(name, max_len=220)
+        import hashlib
+        source_key = [str(r.get('recording_id') or ''),
+                      *[original_name(str(r.get(key) or '')) for key in ('movie_path', 'inf_csv_path')],
+                      int(r.get('start_frame', 0)), r.get('end_frame_exclusive')]
+        token = hashlib.sha256(json.dumps(source_key, separators=(',', ':')).encode()).hexdigest()[:16]
+        name = f"{rid}__t{s}-{e}s{speed_tag}__{mode}_{token}.mp4"
+        # Bound generated clip names for portable paths.
+        name = _sanitize_filename_component(name, max_len=len(name)+1)
         if not name.lower().endswith(".mp4"):
             name = name + ".mp4"
 
-        out_path = (mode_dir / name).resolve()
+        out_path = generated_path(mode_dir, name).resolve()
 
         r["output_movie_path"] = str(out_path)
         # Keep a relpath for portability.
@@ -1169,25 +1269,87 @@ def _assign_output_paths(cfg: InfMoviePipelineConfig, *, output_dir: Path, plan_
             r["output_movie_relpath"] = relpath_str(out_path, output_dir.parent)
         except Exception:
             r["output_movie_relpath"] = str(out_path)
+    _check_unique_outputs(plan_rows)
 
 
-def render_plan(cfg: InfMoviePipelineConfig, *, plan_rows: List[Dict[str, Any]]) -> None:
+def _check_unique_outputs(plan_rows):
+    """Reject duplicate destinations before any rendering or receipt publication."""
+    seen = set()
+    for row in plan_rows:
+        output = str(row.get('output_movie_path') or '')
+        if not output:
+            raise ValueError('InfMovie plan lacks an output_movie_path')
+        key = os.path.normcase(str(Path(output).expanduser().resolve())).casefold()
+        if key in seen:
+            raise ValueError(f'Duplicate InfMovie output destination: {output}')
+        seen.add(key)
+
+
+def _inspect_rendered_movie(path: Path) -> tuple[bool, str, dict[str, Any]]:
+    """Require a readable movie with valid timing and frame metadata."""
+    if not path.is_file():
+        return False, "rendered movie is missing", {}
+    try:
+        size = int(path.stat().st_size)
+    except OSError as exc:
+        return False, f"rendered movie cannot be inspected: {exc}", {}
+    if size <= 1024:
+        return False, f"rendered movie is implausibly small ({size} bytes)", {"size_bytes": size}
+    try:
+        import cv2
+
+        capture = open_video_capture(str(path))
+        opened = capture.isOpened()
+        frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        readable, _frame = capture.read() if opened else (False, None)
+        capture.release()
+    except Exception as exc:
+        return False, f"rendered movie cannot be decoded: {exc}", {"size_bytes": size}
+    if not opened or not readable or frames < 1 or not np.isfinite(fps) or fps <= 0:
+        return False, "rendered movie has no readable frames or valid frame rate", {
+            "size_bytes": size,
+            "frames": frames,
+            "fps": fps,
+        }
+    return True, "ok", {"size_bytes": size, "frames": frames, "fps": fps}
+
+
+@verified_run
+def render_plan(
+    cfg: InfMoviePipelineConfig,
+    *,
+    plan_rows: List[Dict[str, Any]],
+) -> StageValidationReport:
+    """Render selected clips, verify existing or new outputs, and report each clip's
+    outcome.
+    """
+    cfg = replace(cfg, output_dir=str(Path(str(cfg.output_dir)).expanduser().resolve()))
+    _check_unique_outputs(plan_rows)
+    validation = StageValidationReport.for_items(
+        "infmovie",
+        [str(row.get("output_movie_path") or "") for row in plan_rows],
+        metadata={"mode": str(cfg.mode), "output_directory": str(cfg.output_dir)},
+    )
     if not plan_rows:
-        print("[infmovie] No plan rows to render.")
-        return
+        validation.add_issue(
+            "empty_render_plan",
+            "error",
+            "The selected inputs and mode produced no movies to render.",
+        )
+        validation.write(Path(str(cfg.output_dir)) / "INFMOVIE_VALIDATION.json")
+        validation.raise_for_errors()
 
     # Build render payloads.
     payloads: List[Dict[str, Any]] = []
-    skipped = 0
+    skipped_paths: set[str] = set()
+    expected_identities = {}
+    planning_errors = {}
     for r in plan_rows:
         out_path = Path(str(r.get("output_movie_path") or ""))
-        if (not cfg.clobber) and out_path.exists():
-            skipped += 1
-            continue
-
-        payloads.append(
-            {
+        payload = {
                 **r,
+                "source_frame_offset": cfg.source_frame_offset,
                 "skip_first_n_frames": int(cfg.skip_first_n_frames),
                 "timeline": str(cfg.timeline),
                 "timeline_compare": bool(cfg.timeline_compare),
@@ -1200,37 +1362,76 @@ def render_plan(cfg: InfMoviePipelineConfig, *, plan_rows: List[Dict[str, Any]])
                 "timestamp_position": str(cfg.timestamp_position),
                 "timestamp_decimals": int(cfg.timestamp_decimals),
                 "timestamp_reference": str(cfg.timestamp_reference),
+                "default_movie_fps": float(cfg.default_movie_fps),
             }
-        )
+        try:
+            expected = _render_identity(payload)
+            expected_identities[str(out_path)] = expected
+            payload['_render_identity'] = expected
+        except Exception as exc:
+            planning_errors[str(out_path)] = (False, f'Cannot verify overlay inputs: {exc}')
+            continue
+        if (not cfg.clobber) and out_path.exists():
+            from autobehaver.completion import receipt_matches
+            ok, reason, _details = _inspect_rendered_movie(out_path)
+            if ok and receipt_matches(out_path, expected):
+                skipped_paths.add(str(out_path))
+                continue
+            print(f"[infmovie] existing movie does not match the current sources/settings or completed output; re-rendering: {out_path}")
+        payloads.append(payload)
 
-    if skipped:
-        print(f"[infmovie] skipped {skipped} already-rendered outputs")
+    if skipped_paths:
+        print(f"[infmovie] skipped {len(skipped_paths)} validated, already-rendered outputs")
 
-    if not payloads:
-        print("[infmovie] Nothing to render (all outputs already exist).")
-        return
+    results_by_output: dict[str, tuple[bool, str]] = dict(planning_errors)
 
-    n_workers = max(1, int(cfg.num_workers))
+    groups = {}
+    for payload in payloads:
+        key = (payload['inf_csv_path'], payload['movie_path'], payload.get('source_frame_offset'))
+        groups.setdefault(key, []).append(payload)
+    grouped_payloads = list(groups.values())
+    n_workers = worker_count(cfg.num_workers, len(grouped_payloads))
 
     if n_workers == 1:
-        for p in payloads:
-            rid, ok, msg = _render_worker(p)
-            if not ok:
-                print(f"[infmovie] ERROR rendering {rid}: {msg}")
-        return
+        for group in progress(grouped_payloads, desc='Rendering annotated recordings'):
+            for output, ok, msg in _render_recording_group(group):
+                results_by_output[output] = (ok, msg)
+                if not ok:
+                    print(f"[infmovie] ERROR rendering {output}: {msg}")
+    elif payloads:
+        with Pool(processes=n_workers) as pool:
+            for results in progress(pool.imap_unordered(_render_recording_group, grouped_payloads), total=len(grouped_payloads), desc='Rendering annotated recordings'):
+                for output, ok, msg in results:
+                    results_by_output[output] = (ok, msg)
+                    if not ok:
+                        print(f"[infmovie] ERROR rendering {output}: {msg}")
 
-    with Pool(processes=n_workers) as pool:
-        for rid, ok, msg in pool.imap_unordered(_render_worker, payloads):
-            if not ok:
-                print(f"[infmovie] ERROR rendering {rid}: {msg}")
+    for row in plan_rows:
+        output = str(row.get("output_movie_path") or "")
+        result = results_by_output.get(output)
+        if result is not None and not result[0]:
+            validation.add_outcome(output, "failed", reason=result[1])
+            continue
+        ok, reason, details = _inspect_rendered_movie(Path(output))
+        from autobehaver.completion import receipt_matches
+        if ok and not receipt_matches(output, expected_identities[output]):
+            ok, reason = False, 'rendered movie does not match its current sources/settings and completed output record'
+        validation.add_outcome(
+            output,
+            "failed" if not ok else ("reused" if output in skipped_paths else "succeeded"),
+            reason=reason if not ok else ("existing movie and its sources/settings matched" if output in skipped_paths else None),
+            details=details,
+        )
+
+    validation.write(Path(str(cfg.output_dir)) / "INFMOVIE_VALIDATION.json")
+    validation.raise_for_errors()
+    return validation
 
 
-# -----------------------------------------------------------------------------
 # Public orchestrator
-# -----------------------------------------------------------------------------
 
 def run_infmovie_pipeline(cfg: InfMoviePipelineConfig) -> Path:
-    """Run infmovie in registry/config pipeline mode.
+    """Run inference overlays with folder or registry discovery.
 
     Returns:
         Path to the plan CSV written for this run.
@@ -1241,6 +1442,7 @@ def run_infmovie_pipeline(cfg: InfMoviePipelineConfig) -> Path:
         raise ValueError("infmovie.output_dir must be set (e.g. 7_infmovies)")
 
     out_dir = Path(cfg.output_dir).expanduser().resolve()
+    cfg = replace(cfg, output_dir=str(out_dir))
     _ensure_dir(out_dir)
 
     # Discover pairs.
@@ -1286,10 +1488,17 @@ def run_infmovie_pipeline(cfg: InfMoviePipelineConfig) -> Path:
         _write_plan_csv(plan_rows, plan_csv)
         print(f"[infmovie] Wrote plan: {plan_csv}")
 
-    if cfg.write_run_log:
-        _write_run_log(cfg, plan_csv=plan_csv, path=run_log, n_pairs=len(pairs), n_plan=len(plan_rows))
-
     # Render.
-    render_plan(cfg, plan_rows=plan_rows)
+    validation = render_plan(cfg, plan_rows=plan_rows)
+
+    if cfg.write_run_log:
+        _write_run_log(
+            cfg,
+            plan_csv=plan_csv,
+            path=run_log,
+            n_pairs=len(pairs),
+            n_plan=len(plan_rows),
+            validation=validation,
+        )
 
     return plan_csv

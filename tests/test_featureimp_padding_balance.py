@@ -4,8 +4,7 @@ from autobehaver.postinf.featureimp.hhit import generate_feature_subsets_for_hhi
 
 
 def test_padding_balance_is_deterministic_and_no_duplicates():
-    # Choose a feature count that is NOT divisible by n_features_per_model
-    # so padding reuse is required each h_hit round.
+    # An incomplete final subset requires padding from previously used features.
     n_features = 23
     n_features_per_model = 10
     H = 12
@@ -52,9 +51,7 @@ def test_padding_balance_is_deterministic_and_no_duplicates():
 
 
 def test_padding_selection_prefers_low_extra_rep_counts():
-    # This test checks a key property of the min-count padding policy:
-    # reused (padding) features should come from the lower end of the
-    # extra_rep_count distribution among eligible candidates.
+    # Padding favors eligible features with the fewest previous extra uses.
     n_features = 23
     n_features_per_model = 10
     H = 8
@@ -83,14 +80,11 @@ def test_padding_selection_prefers_low_extra_rep_counts():
         padded = [f for f in last_subset if plan.feature_usage_count.get(f, 0) > 1]
         leftover = [f for f in last_subset if plan.feature_usage_count.get(f, 0) == 1]
 
-        # Eligible padding candidates at the time of padding are all features
-        # that were already used earlier in the round, which is equivalent to
-        # all features except the "leftover" unused ones.
+        # Padding candidates exclude the final subset's previously unused features.
         candidates = [f for f in all_feature_names if f not in leftover]
         cand_counts = sorted(extra_rep[f] for f in candidates)
 
-        # The padded features should all have extra_rep_count <= the
-        # padding_count-th smallest candidate count.
+        # Selected extra-use counts must not exceed the candidate cutoff.
         threshold = cand_counts[padding_count - 1]
         assert all(extra_rep[f] <= threshold for f in padded)
 

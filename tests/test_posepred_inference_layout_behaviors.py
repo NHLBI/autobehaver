@@ -10,6 +10,9 @@ def test_run_posepred_inference_discovers_h5_files_in_input_dir(monkeypatch, tmp
     from autobehaver.preinf.posepred_inference.config import PosePredInferenceConfig
     from autobehaver.preinf.posepred_inference.core import run_posepred_inference
 
+    tmp_path = tmp_path.parent / 'layout'
+    tmp_path.mkdir()
+
     input_dir = tmp_path / "5_normalized_features"
     input_dir.mkdir(parents=True)
     h5_path = input_dir / "sample_normalized.h5"
@@ -18,7 +21,8 @@ def test_run_posepred_inference_discovers_h5_files_in_input_dir(monkeypatch, tmp
         dset.attrs["columns"] = [b"f1", b"f2"]
 
     ckpt = tmp_path / "model.pth"
-    ckpt.write_text("stub")
+    import torch
+    torch.save({'global_vars':{'pose_pred':True,'orient_pred':False},'pose_dict':{'A':0}},ckpt)
 
     captured: dict[str, object] = {}
 
@@ -26,6 +30,14 @@ def test_run_posepred_inference_discovers_h5_files_in_input_dir(monkeypatch, tmp
         captured["explicit_files"] = list(kwargs.get("explicit_files") or [])
 
     monkeypatch.setattr("autobehaver.preinf.posepred_inference.core.run_inference", _fake_run_inference)
+    monkeypatch.setattr(
+        "autobehaver.preinf.posepred_inference.core._completed_inference_matches",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "autobehaver.preinf.posepred_inference.core._validate_inference_csv",
+        lambda *args, **kwargs: (True, "ok", {"rows": 4, "columns": 2}),
+    )
 
     cfg = PosePredInferenceConfig(
         input_dir=str(input_dir),
@@ -39,7 +51,7 @@ def test_run_posepred_inference_discovers_h5_files_in_input_dir(monkeypatch, tmp
     assert captured["explicit_files"] == [str(h5_path.resolve())]
 
 
-def test_run_inference_archive_existing_moves_details_dir(monkeypatch, tmp_path: Path) -> None:
+def test_run_inference_does_not_archive_when_no_inputs_are_selected(monkeypatch, tmp_path: Path) -> None:
     from autobehaver.inference import run_inference
 
     input_dir = tmp_path / "5_normalized_features"
@@ -70,10 +82,6 @@ def test_run_inference_archive_existing_moves_details_dir(monkeypatch, tmp_path:
         explicit_files=[],
     )
 
-    past = output_dir / "past_inferences"
-    archived_csvs = list(past.glob("*_sample_inference.csv"))
-    archived_details = list(past.glob("*_inference_details"))
-
-    assert len(archived_csvs) == 1
-    assert len(archived_details) == 1
-    assert (archived_details[0] / "sample_logits.csv").exists()
+    assert (output_dir / "sample_inference.csv").exists()
+    assert (details_dir / "sample_logits.csv").exists()
+    assert not (output_dir / "past_inferences").exists()

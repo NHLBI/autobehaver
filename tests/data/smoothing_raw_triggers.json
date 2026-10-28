@@ -1,0 +1,2256 @@
+{
+  "total_exact_triggers": 90,
+  "source_sha256": "2b6869cd168e3b407f125eddeca18085ff05f0d1cf85cd7320723a04ab4a506f",
+  "candidates": [
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-1_trial1_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 15
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 10
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-1_trial1_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 177
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 6
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-1_trial2_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 348
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 148
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-1_trial2_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 27
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 79
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-1_trial2_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 193
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 78
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-2_trial1_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 221
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 87
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-3_trial2_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 255
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 499
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-5_trial2_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 40
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 90
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-8_trial1_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 186
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 28
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age30_MALE_rpi-8_trial2_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 515
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 444
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age4_MALE_rpi-1_trial7_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 136
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 65
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age4_MALE_rpi-5_trial2_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 256
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 106
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age4_MALE_rpi-6_trial5_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 90
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 34
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age4_MALE_rpi-7_trial8_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 462
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 181
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-1_trial3_chamber1",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 106
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 5
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-1_trial3_chamber1",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 5
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 51090
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-1_trial4_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 42
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 40
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-2_trial2_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 72
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 766
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-2_trial3_chamber5",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 205
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 14
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-2_trial3_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 150
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 77
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-3_trial2_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 130
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 58
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-5_trial1_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 572
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 182
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-5_trial3_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 5
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 7
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-6_trial2_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 243
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 29
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-RESCUE-UBA5+WT-age60_MALE_rpi-7_trial3_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 235
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 122
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-1_trial16_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 10
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 37
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-2_trial3_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 62
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 172
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-4_trial9_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 456
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 813
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-5_trial11_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 392
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 45
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-5_trial2_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 154
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 195
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-5_trial2_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 8
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 410
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-7_trial13_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 644
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 39
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-7_trial15_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 456
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 94
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-7_trial16_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 194
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 120
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-7_trial7_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 151
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 120
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-8_trial11_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 45
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 153
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_FEMALE_rpi-8_trial8_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 183
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 168
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_MALE_rpi-1_trial2_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 48
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 69
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_MALE_rpi-2_trial9_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 140
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 470
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-SPD2-czmab-15day_MALE_rpi-4_trial14_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 347
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 508
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-TRPA1_FEMALE_rpi-2_trial9_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 386
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 667
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-TRPA1_MALE_rpi-4_trial14_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 245
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 406
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-TRPA1_MALE_rpi-7_trial10_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 6
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 55
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-TRPA1_MALE_rpi-7_trial10_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 56
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 116
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-TRPA1_MALE_rpi-7_trial20_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 39
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 172
+        }
+      ]
+    },
+    {
+      "animal": "CONTROL-TRPA1_MALE_rpi-8_trial17_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 119
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 87
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-1_trial1_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 21
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 103
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-1_trial1_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 38
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 13
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-2_trial2_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 194
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 285
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-5_trial1_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 9
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 91
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-5_trial2_chamber1",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 5381
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 99
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-5_trial2_chamber1",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 1024
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Standing",
+          "length": 31
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-5_trial2_chamber1",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 16
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Standing",
+          "length": 150
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-6_trial1_chamber2",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 8
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Standing",
+          "length": 12
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-6_trial1_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 313
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 33
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-RESCUE-UBA5+V260M-age30_MALE_rpi-6_trial1_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 520
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 275
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_FEMALE_rpi-4_trial5_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 217
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 73
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_FEMALE_rpi-4_trial7_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 1462
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 287
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_FEMALE_rpi-5_trial11_chamber3",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 287
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 396
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_FEMALE_rpi-5_trial2_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 70
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 54
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_FEMALE_rpi-6_trial5_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 328
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 58
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_FEMALE_rpi-6_trial5_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 620
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 61
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_MALE_rpi-4_trial2_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 305
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 27
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_MALE_rpi-6_trial1_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 710
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 49
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_MALE_rpi-6_trial4_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 436
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 483
+        }
+      ]
+    },
+    {
+      "animal": "MUTANT-SPD2-Z3-czmab-15day_MALE_rpi-7_trial10_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 441
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 789
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-melpMEL-SPD2-czmab-15day_FEMALE_rpi-4_trial3_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 215
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 65
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-melpMEL-SPD2-czmab-15day_FEMALE_rpi-7_trial4_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 6
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 116
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-melpMEL-SPD2-czmab-15day_FEMALE_rpi-8_trial16_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 212
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 37
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-melpMEL-SPD2-czmab-15day_MALE_rpi-1_trial14_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 290
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 289
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-melpMEL-SPD2-czmab-15day_MALE_rpi-6_trial13_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 158
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 218
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-melpMEL-SPD2-czmab-15day_MALE_rpi-8_trial5_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 361
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 672
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_FEMALE_rpi-1_trial8_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 17
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 313
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_FEMALE_rpi-4_trial11_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 713
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 2
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 35
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_FEMALE_rpi-4_trial4_chamber4",
+      "bouts": [
+        {
+          "label": "Standing",
+          "length": 59
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Standing",
+          "length": 8
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-1_trial2_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 25
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 258
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-3_trial1_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 163
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 2
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 423
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-3_trial3_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 533
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 146
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-6_trial8_chamber1",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 93
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 280
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-7_trial5_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 315
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 268
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-8_trial14_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 86
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 6
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpA-SPD2-czmab-15day_MALE_rpi-8_trial3_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 5
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 41
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpB-SPD2-czmab-15day_FEMALE_rpi-2_trial9_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 161
+        },
+        {
+          "label": "Jump",
+          "length": 2
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1416
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpB-SPD2-czmab-15day_FEMALE_rpi-3_trial5_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 286
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 301
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpB-SPD2-czmab-15day_FEMALE_rpi-7_trial12_chamber5",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 6
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 6
+        }
+      ]
+    },
+    {
+      "animal": "RESCUE-wilpB-SPD2-czmab-15day_MALE_rpi-7_trial6_chamber4",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 116
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 78
+        }
+      ]
+    },
+    {
+      "animal": "TRPA1-29E04_MALE_rpi-1_trial17_chamber6",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 44
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 48
+        }
+      ]
+    },
+    {
+      "animal": "TRPA1-GH146_FEMALE_rpi-4_trial20_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 56
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 45
+        }
+      ]
+    },
+    {
+      "animal": "TRPA1-GH146_FEMALE_rpi-6_trial12_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 163
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Scramble",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 66
+        }
+      ]
+    },
+    {
+      "animal": "TRPA1-GH146_FEMALE_rpi-8_trial18_chamber2",
+      "bouts": [
+        {
+          "label": "Walking",
+          "length": 606
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 1
+        },
+        {
+          "label": "Jump",
+          "length": 1
+        },
+        {
+          "label": "Walking",
+          "length": 5
+        }
+      ]
+    }
+  ]
+}

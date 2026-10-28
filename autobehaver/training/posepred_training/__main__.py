@@ -1,4 +1,4 @@
-"""Module entrypoint for ``python -m autobehaver.training.posepred_training``."""
+"""Run the PosePred training CLI as a Python module."""
 
 from .cli import main
 

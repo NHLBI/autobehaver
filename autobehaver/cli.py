@@ -1,14 +1,7 @@
-"""Command-line interface implementation for pose prediction training and inference.
+"""Parse and dispatch PosePred supervised training, pretraining, inference and LR sweeps.
 
-The organized training entrypoint lives at
-``python -m autobehaver.training.posepred_training``.
-
-Defines the argument parser and main entrypoint that routes to the appropriate mode:
-supervised training, pretraining, LR finder, or inference.
-
-Note on SWA:
-    SWA is implemented as an **optional phase within supervised training** (enabled via
-    `--swa_mode`), rather than as a standalone post-hoc stage.
+The preferred entrypoint is ``python -m autobehaver.training.posepred_training``.
+Optional stochastic weight averaging is a final supervised-training phase.
 """
 
 from __future__ import annotations
@@ -18,52 +11,10 @@ import random
 import argparse
 import warnings
 from pathlib import Path
-from typing import Any, Dict
-
-import yaml
 
 from .feature_selection import PRESETS, DEFAULT_PRESET, FeaturePlan
-from .pipeline_layout import config_main_dir_default
-
-
-def _load_training_config_defaults(config_path: str) -> Dict[str, Any]:
-    """Load posepred training defaults from a pipeline YAML config.
-
-    Reads the top-level ``posepred_training:`` section. Relative path values
-    are resolved relative to the config file.
-    """
-
-    cfg_path = Path(config_path).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
-    with cfg_path.open("r") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError("Pipeline config must be a YAML mapping (dict) at the top level")
-
-    base_dir = cfg_path.parent
-    section = data.get("posepred_training", {})
-    if section is None:
-        section = {}
-    if not isinstance(section, dict):
-        raise ValueError("Expected 'posepred_training' section in config to be a mapping (dict)")
-
-    resolved: Dict[str, Any] = {}
-    global_main_dir = config_main_dir_default(data, base_dir)
-    if global_main_dir and "directory" not in section:
-        resolved["directory"] = str((Path(global_main_dir) / "5_normalized_features").resolve())
-
-    path_keys = {"directory", "pretrained_model_path", "ablation_include_columns_file"}
-    for k, v in section.items():
-        if k in path_keys and isinstance(v, str) and v.strip() != "":
-            p = Path(v.strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved[k] = str(p)
-        else:
-            resolved[k] = v
-    return resolved
+from .argparse_utils import add_bool_pair, parse_cli_args
+from autobehaver.resource_monitor import add_monitor_arguments, monitored_cli, record_settings
 
 
 def _write_feature_plan_artifacts(records_dir: str, run_name: str, feature_plan: FeaturePlan) -> str:
@@ -95,97 +46,81 @@ def _write_feature_plan_artifacts(records_dir: str, run_name: str, feature_plan:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Transformer-based pose prediction training and inference.')
-    parser.add_argument('--config', type=str, default=None, help="Path to global pipeline YAML config (reads the 'posepred_training:' section).")
-    parser.add_argument('--random_seed', type=int, default=None, help='Set random seed for reproducibility. If not provided, the seed will be random.')
+    parser.add_argument('--random_seed', type=int, default=7, help='Set the reproducibility seed (default: 7).')
 
-    # --- Data Loader Parameters ---
+    # Data loaders
     parser.add_argument('--num_workers', type=int, default=14, help='Number of workers for the DataLoader.')
 
-    # --- Pretraining Mode Parameters ---
-    # REQUIRED ARGUMENTS: --pretrain_mode
-    # RECOMMENDED ARGUMENTS: --run_name --base_lr --num_epochs --pretrain_loss --projection_dim --pretrain_files_per_group --log_interval
+    # Pretraining
     pretrain_group = parser.add_argument_group('Pretraining Mode')
-    pretrain_group.add_argument('--pretrain_mode', action='store_true', help='Enable pretraining mode (default: False).')
+    pretrain_group.add_argument('--pretrain_mode', action='store_true', help='Train the encoder and projection head with a self-supervised loss.')
     pretrain_group.add_argument('--projection_dim', type=int, default=128, help='Dimension of the output from the projection head in pretraining mode.')
     pretrain_group.add_argument('--temperature', type=float, default=0.1, help='Temperature for InfoNCE pretraining (ignored for Barlow Twins).')
-    pretrain_group.add_argument('--pretrain_files_per_group', type=int, default=500, help='Number of files to group together for pretraining batches.')
-    pretrain_group.add_argument('--log_interval', type=int, default=200, help='Log metrics every X steps in pretrain_mode.')
+    pretrain_group.add_argument('--pretrain_files_per_group', type=int, default=500, help='Maximum files loaded together in a pretraining chunk.')
+    pretrain_group.add_argument('--log_interval', type=int, default=200, help='Record pretraining metrics after this many optimizer steps.')
     pretrain_group.add_argument('--pretrain_loss', type=str, default='barlow_twins', choices=['info_nce', 'barlow_twins'], help='Loss function for pretraining mode.')
     pretrain_group.add_argument('--barlow_lambda', type=float, default=5e-3, help='Lambda parameter for Barlow Twins pretraining (ignored for InfoNCE).')
 
-    # --- LR Finder Mode Parameters ---
-    # REQUIRED ARGUMENTS: --lr_finder_mode
-    # RECOMMENDED ARGUMENTS: --pretrained_model_path --lrfinder_lr
+    # Learning-rate sweep
     lr_finder_group = parser.add_argument_group('LR Finder Mode')
-    lr_finder_group.add_argument('--lr_finder_mode', action='store_true', help='Enable LR finder mode (default: False).')
+    lr_finder_group.add_argument('--lr_finder_mode', action='store_true', help='Run a short learning-rate sweep and save its loss records.')
     lr_finder_group.add_argument('--lrfinder_lr', type=float, default=1e-8, help='Initial learning rate for the LR finder.')
 
-    # --- Inference Mode Parameters ---
-    # REQUIRED ARGUMENTS: --inference_mode --inference_model
-    # RECOMMENDED ARGUMENTS: --inf_average --use_tta
+    # Inference
     inference_group = parser.add_argument_group('Inference Mode')
-    inference_group.add_argument('--inference_mode', action='store_true', help='Enable inference mode (default: False).')
+    inference_group.add_argument('--inference_mode', action='store_true', help='Predict labels from saved supervised model checkpoints.')
     inference_group.add_argument('--inference_model', type=str, nargs='+', help='Path(s) to model(s) for inference. Provide multiple paths for ensembling.')
-    inference_group.add_argument('--inf_average', type=int, default=10, help='Number of times to repeat inference for averaging.')
-    inference_group.add_argument('--use_tta', action='store_true', help='Enable Test-Time Augmentation for inference (default: False).')
-    inference_group.add_argument('--tta_noise_level', type=float, default=0.01, help='Standard deviation of noise for TTA.')
-    inference_group.add_argument('--min_pose_bout', type=float, default=5, help='Minimum consecutive frames for Pose smoothing.')
-    inference_group.add_argument('--min_orient_bout', type=float, default=5, help='Minimum consecutive frames for Orient smoothing.')
+    inference_group.add_argument('--inf_average', type=int, default=10, help='Passes to average per model; without augmentation, reuse one forward pass.')
+    add_bool_pair(inference_group, 'use_tta', default=True,
+                  help='Use noise-augmented passes for inference (default: enabled).')
+    inference_group.add_argument('--tta_noise_level', type=float, default=0.01, help='Gaussian-noise standard deviation for test-time augmentation.')
+    inference_group.add_argument('--tta_seed', type=int, default=42, help='Reproducible per-recording TTA seed (default: 42).')
+    inference_group.add_argument('--min_pose_bout', type=float, default=5, help='Pose smoothing bout threshold in frames; <=1 disables smoothing.')
+    inference_group.add_argument('--min_orient_bout', type=float, default=5, help='Orientation smoothing bout threshold in frames; <=1 disables smoothing.')
 
 
-    # --- SWA Training Option ---
-    # SWA runs as the *final* phase within a supervised training run:
-    #   - run normal training for the first (num_epochs - swa_epochs) epochs
-    #   - then run SWA for the final `swa_epochs` epochs and save an additional SWA checkpoint
+    # Stochastic weight averaging
+    # Average weights during the final supervised-training epochs.
     swa_group = parser.add_argument_group('SWA (optional)')
     swa_group.add_argument('--swa_mode', action='store_true', help='Enable Stochastic Weight Averaging (SWA) during the final supervised-training epochs (default: False).')
     swa_group.add_argument('--swa_epochs', type=int, default=75, help='Number of final epochs to dedicate to the SWA phase. Must be > 0 and < num_epochs when --swa_mode is set.')
     swa_group.add_argument('--swa_lr', type=float, default=0.00001, help='Target learning rate for the SWA phase (used by torch.optim.swa_utils.SWALR).')
 
-    # --- FINE-TUNING STEP 1: LINEAR PROBING ---
-    # REQUIRED ARGUMENTS: --pretrained_model_path --freeze_encoder
-    # RECOMMENDED ARGUMENTS: --run_name --base_lr --patience
 
-    # --- FINE-TUNING STEP 2: FULL JOINT TRAINING ---
-    # REQUIRED ARGUMENTS: --pretrained_model_path --restart_optimizer
-    # RECOMMENDED ARGUMENTS: --run_name --base_lr --patience --weight_encoder (optional)
 
-    # --- Model Parameters ---
+    # Model architecture
     model_group = parser.add_argument_group('Model Parameters')
-    # Input Parameters
-    model_group.add_argument('--sequence_length', type=int, default=41, help='Length of the input sequence.')
-    # Model Architecture
-    model_group.add_argument('--d_model', type=int, default=512, help='Dimension of the model.')
-    model_group.add_argument('--dim_feedforward', type=int, default=2048, help='Dimension of the feedforward network.')
+    model_group.add_argument('--sequence_length', type=int, default=41, help='Input window length in frames; even values advance to the next odd length.')
+    model_group.add_argument('--d_model', type=int, default=1024, help='Dimension of the model.')
+    model_group.add_argument('--dim_feedforward', type=int, default=4096, help='Dimension of the feedforward network.')
     model_group.add_argument('--nhead', type=int, default=32, help='Number of attention heads.')
     model_group.add_argument('--num_encoder_layers', type=int, default=1, help='Number of encoder layers.')
-    model_group.add_argument('--num_decoder_layers', type=int, default=1, help='Number of decoder layers.')
+    model_group.add_argument('--num_decoder_layers', type=int, default=1, help='Transformer decoder layers used when reconstruction is enabled.')
     model_group.add_argument('--dropout_rate', type=float, default=0.5, help='Dropout rate.')
-    # Context Vector
-    model_group.add_argument('--frame_representation', type=str, default='cls', choices=['middle', 'cls', 'cls+middle'], help='Method for generating the context vector.')
+    model_group.add_argument('--frame_representation', type=str, default='middle', choices=['middle', 'cls', 'cls+middle'], help='Method for generating the context vector.')
     model_group.add_argument('--num_cls', type=int, default=1, help='Number of CLS tokens.')
-    # Prediction Head
-    model_group.add_argument('--prediction_head', type=str, default='fc', choices=['fc', 'mlp'], help='Type of prediction head.')
-    # Positional Encoding
+    model_group.add_argument('--prediction_head', type=str, default='mlp', choices=['fc', 'mlp'], help='Type of prediction head.')
     model_group.add_argument('--positional_encoding_type', type=str, default='sinusoidal', choices=['learned', 'sinusoidal'], help='Type of positional encoding.')
 
-    # --- Training Hyperparameters ---
+    # Training
     training_group = parser.add_argument_group('Training Hyperparameters')
     training_group.add_argument('--batch', type=int, default=1024, help='Batch size.')
-    training_group.add_argument('--num_epochs', type=int, default=6061, help='Number of training epochs.')
-    training_group.add_argument('--checkpoint_interval', type=int, default=601, help='Checkpoint save interval. In supervised training this is epochs; in pretraining it is global steps.')
-    training_group.add_argument('--patience', type=int, default=601, help='Patience for early stopping.')
+    training_group.add_argument('--num_epochs', type=int, default=301, help='Number of training epochs.')
+    training_group.add_argument('--checkpoint_interval', type=int, default=301, help='Checkpoint save interval. In supervised training this is epochs; in pretraining it is global steps.')
+    training_group.add_argument('--patience', type=int, default=601, help='Supervised-training epochs without improvement before early stopping.')
     # Scheduler
     training_group.add_argument('--scheduler_type', type=str, default='cosine', choices=['sqrt', 'cosine', 'linear', 'plateau'], help='Type of learning rate scheduler.')
-    training_group.add_argument('--base_lr', type=float, default=0.00005, help='Base learning rate.')
-    training_group.add_argument('--weight_decay', type=float, default=0.001, help='AdamW weight decay (L2 regularization).')
+    training_group.add_argument('--base_lr', type=float, default=0.0001, help='Base learning rate.')
+    training_group.add_argument('--weight_decay', type=float, default=0.001, help='AdamW decoupled weight decay.')
     training_group.add_argument('--t_0', type=int, default=1476600, help='Number of batches for the first cycle of cosine/linear annealing.')
     training_group.add_argument('--t_mult', type=int, default=1, help='Multiplier for subsequent cycles in cosine/linear annealing.')
     training_group.add_argument('--eta_min', type=float, default=1e-6, help='Minimum learning rate for cosine/linear annealing.')
     training_group.add_argument('--plateau_factor', type=float, default=0.5, help='Factor to reduce LR on plateau.')
     training_group.add_argument('--warmup_steps', type=int, default=2461, help='Number of warmup steps for the scheduler.')
+    training_group.add_argument('--warmup_epochs', type=int, default=None, help='With --cosine_decay_epochs, loader-sized warmup (default: one epoch).')
+    training_group.add_argument('--cosine_decay_epochs', type=int, default=300, help='Cosine decay epochs after warmup (default: 300); total must equal num_epochs. Set 0 for step-based scheduling. SWA, pretraining and LR sweeps use their own step-based schedules.')
     # Data Augmentation
-    training_group.add_argument('--mask_p', type=float, default=0.05, help='Probability of masking a frame.')
+    training_group.add_argument('--mask_p', type=float, default=0.05, help='Probability of masking each feature element after adding noise.')
     training_group.add_argument('--noise_level', type=float, default=0.05, help='Standard deviation of noise for augmentation.')
     # Prediction Heads & Weights
     training_group.add_argument('--no-pose-pred', dest='pose_pred', action='store_false', help='Disable pose prediction head.')
@@ -194,26 +129,28 @@ def build_parser() -> argparse.ArgumentParser:
     training_group.add_argument('--pose_weight', type=float, default=1.0, help='Weight for the pose loss.')
     training_group.add_argument('--orient_weight', type=float, default=0.1, help='Weight for the orientation loss.')
     training_group.add_argument('--recon_weight', type=float, default=1.0, help='Weight for the reconstruction loss.')
-    training_group.add_argument('--max_class_weight', type=float, default=200, help='Maximum weight for a class.')
+    training_group.add_argument('--max_class_weight', type=float, default=200, help='Cap inverse-frequency weights estimated from joint training-window labels.')
     training_group.add_argument('--grad_clip_norm', type=float, default=1.0, help='Max norm for gradient clipping (applied after AMP unscale). Set <=0 to disable.')
     # Data Split
-    training_group.add_argument('--no-defined-split', dest='defined_split', action='store_false', help='Use random split instead of the one defined in metadata.')
+    training_group.add_argument('--no-defined-split', dest='defined_split', action='store_false', help='Use a movie-grouped random split instead of metadata-defined train/val sets.')
     # Optimizer State
     training_group.add_argument('--restart_optimizer', action='store_true', help='Load checkpoint weights but restart optimizer/scheduler/scaler (weights-only fine-tune stage).')
-    pretrain_group.add_argument('--freeze_encoder', action='store_true', help='Freeze encoder for fine-tuning (default: unfrozen).')
-    pretrain_group.add_argument('--weight_encoder', type=float, default=1, help='Weight for the encoder loss during fine-tuning.')
+    pretrain_group.add_argument('--freeze_encoder', action='store_true', help='Freeze the backbone during a pretraining-to-supervised handoff.')
+    pretrain_group.add_argument('--weight_encoder', type=float, default=1, help='Backbone learning-rate multiplier during a pretraining-to-supervised handoff.')
 
-    # --- Logging and Directories ---
+    # Output records and input paths
     dir_group = parser.add_argument_group('Logging and Directories')
-    dir_group.add_argument('--wandb_log', action='store_true', help='Enable logging with Weights & Biases.')
+    dir_group.add_argument('--wandb_log', action='store_true', help='Enable optional offline Weights & Biases training records.')
     dir_group.add_argument('--run_name', type=str, default="autobehaver_run", help='Name of the training run.')
     dir_group.add_argument('--directory', type=str, help='Main directory for data, checkpoints, and records.')
+    dir_group.add_argument('--output_directory', type=str, help='Optional separate folder for checkpoints and records; defaults to --directory.')
+    dir_group.add_argument('--metadata_path', type=str, help='Optional explicit metadata CSV; feature and label paths remain relative to --directory.')
     dir_group.add_argument('--pretrained_model_path', type=str, help='Path to a pretrained model checkpoint.')
-    dir_group.add_argument('--metadata_tag', type=str, default='fullcatvalsplitmetadata', help='Tag to identify the metadata CSV file.')
+    dir_group.add_argument('--metadata_tag', type=str, default='fullcatvalsplitmetadata', help='Find the metadata CSV whose filename ends with <metadata_tag>.csv.')
 
     training_group.add_argument('--noval', action='store_true', help='Do not use validation - train on the full dataset.')
 
-    # --- Feature selection / ablation ---
+    # Ordered feature selection
     ablate_group = parser.add_argument_group('Feature Selection / Ablation')
     ablate_group.add_argument(
         '--ablation_preset',
@@ -263,40 +200,37 @@ def build_parser() -> argparse.ArgumentParser:
         '--ablation_non_strict',
         action='store_true',
         help=(
-            "Non-strict mode: skip files missing required columns instead of erroring. "
-            "(Default is strict.)"
+            "Allow training loaders to skip files missing selected columns; "
+            "input validation still applies. Inference remains strict."
         ),
     )
-    return parser
+    from .inference_options import add_inference_runtime_arguments
+    return add_monitor_arguments(add_inference_runtime_arguments(parser))
 
 
+def resolve_schedule_mode(args):
+    """Keep epoch scheduling specific to ordinary supervised training."""
+    if args.cosine_decay_epochs == 0 or args.swa_mode or args.pretrain_mode or args.lr_finder_mode:
+        args.cosine_decay_epochs = None
+        args.warmup_epochs = None
+    return args
+
+
+@monitored_cli("posepred_training")
 def main(argv: list[str] | None = None) -> None:
-    """Autobehaver pose prediction CLI entrypoint."""
-    # Build and parse args. ``--config`` provides parser defaults; explicit CLI
-    # arguments still override the YAML.
-    argv_list = list(argv) if argv is not None else None
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument('--config', type=str, default=None)
-    pre_args, _ = pre.parse_known_args(argv_list)
-
+    """Parse the requested mode, validate its arguments and dispatch processing."""
     parser = build_parser()
-    if pre_args.config:
-        defaults = _load_training_config_defaults(pre_args.config)
-        valid_dests = {a.dest for a in parser._actions}
-        parser.set_defaults(**{k: v for k, v in defaults.items() if k in valid_dests})
+    args = parse_cli_args(parser, argv)
+    resolve_schedule_mode(args)
+    record_settings(args)
 
-    args = parser.parse_args(argv_list)
-
-    # Heavy training/runtime imports intentionally happen after argparse so
-    # ``--help`` remains fast and does not initialize Torch/sklearn stacks.
+    # Import training dependencies after parsing so --help remains lightweight.
     import numpy as np
     import pandas as pd
     import torch
 
-    # --- Torch perf defaults ---
     torch.backends.cudnn.benchmark = True
 
-    # --- Seed handling ---
     if args.random_seed is not None:
         print(f"Using random seed: {args.random_seed}")
         random.seed(args.random_seed)
@@ -308,31 +242,33 @@ def main(argv: list[str] | None = None) -> None:
     else:
         print("No random seed provided. Running with random seed.")
 
-    # --- Force odd sequence length (core invariant) ---
+    # Center-frame supervision requires an odd sequence length.
     if args.sequence_length % 2 == 0:
         provided_sequence_length = args.sequence_length
         args.sequence_length = int(args.sequence_length) + 1
         print(f"[SEQ_LEN] Even sequence_length={provided_sequence_length} provided; bumping to {args.sequence_length} (must be odd).")
 
-    # --- Modes ---
+    record_settings(args)
+    record_settings({"mode": "inference" if args.inference_mode else
+                     "pretraining" if args.pretrain_mode else
+                     "lr_finder" if args.lr_finder_mode else "supervised_training"})
     pretrain_mode = args.pretrain_mode
     lr_finder_mode = args.lr_finder_mode
     inference_mode = args.inference_mode
     swa_mode = args.swa_mode
 
-    # --- Paths / metadata ---
     run_name = args.run_name
     directory = args.directory
     pretrained_model_path = args.pretrained_model_path
+    if pretrained_model_path and not os.path.isfile(pretrained_model_path):
+        raise FileNotFoundError(f'Requested checkpoint does not exist: {pretrained_model_path}')
     defined_split = args.defined_split
     noval = args.noval
 
     if not directory or not os.path.isdir(directory):
         raise FileNotFoundError(f"Directory does not exist: {directory}")
 
-    # --- Inference mode ---
-    # Inference does NOT require a metadata CSV in the target directory. We simply
-    # scan for HDF5 files and write outputs under <directory>/inferences/.
+    # Inference discovers HDF5 inputs without requiring training metadata.
     if inference_mode:
         if not args.inference_model:
             parser.error("Inference Mode requires --inference_model to be specified.")
@@ -349,12 +285,16 @@ def main(argv: list[str] | None = None) -> None:
             min_orient_bout=args.min_orient_bout,
             use_tta=args.use_tta,
             tta_noise_level=args.tta_noise_level,
+            tta_seed=args.tta_seed,
+            memory_gb=args.memory_gb, noise_workers=args.noise_workers, vram_fraction=args.vram_fraction,
         )
         return
 
 
     metadata_tag = args.metadata_tag
-    if metadata_tag:
+    if args.metadata_path:
+        metadata = pd.read_csv(args.metadata_path)
+    elif metadata_tag:
         metadata_files = [f for f in os.listdir(directory) if f.endswith(f"{metadata_tag}.csv")]
         if len(metadata_files) == 0:
             raise FileNotFoundError(f"No metadata file ending with '{metadata_tag}.csv' found in the directory.")
@@ -365,11 +305,11 @@ def main(argv: list[str] | None = None) -> None:
     else:
         metadata = None
 
-    # Set up directories inside input folder
-    checkpoint_dir = os.path.join(directory, "Checkpoints")
+    output_directory = args.output_directory or directory
+    checkpoint_dir = os.path.join(output_directory, "Checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    records_dir = os.path.join(directory, "Records")
+    records_dir = os.path.join(output_directory, "Records")
     os.makedirs(records_dir, exist_ok=True)
 
     records_path = os.path.join(records_dir, f"{run_name}_training_record.csv")
@@ -377,7 +317,6 @@ def main(argv: list[str] | None = None) -> None:
     orient_conf_matrix_path = os.path.join(records_dir, f"{run_name}_orient_confusion_matrices.csv") if args.orient_pred else None
     combined_conf_matrix_path = os.path.join(records_dir, f"{run_name}_combined_confusion_matrices.csv") if (args.pose_pred and args.orient_pred) else None
 
-    # Optional wandb init
     wandb_log = args.wandb_log
     if wandb_log:
         import wandb
@@ -388,11 +327,9 @@ def main(argv: list[str] | None = None) -> None:
             mode="offline",
         )
 
-    # === WARNING FILTERING ===
     warnings.filterwarnings('ignore', message='enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True')
     warnings.filterwarnings('ignore', category=FutureWarning, message=r'You are using `torch.load` with `weights_only=False.*')
 
-    # --- Dispatch by mode ---
     if pretrain_mode:
         print(f'Starting pretraining for run "{run_name}".\n')
 
@@ -462,7 +399,6 @@ def main(argv: list[str] | None = None) -> None:
         find_lr(args=args, directory=directory, metadata=metadata)
         return
 
-    # --- Default: supervised training ---
     print(f'Starting posepred training for run "{run_name}".\n')
 
     from .checkpoint import load_checkpoint_variables
@@ -470,7 +406,6 @@ def main(argv: list[str] | None = None) -> None:
     from .io import get_headers_from_first_hdf5
     from .training import main_worker, prepare_data
 
-    # --- Resolve feature schema (ablation) ---
     raw_headers = get_headers_from_first_hdf5(directory)
     feature_plan = resolve_feature_plan(
         raw_headers,
@@ -493,7 +428,6 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as e:
         print(f"[FEATURES] Warning: could not write feature column report: {e}")
 
-    # If resuming from checkpoint, optionally override args from ckpt.
     load_checkpoint_variables(
         args=args,
         checkpoint_path=pretrained_model_path,
@@ -504,6 +438,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # --- Final SWA arg validation (after any full-resume checkpoint overrides) ---
+    record_settings(args)
     swa_mode = bool(getattr(args, 'swa_mode', False))
     if swa_mode:
         if args.swa_epochs is None or int(args.swa_epochs) <= 0:
@@ -521,6 +456,7 @@ def main(argv: list[str] | None = None) -> None:
         max_class_weight=args.max_class_weight, defined_split=defined_split, noval=noval,
         feature_plan=feature_plan,
         ablation_strict=ablation_strict,
+        restart_optimizer=bool(args.restart_optimizer),
     )
 
     print("pose_dict:", pose_dict)
@@ -545,6 +481,8 @@ def main(argv: list[str] | None = None) -> None:
         swa_epochs=args.swa_epochs,
         swa_lr=args.swa_lr,
         feature_plan=feature_plan,
+        warmup_epochs=args.warmup_epochs,
+        cosine_decay_epochs=args.cosine_decay_epochs,
     )
 
 

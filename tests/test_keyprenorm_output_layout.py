@@ -31,7 +31,6 @@ def test_keyprenorm_explicit_output_dir_is_flat(tmp_path: Path) -> None:
         clobber=True,
         num_workers=1,
         edge_skip=0,
-        max_rows=0,
         batch_size=4,
         log_level="ERROR",
     )

@@ -1,27 +1,7 @@
-"""Shard-processing utilities for staged FeatureImp execution.
+"""Process frozen FeatureImp subset tasks and write shard-local numerical results and
+completion receipts.
 
-This module implements the heavy *process_shard* stage for the staged/sharded
-FeatureImp workflow.
-
-Design goals for this first shard-processing pass
--------------------------------------------------
-- Reuse the existing XGBoost/SHAP subset worker (`committee_fast._train_subset_worker`)
-  rather than introducing a second training code path.
-- Consume the frozen plan artifacts emitted by :mod:`featureimp.plan`.
-- Share the same frozen plan/task artifacts used by serial ``stage=all`` runs.
-- Write shard-local, merge-friendly partial artifacts without attempting final
-  user-facing report generation yet.
-
-Current scope
--------------
-This module only implements the *processing* stage:
-- load the frozen plan + shard task manifest
-- reconstruct the frozen training/all-groups matrices
-- run the assigned real/permuted subset tasks
-- write shard-local partial sums/counters, subset-performance partial CSVs,
-  performance-record JSONL files, and completion markers
-
-Merging/finalization is implemented in a later pass.
+Final reports are assembled by the merge stage.
 """
 
 from __future__ import annotations
@@ -31,8 +11,9 @@ import json
 import os
 import shutil
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -40,12 +21,22 @@ import pandas as pd
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import LabelEncoder
 
+from autobehaver.atomic_io import sha256_file
+from autobehaver.atomic_io import atomic_write_json
+from .integrity import seal_receipt, validate_receipt, flatten_paths
+
 from .committee import FixedBinaryLabelEncoder
 from .config import DEFAULT_SETTINGS
 from .committee_fast import _init_fast_pool_worker, _train_subset_worker
 from .hhit import make_hhit_folds, validate_stratified_cv_labels
 from .matrix import compute_feature_schema_sha256
 from .mp_utils import iter_parallel_results
+from .bounded_pool import BoundedProcessRunner
+from .archive_io import TaskArchiveWriter
+from autobehaver.scratch import scratch_workspace
+from autobehaver.completion import verified_run
+from .committee_fast import _clear_fast_pool_worker
+from autobehaver.resource_monitor import record_work
 from .permutation import _generate_sex_class_stratified_permutation
 from .plan import (
     ALL_GROUPS_ROW_INDICES_FILENAME,
@@ -58,6 +49,7 @@ from .plan import (
     SHARD_PLAN_DIRNAME,
     TRAINING_ROW_INDICES_FILENAME,
     load_featureimp_plan_manifest,
+    validate_hhit_fold_plan,
 )
 from .margin_tasks import (
     PERM_MARGIN_TASKS_FILENAME_TEMPLATE,
@@ -90,9 +82,10 @@ def _json_load(path: str) -> Any:
         return json.load(f)
 
 
-def _json_dump(obj: Any, path: str) -> None:
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
+def _json_dump(obj: Any, path: str, *, verified_inputs=None) -> None:
+    if os.path.basename(path) in {"SHARD_DONE.json", "WEIGHTS_DONE.json", "FINAL_MERGE_DONE.json", "WEIGHTED_REDUCTION_DONE.json"}:
+        obj = seal_receipt(obj, path, verified_inputs=verified_inputs)
+    atomic_write_json(_to_builtin(obj), path)
 
 
 def _jsonl_load(path: str) -> List[Dict[str, Any]]:
@@ -139,24 +132,104 @@ def _read_csv_rows(path: str) -> List[Dict[str, str]]:
 
 
 def _resolve_analysis_artifact(analysis_folder_path: str, manifest: Mapping[str, Any], *, artifact_key: str, fallback_filename: str) -> str:
+    """Resolve a planned artifact inside the analysis folder."""
     artifacts = manifest.get("artifacts", {}) if isinstance(manifest, Mapping) else {}
     rel = artifacts.get(artifact_key)
     if rel:
-        return os.path.join(analysis_folder_path, str(rel))
+        relative = Path(str(rel))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Unsafe FeatureImp artifact path for {artifact_key}: {rel!r}")
+        base = Path(analysis_folder_path).resolve()
+        candidate = (base / relative).resolve()
+        if not candidate.is_relative_to(base):
+            raise ValueError(f"FeatureImp artifact escapes the analysis folder: {rel!r}")
+        return str(candidate)
     return os.path.join(analysis_folder_path, PLAN_DIRNAME, fallback_filename)
+
+
+def _validate_planned_artifact_hashes(
+    analysis_folder_path: str,
+    manifest: Mapping[str, Any],
+) -> None:
+    """Verify every frozen plan artifact before loading shard context."""
+    expected_hashes = manifest.get("artifact_sha256")
+    if not isinstance(expected_hashes, Mapping) or not expected_hashes:
+        raise ValueError("FeatureImp plan is missing required artifact_sha256 fingerprints.")
+    for artifact_key, expected_hash in expected_hashes.items():
+        path = _resolve_analysis_artifact(
+            analysis_folder_path,
+            manifest,
+            artifact_key=str(artifact_key),
+            fallback_filename=str(artifact_key),
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Frozen FeatureImp plan artifact is missing: {path}")
+        if sha256_file(path) != str(expected_hash):
+            raise ValueError(
+                f"Frozen FeatureImp plan artifact changed after planning: {artifact_key}"
+            )
+
+
+def _flatten_artifact_paths(value: Any) -> List[str]:
+    if isinstance(value, Mapping):
+        paths: List[str] = []
+        for nested in value.values():
+            paths.extend(_flatten_artifact_paths(nested))
+        return paths
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for nested in value:
+            paths.extend(_flatten_artifact_paths(nested))
+        return paths
+    return [str(value)] if value else []
+
+
+def _validate_completed_shard(
+    done_path: str,
+    *,
+    analysis_folder_path: str,
+    plan_manifest_path: str,
+) -> tuple[bool, str]:
+    """Verify a shard receipt and its declared artifacts against the frozen plan."""
+    try:
+        summary = _json_load(done_path)
+        validate_receipt(done_path, analysis_folder_path)
+        if str(summary.get("status", "")).lower() != "completed":
+            return False, "completion marker status is not completed"
+        if summary.get("plan_manifest_sha256") != sha256_file(plan_manifest_path):
+            return False, "FeatureImp plan changed after this shard completed"
+        expected_hashes = summary.get("artifact_sha256")
+        if not isinstance(expected_hashes, Mapping) or not expected_hashes:
+            return False, "completion marker has no artifact fingerprints"
+        if set(flatten_paths(summary.get("artifacts", {}))) != set(expected_hashes):
+            return False, "completion marker does not fingerprint every required artifact"
+        base = Path(analysis_folder_path).resolve()
+        for relative, expected_hash in expected_hashes.items():
+            relative_path = Path(str(relative))
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                return False, f"unsafe shard artifact path: {relative!r}"
+            artifact = (base / relative_path).resolve()
+            if not artifact.is_relative_to(base) or not artifact.is_file():
+                return False, f"shard artifact is missing: {relative}"
+            # validate_receipt already checked every required artifact hash.
+        return True, "ok"
+    except Exception as exc:
+        return False, f"could not validate completion marker: {exc}"
 
 
 def _load_settings_snapshot(analysis_folder_path: str) -> Dict[str, Any]:
     path = os.path.join(analysis_folder_path, "FEATUREIMP_RUN_SETTINGS.json")
     if not os.path.exists(path):
-        return {}
+        raise FileNotFoundError(f"Required frozen FeatureImp settings not found: {path}")
     try:
         data = _json_load(path)
         from .core import filter_saved_settings_snapshot
 
-        return filter_saved_settings_snapshot(data if isinstance(data, dict) else {})
-    except Exception:
-        return {}
+        if not isinstance(data, dict):
+            raise ValueError("Saved FeatureImp settings must be a JSON object")
+        return filter_saved_settings_snapshot(data)
+    except Exception as exc:
+        raise ValueError(f"Saved FeatureImp settings are invalid: {path}") from exc
 
 
 def _get_runtime_num_workers() -> int:
@@ -171,6 +244,7 @@ def _get_runtime_num_workers() -> int:
 
 
 def _load_shard_plan_and_tasks(analysis_folder_path: str, *, shard_index: int) -> Tuple[Dict[str, Any], List[Dict[str, Any]], str]:
+    """Load and validate one shard's assignments and task identities."""
     manifest = load_featureimp_plan_manifest(analysis_folder_path)
     active_num_shards = int(manifest.get("active_num_shards", 1) or 1)
     if shard_index < 0 or shard_index >= active_num_shards:
@@ -186,6 +260,16 @@ def _load_shard_plan_and_tasks(analysis_folder_path: str, *, shard_index: int) -
         raise FileNotFoundError(f"Planned shard manifest not found: {shard_plan_path}")
     if not os.path.exists(shard_tasks_path):
         raise FileNotFoundError(f"Planned shard task CSV not found: {shard_tasks_path}")
+    shard_hashes = manifest.get("shard_artifact_sha256")
+    if not isinstance(shard_hashes, Mapping):
+        raise ValueError("FeatureImp plan is missing shard_artifact_sha256 fingerprints.")
+    for path in (shard_plan_path, shard_tasks_path):
+        relative = Path(os.path.relpath(path, analysis_folder_path)).as_posix()
+        expected_hash = shard_hashes.get(relative) or shard_hashes.get(os.path.relpath(path, analysis_folder_path))
+        if not expected_hash:
+            raise ValueError(f"FeatureImp plan has no fingerprint for shard artifact: {relative}")
+        if sha256_file(path) != str(expected_hash):
+            raise ValueError(f"FeatureImp shard plan artifact changed after planning: {relative}")
     shard_plan = _json_load(shard_plan_path)
     rows_raw = _read_csv_rows(shard_tasks_path)
     task_rows: List[Dict[str, Any]] = []
@@ -207,37 +291,52 @@ def _load_shard_plan_and_tasks(analysis_folder_path: str, *, shard_index: int) -
                 "planned_model_count": int(row.get("planned_model_count", 0) or 0),
             }
         )
+    if str(shard_plan.get("status", "")).lower() != "planned":
+        raise ValueError(f"Shard plan status is not planned: {shard_plan.get('status')!r}")
+    if int(shard_plan.get("shard_index", -1)) != int(shard_index):
+        raise ValueError("Shard plan index does not match the requested shard.")
+    if int(shard_plan.get("task_count", -1)) != len(task_rows):
+        raise ValueError("Shard plan task_count does not match SHARD_TASKS.csv.")
+    task_keys = [str(row.get("task_key") or "") for row in task_rows]
+    if any(not key for key in task_keys) or len(task_keys) != len(set(task_keys)):
+        raise ValueError("Shard task keys must be non-blank and unique.")
+    if any(int(row["shard_index"]) != int(shard_index) for row in task_rows):
+        raise ValueError("SHARD_TASKS.csv contains a task assigned to another shard.")
     return shard_plan, task_rows, shard_label
 
 
 @contextmanager
 def _directory_lock(lock_dir: str):
+    """Hold process ownership; preserve unknown legacy directory locks."""
+    from autobehaver.file_locks import FileLock
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
-    try:
-        os.mkdir(lock_dir)
-    except FileExistsError as exc:
-        raise RuntimeError(
-            f"Shard lock already exists: {lock_dir}. Another process may be running this shard, or a stale lock remains."
-        ) from exc
+    if os.path.isdir(lock_dir):
+        raise RuntimeError(f"Legacy FeatureImp directory lock requires verified recovery: {lock_dir}")
+    lock = FileLock(lock_dir)
+    lock.acquire(metadata={"stage": "featureimp", "lock_path": os.path.abspath(lock_dir)})
     try:
         yield
     finally:
-        shutil.rmtree(lock_dir, ignore_errors=True)
+        lock.release()
 
 
 def _load_featureimp_context(analysis_folder_path: str, manifest: Mapping[str, Any]) -> Dict[str, Any]:
-    normalized_matrix_path = str(manifest.get("normalized_matrix_path") or "").strip()
-    if not normalized_matrix_path or not os.path.exists(normalized_matrix_path):
-        normalized_matrix_path = _resolve_analysis_artifact(
-            analysis_folder_path,
-            manifest,
-            artifact_key="normalized_matrix_csv",
-            fallback_filename="NORMALIZED_FEATURE_MATRIX.csv",
-        )
+    """Restore frozen sample and feature order and prepare validated model inputs."""
+    _validate_planned_artifact_hashes(analysis_folder_path, manifest)
+    # The frozen relative artifact is authoritative after moving a local plan to HPC.
+    normalized_matrix_path = _resolve_analysis_artifact(
+        analysis_folder_path, manifest, artifact_key="normalized_matrix_csv",
+        fallback_filename="NORMALIZED_FEATURE_MATRIX.csv")
     if not os.path.exists(normalized_matrix_path):
         raise FileNotFoundError(f"Normalized feature matrix not found: {normalized_matrix_path}")
+    expected_matrix_hash = str(manifest.get("normalized_matrix_sha256") or "")
+    if not expected_matrix_hash:
+        raise ValueError("FeatureImp plan is missing normalized_matrix_sha256.")
+    if sha256_file(normalized_matrix_path) != expected_matrix_hash:
+        raise ValueError("Normalized feature matrix changed after the FeatureImp plan was created.")
 
-    df_raw = pd.read_csv(normalized_matrix_path)
+    from .matrix_input import read_feature_matrix
+    df_raw = read_feature_matrix(normalized_matrix_path)
 
     selected_features_path = _resolve_analysis_artifact(
         analysis_folder_path,
@@ -299,6 +398,22 @@ def _load_featureimp_context(analysis_folder_path: str, manifest: Mapping[str, A
         raise ValueError("Training row-count mismatch between plan manifest and training-row index file.")
     if len(all_groups_row_indices) != int(manifest.get("all_groups_row_count", len(all_groups_row_indices))):
         raise ValueError("All-groups row-count mismatch between plan manifest and all-groups row index file.")
+    if len(training_row_indices) != len(set(training_row_indices)):
+        raise ValueError("Training row-index plan contains duplicate rows.")
+    if len(other_group_row_indices) != len(set(other_group_row_indices)):
+        raise ValueError("Other-group row-index plan contains duplicate rows.")
+    if set(training_row_indices) & set(other_group_row_indices):
+        raise ValueError("Training and other-group row-index plans overlap.")
+    if all_groups_row_indices != training_row_indices + other_group_row_indices:
+        raise ValueError("All-groups row order does not equal the frozen training + other row order.")
+    invalid_indices = [
+        index for index in all_groups_row_indices if index < 0 or index >= len(df_raw)
+    ]
+    if invalid_indices:
+        raise ValueError(f"Frozen row indices fall outside the normalized matrix: {invalid_indices[:20]}")
+    missing_features = [feature for feature in selected_features if feature not in df_raw.columns]
+    if missing_features:
+        raise ValueError(f"Selected features are missing from normalized matrix: {missing_features[:20]}")
 
     df_for_training = df_raw.loc[training_row_indices].copy()
     df_for_other_groups = df_raw.loc[other_group_row_indices].copy()
@@ -346,6 +461,12 @@ def _load_featureimp_context(analysis_folder_path: str, manifest: Mapping[str, A
     fold_plan_records = {
         int(rec["h_hit"]): rec for rec in _jsonl_load(fold_plan_path)
     }
+    validate_hhit_fold_plan(
+        list(fold_plan_records.values()),
+        n_training_rows=len(training_row_indices),
+        n_splits=n_splits,
+        expected_h_hits=int(manifest.get("H_hits_per_feature", 0) or 0),
+    )
     subset_plan_records = {
         int(rec["h_hit"]): rec for rec in _jsonl_load(subset_plan_path)
     }
@@ -397,6 +518,7 @@ def _baseline_fold_logloss_sums(
     fold_indices_round: Sequence[Tuple[np.ndarray, np.ndarray]],
     num_classes: int,
 ) -> List[float]:
+    """Calculate constant-predictor log-loss sums using each fold's training prevalence."""
     baseline_sums: List[float] = []
     for train_indices, test_indices in fold_indices_round:
         y_train_fold = y_encoded_train[np.asarray(train_indices, dtype=np.int64)]
@@ -441,6 +563,7 @@ def _subset_performance_row_from_result(
     is_permuted: bool,
     permutation_idx: Optional[int],
 ) -> Dict[str, Any]:
+    """Validate fold metrics and summarize one subset's out-of-fold skill."""
     h_hit = int(result.get("h_hit", 0) or 0)
     subset_idx = int(result.get("subset_idx", 0) or 0)
     n_features = int(result.get("n_features", len(result.get("features", []) or [])) or 0)
@@ -510,6 +633,7 @@ def _subset_performance_row_from_result(
 
 
 def _performance_records_from_result(result: Mapping[str, Any], *, is_permuted: bool, permutation_idx: Optional[int]) -> List[Dict[str, Any]]:
+    """Attach real or permutation identity to fold-performance records."""
     specialist_features = result.get("features", [])
     if isinstance(specialist_features, (pd.Index, np.ndarray, tuple)):
         specialist_features = list(specialist_features)
@@ -539,6 +663,7 @@ def _accumulate_result(
     result: Mapping[str, Any],
     feature_to_idx: Mapping[str, int],
 ) -> None:
+    """Add one subset result to ordered feature-level and sample-level accumulators."""
     feature_indices = np.asarray([feature_to_idx[f] for f in list(result.get("features") or [])], dtype=np.int32)
 
     accum["feature_subset_hit_counts"][feature_indices] += 1
@@ -575,6 +700,7 @@ def _save_partial_npz(path: str, *, partial: Mapping[str, Any], metadata: Mappin
 
 
 def _empty_subset_performance_frame() -> pd.DataFrame:
+    """Create the declared subset-performance columns for an empty task group."""
     return pd.DataFrame(
         columns=[
             "subset_id",
@@ -621,6 +747,7 @@ def _shap_task_record_from_result(
     include_insample: bool,
     include_all_groups: bool,
 ) -> Dict[str, Any]:
+    """Build an ordered subset SHAP record for the requested output views."""
     feature_indices = np.asarray(
         [feature_to_idx[f] for f in list(result.get("features") or [])],
         dtype=np.int32,
@@ -654,7 +781,11 @@ def _run_task_group(
     n_train: int,
     is_permuted: bool,
     permutation_idx: Optional[int],
+    runner=None,
+    archive_writer=None,
+    error_path=None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run and accumulate assigned subset tasks, recording every worker failure."""
     subset_rows: List[Dict[str, Any]] = []
     performance_rows: List[Dict[str, Any]] = []
     margin_task_rows: List[Dict[str, Any]] = []
@@ -664,7 +795,9 @@ def _run_task_group(
     if not task_payloads:
         return subset_rows, performance_rows, margin_task_rows, shap_task_rows, errors
 
-    for result in iter_parallel_results(
+    result_iterator = (runner.run(_train_subset_worker, task_payloads, desc=group_label,
+                                  stage_name=f"FeatureImp shard {group_label}")
+                       if runner is not None else iter_parallel_results(
         _train_subset_worker,
         task_payloads,
         num_workers=num_workers,
@@ -672,8 +805,10 @@ def _run_task_group(
         initargs=(X_train_full, X_shap_full, y_encoded_train, le),
         desc=group_label,
         stage_name=f"FeatureImp shard {group_label}",
-    ):
+    ))
+    for result in result_iterator:
         if result is None:
+            record_work("featureimp_subset_tasks", failed=1)
             errors.append(
                 {
                     "error_type": "WorkerReturnedNone",
@@ -685,10 +820,12 @@ def _run_task_group(
             continue
 
         if isinstance(result, dict) and result.get("__worker_error__"):
+            record_work("featureimp_subset_tasks", failed=1)
             errors.append(dict(result))
             continue
 
         failed_folds = list(result.get("failed_folds") or [])
+        record_work("featureimp_subset_tasks", completed=int(not failed_folds), failed=int(bool(failed_folds)))
         if failed_folds:
             errors.extend([dict(err) for err in failed_folds])
 
@@ -710,20 +847,26 @@ def _run_task_group(
                 permutation_idx=permutation_idx,
             )
         )
-        margin_task_rows.append(_margin_task_record_from_result(result))
-        shap_task_rows.append(
-            _shap_task_record_from_result(
-                result,
-                feature_to_idx=feature_to_idx,
-                include_insample=True,
-                include_all_groups=True,
+        if archive_writer is not None:
+            archive_writer.append(result, feature_to_idx)
+        else:
+            margin_task_rows.append(_margin_task_record_from_result(result))
+            shap_task_rows.append(
+                _shap_task_record_from_result(
+                    result,
+                    feature_to_idx=feature_to_idx,
+                    include_insample=True,
+                    include_all_groups=True,
+                )
             )
-        )
 
+    if errors and error_path is not None:
+        _write_jsonl(errors, error_path)
+        raise RuntimeError(f"FeatureImp shard {group_label} failed: {errors[0].get('error_message', errors[0])}; see {error_path}")
     return subset_rows, performance_rows, margin_task_rows, shap_task_rows, errors
 
 
-def process_featureimp_shard_run(
+def _process_featureimp_shard_owned(
     analysis_folder_path: str,
     *,
     shard_index: int,
@@ -752,15 +895,30 @@ def process_featureimp_shard_run(
 
     done_path = os.path.join(shard_output_dir, SHARD_DONE_FILENAME)
     if os.path.exists(done_path):
-        print(f"Shard already completed successfully; reusing existing outputs: {done_path}")
+        plan_manifest_path = os.path.join(
+            analysis_folder_path,
+            PLAN_DIRNAME,
+            "PLAN_MANIFEST.json",
+        )
+        valid_done, reason = _validate_completed_shard(
+            done_path,
+            analysis_folder_path=analysis_folder_path,
+            plan_manifest_path=plan_manifest_path,
+        )
+        if not valid_done:
+            raise RuntimeError(
+                "Existing FeatureImp shard completion marker cannot be safely reused: "
+                f"{reason}. Remove or archive the shard output directory before rerunning."
+            )
+        print(f"Shard already completed successfully; reusing validated outputs: {done_path}")
         return shard_output_dir
 
     settings_snapshot = _load_settings_snapshot(analysis_folder_path)
     num_workers = _get_runtime_num_workers()
-    model_subsample = float(settings_snapshot.get("model_subsample", 1.0) or 1.0)
-    n_estimators = int(settings_snapshot.get("n_estimators", 200) or 200)
-    learning_rate = float(settings_snapshot.get("learning_rate", 0.1) or 0.1)
-    max_depth = int(settings_snapshot.get("max_depth", 6) or 6)
+    model_subsample = float(settings_snapshot.get("model_subsample", 1.0))
+    n_estimators = int(settings_snapshot.get("n_estimators", 200))
+    learning_rate = float(settings_snapshot.get("learning_rate", 0.1))
+    max_depth = int(settings_snapshot.get("max_depth", 6))
     resolved_global_seed = int(manifest.get("resolved_global_random_seed", 0) or 0)
     n_splits = int(manifest.get("n_splits", 0) or 0)
 
@@ -792,7 +950,7 @@ def process_featureimp_shard_run(
     )
 
     try:
-        with _directory_lock(lock_dir):
+        with ExitStack() as run_stack:
             context = _load_featureimp_context(analysis_folder_path, manifest)
 
             df_for_training = context["df_for_training"]
@@ -852,11 +1010,33 @@ def process_featureimp_shard_run(
             perm_subset_rows: List[Dict[str, Any]] = []
             real_performance_rows: List[Dict[str, Any]] = []
             perm_performance_rows: List[Dict[str, Any]] = []
-            real_margin_task_rows: List[Dict[str, Any]] = []
-            perm_margin_task_rows: Dict[int, List[Dict[str, Any]]] = {}
-            real_shap_task_rows: List[Dict[str, Any]] = []
-            perm_shap_task_rows: Dict[int, List[Dict[str, Any]]] = {}
             errors: List[Dict[str, Any]] = []
+            task_features = {str(row['task_key']): tuple(subset_plan_records[int(row['h_hit'])]['feature_subsets'][int(row['subset_idx'])]) for row in shard_task_rows}
+            archive_bytes = sum(4 * (2 * n_train + n_all + 1) * len(task_features[str(row['task_key'])]) +
+                                8 * (2 * n_train + n_all) + 8 * n_train + 128 for row in shard_task_rows)
+            matrix_bytes = int(X_train_full.memory_usage(index=False).sum() + X_shap_full.memory_usage(index=False).sum())
+            scratch = run_stack.enter_context(scratch_workspace('featureimp', required_bytes=archive_bytes + matrix_bytes + 1048576))
+            def matrix_descriptor(frame, name):
+                path = scratch / f'{name}.npy'
+                np.save(path, frame.to_numpy(copy=False), allow_pickle=False)
+                return {'memmap_path': str(path), 'feature_columns': list(frame.columns)}
+            descriptors = matrix_descriptor(X_train_full, 'training'), matrix_descriptor(X_shap_full, 'all_groups')
+            run_stack.callback(_clear_fast_pool_worker)
+            from .execution import worker_capacity, GIB
+            subset_width = max((len(v) for v in task_features.values()), default=n_feats)
+            # Inputs, SHAP temporaries, tree workspace and interpreter/native overhead.
+            worker_bytes = GIB + 96 * (n_train + n_all) * subset_width
+            num_workers = worker_capacity(num_workers, worker_bytes, 'Training')
+            runner = run_stack.enter_context(BoundedProcessRunner(num_workers=num_workers,
+                estimated_worker_bytes=worker_bytes,
+                initializer=_init_fast_pool_worker, initargs=(*descriptors, y_encoded_train, le)))
+            def make_writer(family, permutation_idx=None):
+                specs = {(int(row['h_hit']), int(row['subset_idx'])): task_features[str(row['task_key'])]
+                         for row in shard_task_rows if row['family'] == family and row.get('permutation_idx') == permutation_idx}
+                writer = TaskArchiveWriter(scratch / f'{family}_{permutation_idx}', specs, n_train=n_train, n_all=n_all)
+                run_stack.callback(writer.close)
+                return writer
+            real_writer = make_writer('real')
 
             print("\n" + "=" * 80)
             print("PROCESSING FEATUREIMP SHARD")
@@ -912,7 +1092,7 @@ def process_featureimp_shard_run(
 
                 print(f"\nReal shard tasks for h_hit={h_hit}: {len(task_payloads)} subset tasks")
                 subset_rows, performance_rows, margin_rows, shap_rows, group_errors = _run_task_group(
-                    group_label=f"real h_hit {h_hit}",
+                    group_label=f"real h_hit {h_hit}", runner=runner, archive_writer=real_writer, error_path=errors_path,
                     task_payloads=task_payloads,
                     X_train_full=X_train_full,
                     X_shap_full=X_shap_full,
@@ -929,11 +1109,10 @@ def process_featureimp_shard_run(
                 )
                 real_subset_rows.extend(subset_rows)
                 real_performance_rows.extend(performance_rows)
-                real_margin_task_rows.extend(margin_rows)
-                real_shap_task_rows.extend(shap_rows)
                 errors.extend(group_errors)
 
             for perm_idx in sorted(perm_tasks_by_perm_hhit.keys()):
+                perm_writer = make_writer('perm', int(perm_idx))
                 perm_partial = _init_partial_accumulators(
                     n_train=n_train,
                     n_all=n_all,
@@ -1013,7 +1192,7 @@ def process_featureimp_shard_run(
                         f"\nPermuted shard tasks for perm={perm_idx}, h_hit={h_hit}: {len(task_payloads)} subset tasks"
                     )
                     subset_rows, performance_rows, margin_rows, shap_rows, group_errors = _run_task_group(
-                        group_label=f"perm {perm_idx} h_hit {h_hit}",
+                        group_label=f"perm {perm_idx} h_hit {h_hit}", runner=runner, archive_writer=perm_writer, error_path=errors_path,
                         task_payloads=task_payloads,
                         X_train_full=X_train_full,
                         X_shap_full=X_shap_full,
@@ -1030,42 +1209,16 @@ def process_featureimp_shard_run(
                     )
                     perm_subset_rows.extend(subset_rows)
                     perm_performance_rows.extend(performance_rows)
-                    perm_margin_task_rows.setdefault(int(perm_idx), []).extend(margin_rows)
-                    perm_shap_task_rows.setdefault(int(perm_idx), []).extend(shap_rows)
                     errors.extend(group_errors)
 
                 perm_margin_tasks_path = os.path.join(
                     shard_output_dir,
                     PERM_MARGIN_TASKS_FILENAME_TEMPLATE.format(perm_idx=int(perm_idx)),
                 )
-                save_margin_task_archive(
-                    perm_margin_tasks_path,
-                    task_records=perm_margin_task_rows.get(int(perm_idx), []),
-                    n_train=n_train,
-                    n_all=n_all,
-                    metadata={
-                        "family": "perm_margin_tasks",
-                        "permutation_idx": int(perm_idx),
-                        "shard_index": int(shard_index),
-                    },
-                )
-                perm_shap_tasks_path = os.path.join(
-                    shard_output_dir,
-                    PERM_SHAP_TASKS_FILENAME_TEMPLATE.format(perm_idx=int(perm_idx)),
-                )
-                save_shap_task_archive(
-                    perm_shap_tasks_path,
-                    task_records=perm_shap_task_rows.get(int(perm_idx), []),
-                    n_train=n_train,
-                    n_all=n_all,
-                    include_insample=True,
-                    include_all_groups=True,
-                    metadata={
-                        "family": "perm_shap_tasks",
-                        "permutation_idx": int(perm_idx),
-                        "shard_index": int(shard_index),
-                    },
-                )
+                perm_shap_tasks_path = os.path.join(shard_output_dir, PERM_SHAP_TASKS_FILENAME_TEMPLATE.format(perm_idx=int(perm_idx)))
+                perm_writer.publish(margin_path=perm_margin_tasks_path, shap_path=perm_shap_tasks_path,
+                    metadata={'family': 'perm_tasks', 'permutation_idx': int(perm_idx), 'shard_index': int(shard_index)})
+                perm_writer.close()
                 perm_partials_path = os.path.join(
                     shard_output_dir,
                     PERM_PARTIALS_FILENAME_TEMPLATE.format(perm_idx=int(perm_idx)),
@@ -1084,32 +1237,14 @@ def process_featureimp_shard_run(
                     },
                 )
 
+                perm_partials[int(perm_idx)] = {}
+                del perm_partial
+
             real_margin_tasks_path = os.path.join(shard_output_dir, REAL_MARGIN_TASKS_FILENAME)
-            save_margin_task_archive(
-                real_margin_tasks_path,
-                task_records=real_margin_task_rows,
-                n_train=n_train,
-                n_all=n_all,
-                metadata={
-                    "family": "real_margin_tasks",
-                    "permutation_idx": -1,
-                    "shard_index": int(shard_index),
-                },
-            )
             real_shap_tasks_path = os.path.join(shard_output_dir, REAL_SHAP_TASKS_FILENAME)
-            save_shap_task_archive(
-                real_shap_tasks_path,
-                task_records=real_shap_task_rows,
-                n_train=n_train,
-                n_all=n_all,
-                include_insample=True,
-                include_all_groups=True,
-                metadata={
-                    "family": "real_shap_tasks",
-                    "permutation_idx": -1,
-                    "shard_index": int(shard_index),
-                },
-            )
+            real_writer.publish(margin_path=real_margin_tasks_path, shap_path=real_shap_tasks_path,
+                metadata={'family': 'real_tasks', 'permutation_idx': -1, 'shard_index': int(shard_index)})
+            real_writer.close()
             real_partials_path = os.path.join(shard_output_dir, REAL_PARTIALS_FILENAME)
             _save_partial_npz(
                 real_partials_path,
@@ -1216,8 +1351,24 @@ def process_featureimp_shard_run(
                         )
                         for perm_idx in sorted(perm_partials.keys())
                     },
+                    "model_files": [
+                        os.path.relpath(str(path), analysis_folder_path)
+                        for path in sorted(Path(models_folder).rglob("*.json"))
+                    ],
                 },
             }
+            summary["plan_manifest_sha256"] = sha256_file(
+                os.path.join(analysis_folder_path, PLAN_DIRNAME, "PLAN_MANIFEST.json")
+            )
+            artifact_hashes: Dict[str, str] = {}
+            for relative in _flatten_artifact_paths(summary["artifacts"]):
+                artifact_path = os.path.abspath(os.path.join(analysis_folder_path, relative))
+                if not os.path.isfile(artifact_path):
+                    raise FileNotFoundError(
+                        f"Shard declared an output artifact that was not written: {relative}"
+                    )
+                artifact_hashes[relative] = sha256_file(artifact_path)
+            summary["artifact_sha256"] = artifact_hashes
             _json_dump(summary, done_path)
             print("\nShard processing complete.")
             print(f"  - Done manifest: {done_path}")
@@ -1253,6 +1404,16 @@ def process_featureimp_shard_run(
 
     return shard_output_dir
 
+
+
+@verified_run
+def process_featureimp_shard_run(analysis_folder_path: str, *, shard_index: int) -> str:
+    """Own the shard before inspecting or changing completion/status records."""
+    analysis_folder_path = os.path.abspath(str(analysis_folder_path))
+    _plan, _tasks, label = _load_shard_plan_and_tasks(analysis_folder_path, shard_index=int(shard_index))
+    output = os.path.join(analysis_folder_path, SHARD_OUTPUT_DIRNAME, label)
+    with _directory_lock(os.path.join(output, LOCK_DIRNAME)):
+        return _process_featureimp_shard_owned(analysis_folder_path, shard_index=shard_index)
 
 __all__ = [
     "SHARD_OUTPUT_DIRNAME",

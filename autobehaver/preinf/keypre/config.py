@@ -1,3 +1,4 @@
+"""Define runtime options and output paths for KeyPre."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,7 +6,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class KeypreConfig:
-    """Configuration for keypre runs."""
+    """Store runtime options for KeyPre."""
 
     # Paths
     input_dir: str
@@ -16,7 +17,9 @@ class KeypreConfig:
     file_filter: str | None = None
 
     # Runtime
-    num_workers: int = 15
+    # 0 = automatic; positive values are an upper limit, still constrained by RAM/CPUs.
+    num_workers: int = 0
+    memory_gb: float | None = None
     clobber: bool = False
     movie_dim: int = 600
     dry_run: bool = False
@@ -31,9 +34,7 @@ class KeypreConfig:
     chunk_size: int = 100
     pool_maxtasksperchild: int = 100
 
-    # ------------------------------------------------------------------
     # Project registry (optional)
-    # ------------------------------------------------------------------
     # When enabled, keypre discovers inputs from the project registry
     # (dlc_csv_relpath) instead of scanning the filesystem, and then upserts
     # keypre outputs (keypre_csv_relpath + keypre_version) back into the
@@ -42,6 +43,7 @@ class KeypreConfig:
     registry_csv: str | None = None
     registry_lock_timeout_sec: int = 120
     registry_lock_stale_sec: int = 60 * 60
+    file_list: str | None = None
 
     def resolved_registry_csv(self) -> str | None:
         """Return the registry CSV path if enabled."""

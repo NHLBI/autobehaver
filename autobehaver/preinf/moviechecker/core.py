@@ -1,16 +1,21 @@
-"""OpenCV UI for reviewing full-frame movies and marking chamber exclusions."""
+"""Provide the OpenCV review interface for MovieChecker chamber exclusions."""
 
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from .exclusions import ExclusionsStore
+from autobehaver.portable_paths import original_name
+
+if TYPE_CHECKING:
+    from ..autocropper.recording_db import RecordingDBIndex
 
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".mpg", ".mpeg"}
@@ -21,39 +26,11 @@ def _is_video_file(path: str) -> bool:
     return ext in VIDEO_EXTS
 
 
-def derive_pair_key(movie_path: str) -> str:
-    """Derive a stable key for pairing movie0/movie1 recordings.
-
-    The key is intended to be the same for movie0 and movie1 from the same
-    camera/trial/session. We:
-
-    - Strip the extension
-    - Remove timestamp tokens like 20250819015233PM (or with '_'/'-')
-    - Replace movie0/movie1 -> movie
-    - Normalize repeated separators
-    """
-
-    base = os.path.basename(movie_path)
-    stem, _ = os.path.splitext(base)
-
-    # Remove timestamp token (common format: YYYYMMDDHHMMSSAM/PM, with optional '_'/'-')
-    stem = re.sub(r"\d{8}[_-]?\d{6}(AM|PM)", "", stem, flags=re.IGNORECASE)
-    # Some filenames may contain 14 digits without separator; above handles it, but keep:
-    stem = re.sub(r"\d{14}(AM|PM)", "", stem, flags=re.IGNORECASE)
-
-    # Normalize movie index
-    stem = re.sub(r"movie[01]", "movie", stem, flags=re.IGNORECASE)
-
-    # Clean up leftover separators
-    stem = re.sub(r"__+", "_", stem)
-    stem = re.sub(r"--+", "-", stem)
-    stem = re.sub(r"[_-]{2,}", "_", stem)
-    stem = stem.strip("_- ")
-
-    return stem
+from autobehaver.recording_identity import derive_pair_key
 
 
 def group_movie_pairs(movie_paths: List[str]) -> Dict[str, List[str]]:
+    """Group movie paths by pair key and sort each group deterministically."""
     pairs: Dict[str, List[str]] = {}
     for p in movie_paths:
         key = derive_pair_key(p)
@@ -65,7 +42,7 @@ def group_movie_pairs(movie_paths: List[str]) -> Dict[str, List[str]]:
 
 
 def choose_representative_movie(paths: List[str]) -> str:
-    """Pick one movie from a (movie0/movie1) pair to review."""
+    """Choose movie0 from a recording pair when present, otherwise the first path."""
     if not paths:
         raise ValueError("paths must be non-empty")
     # Prefer movie0 if present.
@@ -77,6 +54,7 @@ def choose_representative_movie(paths: List[str]) -> str:
 
 @dataclass
 class UILayout:
+    """Store display rectangles and scaling in canvas pixel coordinates."""
     tile_rects: Dict[int, Tuple[int, int, int, int]]  # chamber -> (x1,y1,x2,y2) on the canvas
     seekbar_rect: Tuple[int, int, int, int]
     image_rect: Tuple[int, int, int, int]  # (x1,y1,x2,y2) where the resized frame is drawn
@@ -88,13 +66,11 @@ class UILayout:
 
 
 def compute_ui_layout(frame_w: int, frame_h: int, *, max_display_w: int = 1600, max_display_h: int = 1000) -> UILayout:
-    """Compute display scaling and UI element rectangles.
+    """Calculate image scaling and review-control rectangles in canvas pixels.
 
-    The movie frame is shown in full, with the header/seekbar drawn in dedicated
-    canvas areas *outside* the image so the top/bottom pixels are never obscured.
+    Reserve header and seekbar areas outside the movie image.
     """
 
-    # Initial scale based on image only
     scale = min(1.0, max_display_w / float(frame_w), max_display_h / float(frame_h))
     disp_w = int(round(frame_w * scale))
     disp_h = int(round(frame_h * scale))
@@ -159,7 +135,7 @@ def compute_ui_layout(frame_w: int, frame_h: int, *, max_display_w: int = 1600, 
 
 
 def _draw_text_with_outline(img: np.ndarray, text: str, org: Tuple[int, int], font_scale: float, thickness: int) -> None:
-    # Outline
+    """Draw white text with a black outline on the image in place."""
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
@@ -176,6 +152,7 @@ def _draw_ui_overlays(
     playback_stride: int,
     frame_pos: int,
     frame_count: int,
+    recording_excluded_chambers: Optional[List[int]] = None,
 ) -> np.ndarray:
     """Draw tiles, header text, and seekbar while keeping the full image visible."""
 
@@ -204,6 +181,8 @@ def _draw_ui_overlays(
     for ch, (x1, y1, x2, y2) in layout.tile_rects.items():
         cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 255, 255), outline_thick)
         cv2.putText(disp, str(ch), (x1 + 10, y1 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        if recording_excluded_chambers and recording_excluded_chambers[ch - 1]:
+            _draw_text_with_outline(disp, "Recording exclusion", (x1 + 10, y1 + 55), 0.5, 1)
         if excluded_chambers[ch - 1]:
             cv2.line(disp, (x1 + 15, y1 + 15), (x2 - 15, y2 - 15), (0, 0, 255), x_thick)
             cv2.line(disp, (x2 - 15, y1 + 15), (x1 + 15, y2 - 15), (0, 0, 255), x_thick)
@@ -231,6 +210,7 @@ def _draw_ui_overlays(
 
 
 class MovieCheckerApp:
+    """Manage movie-pair selection, playback, and persistent chamber exclusions."""
     def __init__(
         self,
         input_dir: str,
@@ -240,6 +220,7 @@ class MovieCheckerApp:
         max_display_w: int = 1600,
         max_display_h: int = 1000,
         playback_stride: int = 1,
+        recording_index: Optional[RecordingDBIndex] = None,
     ):
         self.input_dir = input_dir
         self.exclusions_csv_path = exclusions_csv_path
@@ -247,6 +228,10 @@ class MovieCheckerApp:
         self.max_display_w = max_display_w
         self.max_display_h = max_display_h
         self._playback_stride = max(1, int(playback_stride))
+        self.recording_index = recording_index
+        self._recording_exclusions: Dict[str, List[int]] = {}
+        self.recording_skipped_keys: List[str] = []
+        self._recording_flags: List[int] = [0] * 6
 
         self.store = ExclusionsStore(csv_path=exclusions_csv_path)
         self.store.load()
@@ -266,6 +251,7 @@ class MovieCheckerApp:
         self._pending_seek_frame: Optional[int] = None
 
     def scan_movies(self) -> None:
+        """Discover movie pairs and select those needing review after metadata exclusions."""
         if not os.path.isdir(self.input_dir):
             raise FileNotFoundError(f"input_dir does not exist: {self.input_dir}")
 
@@ -274,8 +260,20 @@ class MovieCheckerApp:
 
         self.movie_pairs = group_movie_pairs(movie_files)
 
+        # Resolve every movie before allowing any writes or automatic skips.
+        self._recording_exclusions = {}
+        self.recording_skipped_keys = []
+        if self.recording_index is not None:
+            for pair_key, paths in self.movie_pairs.items():
+                flags = [self.recording_index.get_movie_exclusion_flags(Path(original_name(p))) for p in paths]
+                if any(value != flags[0] for value in flags[1:]):
+                    raise ValueError(f"Conflicting recording occupancy for movie pair: {pair_key}")
+                self._recording_exclusions[pair_key] = flags[0]
+                if all(flags[0]):
+                    self.recording_skipped_keys.append(pair_key)
+
         # Build review list
-        keys = sorted(self.movie_pairs.keys())
+        keys = sorted(set(self.movie_pairs) - set(self.recording_skipped_keys))
         if not self.review_all:
             keys = [k for k in keys if not self.store.has(k)]
         self.review_keys = keys
@@ -283,22 +281,43 @@ class MovieCheckerApp:
         self.current_idx = 0
 
     def _load_state_for_pair(self, pair_key: str, reviewed_movie: str) -> None:
+        """Combine saved manual and recording-time exclusions for the current pair."""
         rec = self.store.get(pair_key)
         if rec is None:
             self.excluded_flags = [0, 0, 0, 0, 0, 0]
         else:
             self.excluded_flags = list(rec.exclude_ch)
+        self._recording_flags = list(self._recording_exclusions.get(pair_key, [0] * 6))
+        self.excluded_flags = [int(manual or recorded) for manual, recorded in
+                               zip(self.excluded_flags, self._recording_flags)]
 
         self._current_pair_key = pair_key
         self._current_movie_path = reviewed_movie
 
+    def _save_recording_only_exclusions(self) -> None:
+        """Keep skipped cameras covered for cropping, preserving existing reviews."""
+        changed = False
+        for pair_key in self.recording_skipped_keys:
+            if not self.store.has(pair_key):
+                self.store.upsert(
+                    pair_key=pair_key,
+                    reviewed_movie=os.path.basename(choose_representative_movie(self.movie_pairs[pair_key])),
+                    exclude_ch=[1] * 6,
+                )
+                changed = True
+        if changed:
+            # Stop on save failure; otherwise cropping could see incomplete coverage.
+            self.store.write_atomic()
+
     def _save_current_state(self) -> None:
+        """Save the current pair exclusions and report recoverable storage failures."""
         if not self._current_pair_key or not self._current_movie_path:
             return
         self.store.upsert(
             pair_key=self._current_pair_key,
             reviewed_movie=os.path.basename(self._current_movie_path),
-            exclude_ch=list(self.excluded_flags),
+            exclude_ch=[int(manual or recorded) for manual, recorded in
+                        zip(self.excluded_flags, self._recording_flags)],
         )
         try:
             self.store.write_atomic()
@@ -310,6 +329,7 @@ class MovieCheckerApp:
             print(f"WARNING: moviechecker could not save exclusions.csv: {exc}")
 
     def _close_cap(self) -> None:
+        """Release the current video capture, if open."""
         if self._cap is not None:
             try:
                 self._cap.release()
@@ -318,6 +338,7 @@ class MovieCheckerApp:
         self._cap = None
 
     def _open_current_movie(self) -> None:
+        """Open the selected movie, restore exclusions, and initialize its display layout."""
         self._close_cap()
         movie_path = self.review_movies[self.current_idx]
         pair_key = self.review_keys[self.current_idx]
@@ -341,6 +362,7 @@ class MovieCheckerApp:
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def _mouse_callback(self, event: int, x: int, y: int, flags: int, param: object) -> None:
+        """Handle seeking and manual exclusion clicks while preserving recording exclusions."""
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         if self.layout is None:
@@ -363,17 +385,25 @@ class MovieCheckerApp:
         for ch, (x1, y1, x2, y2) in self.layout.tile_rects.items():
             if x1 <= x <= x2 and y1 <= y <= y2:
                 idx = ch - 1
+                if self._recording_flags[idx]:
+                    print(f"Chamber {ch} is excluded by the recording records. "
+                          "Correct those records if its occupancy is wrong.")
+                    return
                 self.excluded_flags[idx] = 0 if self.excluded_flags[idx] else 1
                 return
 
     def run(self) -> None:
+        """Run movie review and persist exclusions on navigation or exit."""
         self.scan_movies()
+        self._save_recording_only_exclusions()
+        if self.recording_index is not None:
+            print(f"Skipped {len(self.recording_skipped_keys)} cameras excluded by recording metadata; "
+                  f"{len(self.review_movies)} cameras need review.", flush=True)
         if not self.review_movies:
-            print("No movies to review (empty folder, or everything already in exclusions.csv).")
+            print("No movies to review (empty folder, already reviewed, or excluded by recording metadata).")
             return
 
-        # Use AUTOSIZE to keep mouse coordinates aligned with the displayed image.
-        # (We already scale frames down to a screen-friendly size internally.)
+        # AUTOSIZE keeps mouse coordinates aligned with the internally scaled image.
         cv2.namedWindow("moviechecker", cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback("moviechecker", self._mouse_callback)
 
@@ -434,6 +464,7 @@ class MovieCheckerApp:
                 playback_stride=self._playback_stride,
                 frame_pos=frame_pos,
                 frame_count=frame_count,
+                recording_excluded_chambers=self._recording_flags,
             )
 
             cv2.imshow("moviechecker", disp)

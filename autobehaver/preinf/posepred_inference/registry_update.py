@@ -1,19 +1,13 @@
-"""Project-registry update for the posepred inference stage.
+"""Record PosePred prediction paths and verified model identities in the registry.
 
-Posepred inference consumes per-animal normalized feature HDF5s (produced by keyprenorm)
-and produces per-frame inference CSVs (probabilities + predicted labels).
-
-In the Autobehaver pipeline we store, for each animal/cropped movie:
-  * ``posepred_inference_csv_relpath`` -> path to the main inference CSV
-  * ``posepred_models``               -> model checkpoint(s) used for inference (ensemble)
-
-This helper is called once per posepred inference run (in the parent process)
-to avoid multiprocessing contention.
+Update once in the parent process to avoid worker contention.
 """
 
 from __future__ import annotations
 
 import logging
+import json
+from autobehaver.portable_paths import prediction_path
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, Set, List
@@ -39,7 +33,7 @@ def update_registry_from_posepred_inference_outputs(
     lock_timeout_sec: int = 120,
     lock_stale_sec: int = 3600,
 ) -> None:
-    """Upsert posepred inference outputs into the project registry."""
+    """Upsert prediction paths, preferring checkpoint identities from verified provenance."""
 
     registry_csv = Path(registry_csv).expanduser().resolve()
     project_root = Path(project_root).expanduser().resolve()
@@ -69,7 +63,7 @@ def update_registry_from_posepred_inference_outputs(
 
     inference_dir = (output_root / "inferences") if use_inferences_subdir else output_root
 
-    # Models string (human readable) – store basenames to keep CSV manageable.
+    # Store checkpoint basenames in the registry; full identities remain in provenance.
     models_str: Optional[str] = None
     if model_paths:
         try:
@@ -99,7 +93,7 @@ def update_registry_from_posepred_inference_outputs(
         if not rid:
             continue
 
-        out_path = inference_dir / _expected_inference_name(inp)
+        out_path = prediction_path(inp, inference_dir)
         if not out_path.exists():
             continue
 
@@ -110,13 +104,32 @@ def update_registry_from_posepred_inference_outputs(
             out_res = str(out_path)
         is_new = out_res not in existing_outputs_before
 
+        # Regenerated outputs can reuse a path; verified provenance identifies
+        # the checkpoint content that actually produced them.
+        actual_models = None
+        manifest = Path(str(out_path) + '.provenance.json')
+        if manifest.is_file():
+            from autobehaver.inference import _completed_inference_matches
+            from autobehaver.atomic_io import sha256_file
+            try:
+                metadata = json.loads(manifest.read_text(encoding='utf-8'))
+                checkpoint_records = metadata.get('inputs', {}).get('checkpoints', [])
+                if (metadata.get('fingerprint_sha256') and checkpoint_records
+                    and metadata.get('inputs', {}).get('source_hdf5', {}).get('sha256') == sha256_file(inp)
+                    and _completed_inference_matches(str(manifest), metadata)):
+                    actual_models = ';'.join(Path(item['path']).name for item in checkpoint_records)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+
         row: dict[str, Any] = {
             "recording_id": rid,
             "posepred_inference_csv_relpath": relpath_str(out_path, project_root),
             "updated_at": now,
         }
 
-        if models_str and (not only_set_models_if_new or is_new):
+        if actual_models:
+            row['posepred_models'] = actual_models
+        elif models_str and (not only_set_models_if_new or is_new):
             row["posepred_models"] = models_str
 
         rows.append(row)

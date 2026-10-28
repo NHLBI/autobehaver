@@ -18,6 +18,15 @@ def _build_small_staged_analysis(tmp_path: Path) -> Path:
 
     matrix_path = matrix_dir / "MASTER_FEATURE_MATRIX.csv"
     _write_small_master_matrix(matrix_path)
+    # Postanalysis tests need a genuine positive-weight committee. A null
+    # four-tree fixture cannot stand in for completed weighted results.
+    fixture = pd.read_csv(matrix_path)
+    for feature in [c for c in fixture if c.startswith(('BoutSummary_', 'StdMeasure_', 'Kinematic_', 'Spatial_'))]:
+        fixture[feature] = np.where(fixture['group'].eq('A'), -4., 4.) + np.arange(len(fixture)) * .001
+    fixture.to_csv(matrix_path,index=False)
+    copied = fixture.copy()
+    copied['individual'] = copied['individual'].astype(str) + '_repeat'
+    pd.concat([fixture,copied],ignore_index=True).to_csv(matrix_path,index=False)
 
     settings = {
         "analysis_run_name": "postanalysis",
@@ -28,7 +37,7 @@ def _build_small_staged_analysis(tmp_path: Path) -> Path:
         "training_group_a": "A",
         "training_group_b": "B",
         "num_workers": 1,
-        "n_estimators": 4,
+        "n_estimators": 20,
         "learning_rate": 0.2,
         "max_depth": 2,
         "n_splits": 2,
@@ -101,7 +110,7 @@ def test_postanalysis_runner_fsea_stage_uses_core_bundle(monkeypatch, tmp_path: 
         out_dir = Path(paths["analysis_folder"]) / "FSEA"
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "dummy.txt").write_text("ok")
-        return None
+        return {'status':'completed','artifact_paths':[str(out_dir/'dummy.txt')]}
 
     monkeypatch.setattr(
         "autobehaver.postinf.featureimp.postanalysis_runner._perform_fsea_analysis",
@@ -116,8 +125,8 @@ def test_postanalysis_runner_fsea_stage_uses_core_bundle(monkeypatch, tmp_path: 
     )
     assert out == str(analysis_dir)
     assert len(calls) == 1
-    assert calls[0]["oof_shape"][0] == 12
-    assert calls[0]["all_shape"][0] == 12
+    assert calls[0]["oof_shape"][0] == 24
+    assert calls[0]["all_shape"][0] == 24
 
     post_idx = json.loads((analysis_dir / "POSTANALYSIS_INDEX.json").read_text())
     stage_map = {row["stage"]: row for row in post_idx["stages"]}

@@ -1,4 +1,4 @@
-"""Correctness checks for cleaned FSEA feature grouping utilities."""
+"""Check FSEA group membership and pruning rules."""
 
 from __future__ import annotations
 
@@ -28,13 +28,12 @@ def test_generate_bout_timebudget_groups_cleaned_surface() -> None:
     assert all(not k.startswith('Orient_All_') for k in groups)
 
 
-def test_generate_kinematic_groups_include_tw_prune_redundant_hybrids_and_fix_head_jerk() -> None:
+def test_generate_kinematic_groups_prune_redundant_hybrids_and_fix_head_jerk() -> None:
     from autobehaver.postinf.featureimp.fsea import _generate_kinematic_groups
 
     feats = [
         'KinematicBB_Pose+Orient_Groom-Abdomen+Floor_backleg_velocity_max_mean',
         'KinematicBB_Pose+Orient_Groom-Abdomen+Floor_frontleg_velocity_max_mean',
-        'KinematicTW_Pose+Orient_Groom-Abdomen+Floor_backleg_velocity_mean',
         'KinematicBB_Pose+Orient_Standing+Floor_frontleg_velocity_max_mean',
         'KinematicBB_Pose+Orient_Standing+Floor_midleg_velocity_max_mean',
         'KinematicBB_Pose+Orient_Standing+Floor_backleg_velocity_max_mean',
@@ -51,19 +50,17 @@ def test_generate_kinematic_groups_include_tw_prune_redundant_hybrids_and_fix_he
     ]
     groups = _generate_kinematic_groups(feats)
     all_grouped = {f for vals in groups.values() for f in vals}
-    # TW features should join the same kinematic grouping universe.
-    assert 'KinematicTW_Pose+Orient_Groom-Abdomen+Floor_backleg_velocity_mean' in all_grouped
     # Implausible front-leg abdomen grooming pairing should be pruned.
     assert 'Kinematic_Groom-Abdomen_FrontLeg' not in groups
     # Standing legs should collapse into LegMove.
     assert 'Kinematic_Standing_LegMove' in groups
     assert 'Kinematic_Standing_FrontLeg' not in groups
-    # head_jerk should now contribute to the Head family.
+    # Head jerk belongs to the Head family.
     assert 'Kinematic_Groom-Head_Head' in groups
     assert 'KinematicBB_Pose+Orient_Groom-Head+Floor_head_jerk_mean_mean' in groups['Kinematic_Groom-Head_Head']
     assert 'Kinematic_Walking_Head' in groups
     assert 'KinematicBB_Pose+Orient_Walking+Floor_head_jerk_mean_mean' in groups['Kinematic_Walking_Head']
-    # Scramble/Jump should use dedicated hybrid groups without redundant body-movement-only subgroups.
+    # Scramble/Jump use dedicated hybrid groups without redundant movement groups.
     assert 'PoseStatsKinematic_Scramble' in groups
     assert 'BoutSummary_Pose_Scramble_bout_frequency' in groups['PoseStatsKinematic_Scramble']
     assert 'KinematicBB_Pose+Orient_Scramble_speed_mean_mean' in groups['PoseStatsKinematic_Scramble']

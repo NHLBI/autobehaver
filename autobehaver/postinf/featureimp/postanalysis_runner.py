@@ -1,14 +1,7 @@
-"""Standalone FeatureImp side-analysis runner.
+"""Run standalone FeatureImp postanalyses from verified completed runs.
 
-This module lets retained downstream analyses run as independent jobs
-or as automatic reference post-merge steps.
-
-Design goals
-------------
-- Keep the staged core path lean.
-- Reuse existing analysis implementations with minimal behavioral drift.
-- Record persistent stage status in ``POSTANALYSIS_INDEX.json``.
-- Fail loudly for standalone jobs while still writing an error log.
+Restore saved analysis settings, apply explicit overrides, and record outcomes in the
+stage index.
 """
 
 from __future__ import annotations
@@ -33,6 +26,7 @@ from .shard_runner import _json_load, _load_settings_snapshot
 from .final_merge import MERGE_DIRNAME, FINAL_MERGE_DONE_FILENAME, FINAL_POSTANALYSIS_BUNDLE_FILENAME
 from .fsea_runner import _perform_fsea_analysis
 from .runtime_settings import FSEARuntimeSettings
+from .integrity import validate_receipt, strict_bool
 
 PLAN_ONLY_POSTANALYSIS_STAGES: Set[str] = {PLAIN_XGBOOST_STAGE_NAME}
 
@@ -42,16 +36,6 @@ POST_FINAL_MERGE_POSTANALYSIS_STAGES: Set[str] = {
 }
 
 ALL_POSTANALYSIS_STAGES: Set[str] = PLAN_ONLY_POSTANALYSIS_STAGES | POST_FINAL_MERGE_POSTANALYSIS_STAGES
-
-
-
-def _preflight_postanalysis_dependencies(analysis_folder_path: str, stage_name: str, settings_snapshot: Mapping[str, Any]) -> None:
-    """Validate dependencies for retained post-analysis stages.
-
-    Removed optional side branches are not preflighted here; retained stages perform their own input validation when run.
-    """
-    return None
-
 
 
 def _safe_relpath(path: Optional[str], start: str) -> Optional[str]:
@@ -87,7 +71,7 @@ def _require_final_merge_done(analysis_folder_path: str) -> Dict[str, Any]:
         raise RuntimeError(
             f"Post-merge stage requires completed final merge, but completion marker was not found: {merge_done_path}"
         )
-    payload = _json_load(merge_done_path)
+    payload = validate_receipt(merge_done_path, analysis_folder_path)
     if not isinstance(payload, dict) or str(payload.get("status", "")).strip().lower() != "completed":
         raise RuntimeError(f"final-merge completion marker is invalid: {merge_done_path}")
     return payload
@@ -151,6 +135,7 @@ def _record_and_raise_stage_failure(
     error: BaseException,
     extra_context: Optional[Mapping[str, Any]] = None,
 ) -> None:
+    """Persist the failed stage status and error context, then propagate its exception."""
     tb = traceback.format_exc()
     log_path = append_postanalysis_error_log(
         analysis_folder=str(analysis_folder_path),
@@ -189,10 +174,16 @@ def _run_logged_stage(
     output_dir: Optional[str] = None,
     extra_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Run a postanalysis callable and persist its success or failure in the stage
+    index.
+    """
     started_at = datetime.now().isoformat(timespec="seconds")
     out_dir = str(output_dir or _postanalysis_output_dir(stage_name, analysis_folder_path, settings_snapshot))
+    result = None
     try:
         result = func()
+        if isinstance(result, Mapping) and result.get('status') in {'failed', 'partial'}:
+            raise RuntimeError(f'Required {stage_name} analysis returned {result["status"]}')
         stage_record: Dict[str, Any] = {
             "stage": str(stage_name),
             "status": "completed",
@@ -204,6 +195,9 @@ def _run_logged_stage(
         if isinstance(result, str) and result.strip():
             stage_record["result_path"] = _safe_relpath(result, str(analysis_folder_path))
         elif isinstance(result, Mapping):
+            if result.get('status') == 'inapplicable':
+                stage_record['status'] = 'inapplicable'
+                stage_record['reason'] = str(result.get('reason', 'No applicable analysis'))
             result_path = result.get("result_path")
             if isinstance(result_path, str) and result_path.strip():
                 stage_record["result_path"] = _safe_relpath(result_path, str(analysis_folder_path))
@@ -231,12 +225,14 @@ def _run_logged_stage(
             started_at=started_at,
             output_dir=out_dir,
             error=e,
-            extra_context=extra_context,
+            extra_context={**dict(extra_context or {}),
+                **({"result": dict(result)} if isinstance(result, Mapping) else {})},
         )
         raise AssertionError("unreachable")
 
 
 def _load_core_postanalysis_bundle(analysis_folder_path: str) -> Dict[str, Any]:
+    """Require the completed core bundle needed by standalone postanalysis."""
     bundle_path = os.path.join(str(analysis_folder_path), MERGE_DIRNAME, FINAL_POSTANALYSIS_BUNDLE_FILENAME)
     if not os.path.exists(bundle_path):
         raise FileNotFoundError(
@@ -253,6 +249,7 @@ def _run_fsea_from_analysis_folder(
     analysis_folder_path: str,
     settings_override: Optional[Mapping[str, Any]] = None,
 ) -> Mapping[str, Any]:
+    """Restore completed SHAP arrays and saved settings for standalone FSEA."""
     loaded = load_featureimp_baseline_context(str(analysis_folder_path))
     settings_snapshot = dict(loaded.get("settings_snapshot") or {})
     effective_settings = dict(settings_snapshot)
@@ -279,9 +276,9 @@ def _run_fsea_from_analysis_folder(
 
     paths = _build_paths(
         str(analysis_folder_path),
-        run_permutation_test=bool(effective_settings.get("run_permutation_test", manifest.get("run_permutation_test", False))),
+        run_permutation_test=strict_bool(effective_settings.get("run_permutation_test", manifest.get("run_permutation_test", False))),
     )
-    _perform_fsea_analysis(
+    fsea_status = _perform_fsea_analysis(
         oof_shap_values=oof_shap_values,
         df_for_training=context["df_for_training"],
         all_feature_names=context["selected_features"],
@@ -297,6 +294,10 @@ def _run_fsea_from_analysis_folder(
     out_dir = os.path.join(str(analysis_folder_path), "FSEA")
     artifact_paths = [out_dir] if os.path.isdir(out_dir) else []
     return {
+        'status': fsea_status['status'],
+        'reason': fsea_status.get('reason'),
+        'plots_complete': fsea_status.get('plots_complete'),
+        'visualization_failures': fsea_status.get('visualization_failures', []),
         "output_dir": out_dir,
         "artifact_paths": artifact_paths,
         "summary": "FSEA outputs updated from saved final SHAP bundle.",
@@ -304,6 +305,7 @@ def _run_fsea_from_analysis_folder(
 
 
 def run_featureimp_postanalysis_stage(*, analysis_folder_path: str, stage_name: str) -> str:
+    """Run one supported postanalysis from a verified completed FeatureImp folder."""
     analysis_dir = _require_analysis_folder(analysis_folder_path)
     stage = str(stage_name or "").strip().lower()
     if stage not in ALL_POSTANALYSIS_STAGES:
@@ -316,7 +318,6 @@ def run_featureimp_postanalysis_stage(*, analysis_folder_path: str, stage_name: 
     if stage in POST_FINAL_MERGE_POSTANALYSIS_STAGES:
         _require_final_merge_done(analysis_dir)
 
-    _preflight_postanalysis_dependencies(analysis_dir, stage, settings_snapshot)
 
     # Baseline jobs already have their own rerun helpers and stage-index updates.
     if stage == PLAIN_XGBOOST_STAGE_NAME:
@@ -326,7 +327,7 @@ def run_featureimp_postanalysis_stage(*, analysis_folder_path: str, stage_name: 
         )
         return analysis_dir
 
-    paths = _build_paths(analysis_dir, run_permutation_test=bool(settings_snapshot.get("run_permutation_test", False)))
+    paths = _build_paths(analysis_dir, run_permutation_test=strict_bool(settings_snapshot.get("run_permutation_test", False)))
 
     if stage == "pca":
         loaded = load_featureimp_baseline_context(str(analysis_dir))
@@ -350,7 +351,7 @@ def run_featureimp_postanalysis_stage(*, analysis_folder_path: str, stage_name: 
                 df_all_groups=df_all,
                 all_feature_names=selected_features,
                 paths=paths,
-                GLOBAL_RANDOM_SEED=int(settings_snapshot.get("GLOBAL_RANDOM_SEED", 7) or 7),
+                GLOBAL_RANDOM_SEED=int(loaded["global_random_seed"]),
                 pca_fixed_k=settings_snapshot.get("pca_fixed_k"),
                 n_pca_components_to_save=int(settings_snapshot.get("n_pca_components_to_save", 0) or 0),
                 training_group_a=training_group_a,

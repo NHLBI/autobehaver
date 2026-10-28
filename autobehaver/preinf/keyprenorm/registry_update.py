@@ -1,20 +1,12 @@
-"""Project-registry update for the keyprenorm stage.
+"""Record normalized feature and parameter paths in the project registry.
 
-Keyprenorm consumes keypre output CSVs (``*_positional_calcs.csv``) and produces
-normalized HDF5 feature matrices (``*_normalized.h5``) plus a normalization
-parameter CSV.
-
-In the Autobehaver pipeline we store, for each animal/cropped movie:
-  * ``keyprenorm_h5_relpath``         -> path to the per-animal normalized H5
-  * ``keyprenorm_params_relpath``     -> path to the normalization parameters CSV
-
-This helper is called once per keyprenorm run (in the parent process) to avoid
-multiprocessing contention.
+Update once in the parent process to avoid worker contention.
 """
 
 from __future__ import annotations
 
 import logging
+from autobehaver.portable_paths import normalized_path
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,7 +15,7 @@ from autobehaver.registry import read_registry, relpath_str, upsert_registry_row
 
 
 def _expected_norm_h5_name(keypre_csv: Path) -> str:
-    """Return the expected normalized H5 filename for a keypre CSV."""
+    """Return the expected normalized HDF5 filename for a KeyPre CSV."""
     name = keypre_csv.name
     if name.lower().endswith(".csv"):
         return name[:-4] + "_normalized.h5"
@@ -40,7 +32,7 @@ def update_registry_from_keyprenorm_outputs(
     lock_timeout_sec: int = 120,
     lock_stale_sec: int = 3600,
 ) -> None:
-    """Upsert keyprenorm outputs into the project registry."""
+    """Upsert KeyPreNorm output and parameter paths for the supplied feature CSVs."""
 
     registry_csv = Path(registry_csv).expanduser().resolve()
     project_root = Path(project_root).expanduser().resolve()
@@ -90,7 +82,7 @@ def update_registry_from_keyprenorm_outputs(
         if not rid:
             continue
 
-        out_path = normalized_h5_dir / _expected_norm_h5_name(inp)
+        out_path = normalized_path(inp, normalized_h5_dir)
         if not out_path.exists():
             continue
 

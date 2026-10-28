@@ -1,14 +1,5 @@
-"""Bout definition and summary feature calculations.
-
-This module contains foundational bout-domain utilities used by mmgen:
-
-- Converting framewise label sequences into bouts.
-- Building "valid" per-frame label arrays from bout lists.
-- Per-bout-type summary feature calculation.
-- Sleep feature calculation (Standing bouts >= threshold).
-
-These functions were extracted into a dedicated module to make the
-pipeline modular while preserving behavior.
+"""Extract valid label bouts and calculate recording-level bout and sleep summaries for
+MMGen.
 """
 
 from __future__ import annotations
@@ -19,11 +10,11 @@ import pandas as pd
 
 
 def extract_bouts_from_label_sequence(label_sequence, min_bout=1, exempt_labels=None):
-    """
-    Given a 1D array-like of labels (e.g., masked_poses), returns a list of bouts.
-    Each bout is a dict: {'start': int, 'end': int, 'label': str}
-    Includes bouts of length >= min_bout, except labels in `exempt_labels`
-    (e.g., 'Jump') which are always kept (threshold = 1).
+    """Extract consecutive nonmissing label runs as bouts with inclusive start and end
+    indices.
+
+    Require min_bout frames, except exempt poses and their combined labels, which
+    require one frame.
     """
     exempt_labels = set(exempt_labels or [])
     bouts = []
@@ -59,6 +50,13 @@ def extract_bouts_from_label_sequence(label_sequence, min_bout=1, exempt_labels=
         if bout_length >= _threshold_for(current_label):
             bouts.append({'start': start_idx, 'end': len(label_sequence) - 1, 'label': current_label})
 
+    known = np.array([pd.notna(v) and v != "" for v in label_sequence], dtype=bool)
+    segments = np.cumsum(known & ~np.r_[False, known[:-1]]) if len(known) else np.array([])
+    for bout in bouts:
+        start, end = bout['start'], bout['end']
+        bout['complete'] = bool(start > 0 and end + 1 < len(known)
+                                and known[start - 1] and known[end + 1])
+        bout['observation_segment'] = int(segments[start])
     return bouts
 
 
@@ -87,121 +85,68 @@ def _build_valid_label_array_from_bouts(bouts, length):
 
 
 def calculate_bout_summary_features(bouts, total_frames, fps=40):
-    """
-    Takes a list of bouts for a single movie and calculates a full suite of summary features.
+    """Summarize complete bouts, retaining all eligible frame time for budgets.
 
-    Args:
-        bouts (list of dicts): The output from extract_bouts_from_label_sequence.
-        total_frames (int): The total number of frames in the analyzed video segment.
-        fps (int): The frames per second of the video, for converting to seconds.
-
-    Returns:
-        pd.DataFrame: A DataFrame where each row is a behavior and columns are the summary features.
+    total_frames is the number of observed labels in this category. Intervals
+    require complete endpoints in the same uninterrupted observation segment.
+    Duration and interval moments allow exact pooling across separate recordings.
     """
     if not bouts:
         return pd.DataFrame()
-
-    # Add a 'length' key to each bout dictionary if not present
-    for bout in bouts:
-        if 'length' not in bout:
-            bout['length'] = bout['end'] - bout['start'] + 1
-
-    total_seconds = total_frames / fps
-    bout_df = pd.DataFrame(bouts)
-
-    # Group bouts by their label to calculate stats per behavior
-    grouped = bout_df.groupby('label')
-    
-    summary_list = []
-    for behavior, group_df in grouped:
-        # --- Basic Stats ---
-        n_bouts = len(group_df)
-        total_length_frames = group_df['length'].sum()
-        mean_length_frames = group_df['length'].mean()
-        std_length_frames = group_df['length'].std(ddof=0) # Use population std
-
-        # --- Refined Features ---
-        bout_frequency = n_bouts / total_seconds if total_seconds > 0 else 0
-        bout_duration_mean_s = mean_length_frames / fps
-        
-        # Coefficient of Variation (CV) for bout duration
-        bout_duration_coeff_of_var = (std_length_frames / mean_length_frames) if mean_length_frames > 0 else 0
-        
-        # Bout Initiation Probability (BIP)
-        available_frames = total_frames - total_length_frames
-        initiation_prob = n_bouts / available_frames if available_frames > 0 else 0
-
-        # Inter-Bout Interval (IBI) Calculation
-        inter_bout_interval_mean_s, inter_bout_interval_std_s = np.nan, np.nan
-        if n_bouts > 1:
-            sorted_bouts = group_df.sort_values('start')
-            # Ensure start/end are numeric before calculation
-            starts = pd.to_numeric(sorted_bouts['start'], errors='coerce')
-            ends = pd.to_numeric(sorted_bouts['end'], errors='coerce')
-
-            # Create slices, explicitly reset index to ensure alignment (0 to N-2)
-            starts_next = starts.iloc[1:].reset_index(drop=True)
-            ends_current = ends.iloc[:-1].reset_index(drop=True)
-
-            # Check for NaNs *after* resetting index
-            # valid_ibis will now be aligned and have length N-1
-            valid_ibis_mask = starts_next.notna() & ends_current.notna()
-
-            # Convert the mask to a NumPy boolean array
-            valid_ibis_np = valid_ibis_mask.to_numpy()
-
-            if valid_ibis_np.any():
-                # Convert data slices to NumPy arrays
-                s_vals = starts_next.to_numpy()
-                e_vals = ends_current.to_numpy()
-
-                # Filter using the NumPy boolean mask - lengths should now match
-                ibis = s_vals[valid_ibis_np] - e_vals[valid_ibis_np]
-
-                # Ensure IBIs are non-negative, filter out invalid values
-                ibis_s = ibis[ibis >= 0] / fps
-                if ibis_s.size > 0:
-                     inter_bout_interval_mean_s = np.mean(ibis_s)
-                     # Calculate std only if there's more than one valid IBI
-                     inter_bout_interval_std_s = np.std(ibis_s) if ibis_s.size > 1 else 0.0
-                     # Ensure std is not NaN if size is 1
-                     inter_bout_interval_std_s = inter_bout_interval_std_s if pd.notna(inter_bout_interval_std_s) else 0.0
-                else: # Handle cases where all ibis were negative or filtered out
-                     inter_bout_interval_mean_s, inter_bout_interval_std_s = 0.0, 0.0 # Or np.nan, np.nan depending on desired output
-
-        summary_list.append({
-            'bout_type': behavior,
-            'bout_frequency': bout_frequency,
-            'bout_duration_mean_s': bout_duration_mean_s,
-            'bout_duration_coeff_of_var': bout_duration_coeff_of_var,
-            'inter_bout_interval_mean_s': inter_bout_interval_mean_s,
-            'inter_bout_interval_std_s': inter_bout_interval_std_s,
-            'initiation_prob': initiation_prob,
-            'n_bouts': n_bouts,
-            'total_length_frames': total_length_frames
-        })
-
-    return pd.DataFrame(summary_list)
+    frame = pd.DataFrame([dict(b, length=b['end'] - b['start'] + 1) for b in bouts])
+    if 'complete' not in frame:
+        frame['complete'] = True
+    if 'observation_segment' not in frame:
+        frame['observation_segment'] = 0
+    rows = []
+    for label, all_bouts in frame.groupby('label'):
+        complete = all_bouts[all_bouts['complete']].sort_values('start')
+        durations = complete['length'].to_numpy(dtype=float) / fps
+        intervals = []
+        for _, segment in all_bouts.sort_values('start').groupby('observation_segment', sort=False):
+            records = segment.to_dict('records')
+            for left, right in zip(records, records[1:]):
+                if left['complete'] and right['complete']:
+                    intervals.append((right['start'] - left['end']) / fps)
+        intervals = np.asarray(intervals, dtype=float)
+        n = len(durations)
+        mean = float(durations.mean()) if n else np.nan
+        total_length = float(all_bouts['length'].sum())
+        seconds = total_frames / fps
+        rows.append(dict(
+            bout_type=label, n_bouts=n, total_length_frames=total_length,
+            observed_frames=float(total_frames), observed_seconds=float(seconds),
+            duration_sum_s=float(durations.sum()), duration_sumsq_s=float(np.square(durations).sum()),
+            interval_count=len(intervals), interval_sum_s=float(intervals.sum()),
+            interval_sumsq_s=float(np.square(intervals).sum()),
+            bout_frequency=n / seconds if seconds > 0 else np.nan,
+            bout_duration_mean_s=mean,
+            bout_duration_coeff_of_var=float(durations.std(ddof=0)) / mean if n and mean > 0 else np.nan,
+            initiation_prob=n / (total_frames - total_length) if total_frames > total_length else np.nan,
+            inter_bout_interval_mean_s=float(intervals.mean()) if len(intervals) else np.nan,
+            inter_bout_interval_std_s=float(intervals.std(ddof=0)) if len(intervals) else np.nan,
+        ))
+    return pd.DataFrame(rows)
 
 
 def calculate_sleep_features(bouts, total_frames, fps=40, sleep_threshold_frames=7200):
-    """
-    Calculates sleep-specific features for Standing bouts >= sleep_threshold_frames.
-    
+    """Calculate sleep-specific features for Standing bouts >= sleep_threshold_frames.
+
     Sleep is defined as Standing bouts (pose-only or pose+orient) that last at least
     sleep_threshold_frames (default: 7200 frames = 3 minutes at 40fps).
-    
+
     Args:
         bouts: List of bout dictionaries with 'start', 'end', 'label', and optionally 'bout_type'
         total_frames: Total frames in video
         fps: Frames per second (default: 40)
         sleep_threshold_frames: Minimum frames to be considered sleep (default: 7200)
-    
+
     Returns:
         pd.DataFrame: One row per Standing bout type (Standing, Standing+Floor, etc.)
                      with columns: bout_type, n_sleep_bouts, sleep_bout_duration_mean_s,
                      sleep_bout_duration_std_s, total_sleep_time_s, total_length_frames, sleep_time_budget
     """
+    bouts = [b for b in bouts if b.get('complete', True)]
     if not bouts:
         return pd.DataFrame()
     
@@ -275,8 +220,4 @@ def calculate_sleep_features(bouts, total_frames, fps=40, sleep_threshold_frames
 
 
 
-# ============================================================================
-# DOWNSTREAM ANALYSIS MODULES
-# ============================================================================
 
-# 2 Time Budgets

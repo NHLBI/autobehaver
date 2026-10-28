@@ -1,10 +1,4 @@
-"""Training namespace for pose prediction.
-
-This package exposes the organized pose prediction training entrypoints. Core
-training functions are loaded lazily so commands such as
-``python -m autobehaver.training --help`` do not import the full Torch/sklearn
-training stack just to display CLI help.
-"""
+"""Expose PosePred training helpers lazily to keep CLI help lightweight."""
 
 from __future__ import annotations
 

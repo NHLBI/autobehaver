@@ -1,25 +1,8 @@
-"""autobehaver.postinf.featureimp.logit_ensemble
+"""Aggregate binary specialist predictions by averaging raw margins before applying
+sigmoid.
 
-Helpers for aggregating specialist-committee predictions in **logit space**.
-
-Why this exists
----------------
-The FeatureImp committee trains many XGBoost specialists (subset x fold).
-Historically, the pipeline averaged *probabilities* across models. For
-probabilistic classifiers, the more principled aggregation is to average the
-*raw margins / logits* and then apply the sigmoid (for binary problems).
-
-This module also supports optional **subset-level weighting** (one weight per
-feature subset), which is computed elsewhere (see `subset_weighting.py`).
-
-Important constraints
----------------------
-- Binary classification only (training_group_a -> class0, training_group_b -> class1)
-- Weighting is applied at the **subset** level:
-    * OOF (training): each subset contributes exactly one fold's prediction per sample.
-    * All-groups (non-training): each subset contributes the mean across its folds.
-
-This module intentionally does *not* touch SHAP aggregation.
+Group A is class 0 and group B is class 1; optional weights apply per complete feature
+subset.
 """
 
 from __future__ import annotations
@@ -28,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import os
+from .integrity import strict_bool
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -37,7 +21,7 @@ from .permutation import _generate_sex_class_stratified_permutation
 
 
 def _sigmoid_stable(x: np.ndarray) -> np.ndarray:
-    """Numerically-stable sigmoid for float arrays."""
+    """Apply a numerically stable sigmoid to raw margins."""
 
     x = np.asarray(x, dtype=np.float64)
     out = np.empty_like(x, dtype=np.float64)
@@ -46,6 +30,14 @@ def _sigmoid_stable(x: np.ndarray) -> np.ndarray:
     exp_x = np.exp(x[~pos])
     out[~pos] = exp_x / (1.0 + exp_x)
     return out
+
+
+def load_classifier_model(path: str):
+    """Load persisted classifier metadata across sklearn's estimator-tag API change."""
+    model = xgb.XGBClassifier()
+    model._estimator_type = 'classifier'
+    model.load_model(str(path))
+    return model
 
 
 @dataclass
@@ -78,14 +70,16 @@ def load_subset_weights_mapping(weights_csv_path: str) -> Dict[Tuple[int, int], 
         raise ValueError(
             f"Weights CSV missing required columns: {sorted(missing)} (path={weights_csv_path})"
         )
+    if df.duplicated(subset=['h_hit', 'subset_idx']).any():
+        raise ValueError("Duplicate subset identities in weights CSV")
+    weights = pd.to_numeric(df['subset_weight'], errors='raise').to_numpy(dtype=float)
+    if not np.isfinite(weights).all() or np.any(weights < 0):
+        raise ValueError("Subset weights must be nonnegative and finite")
 
     m: Dict[Tuple[int, int], float] = {}
     for _, row in df.iterrows():
         key = (int(row["h_hit"]), int(row["subset_idx"]))
-        try:
-            w = float(row["subset_weight"])
-        except Exception:
-            w = 0.0
+        w = float(row["subset_weight"])
         m[key] = w
     return m
 
@@ -108,7 +102,7 @@ def _iter_relevant_model_records(
         if not isinstance(rec, dict):
             continue
 
-        is_perm = bool(rec.get("is_permuted", False))
+        is_perm = strict_bool(rec.get("is_permuted", False))
         if include_permuted:
             if not is_perm:
                 continue
@@ -138,18 +132,10 @@ def _build_permuted_train_flip_masks(
     permutation_idx: int,
     GLOBAL_RANDOM_SEED: int,
 ) -> Dict[int, np.ndarray]:
-    """Reconstruct per-fold TRAIN-sample flip masks for permuted committees.
+    """Reconstruct training-fold label swaps from saved permutation seeds.
 
-    During permutation testing, labels are shuffled *within sex strata* for the
-    training fold only. The original probability-space aggregation flipped the
-    affected TRAIN-fold probabilities back into the original A/B label frame
-    before averaging. When we re-score saved permuted models in logit space, we
-    must apply the same correction by negating the affected raw margins before
-    aggregation.
-
-    Because the permutations are deterministic functions of
-    (GLOBAL_RANDOM_SEED, permutation_idx, h_hit, fold_idx), we can reconstruct
-    the exact per-fold flip masks from the original training labels + sexes.
+    Negate the corresponding margins before aggregation to express in-sample predictions
+    in the original group A/B frame.
     """
 
     y_original_labels_train = np.asarray(y_original_labels_train)
@@ -281,13 +267,11 @@ def compute_logit_ensemble_predictions_from_saved_models(
     if len(records) == 0:
         raise ValueError("No eligible performance records found for logit aggregation.")
 
-    # ------------------------------------------------------------------
     # Group records by (h_hit, subset_idx) and enforce **subset completeness**.
     #
     # A "subset" is only usable if we have all folds (0..n_splits-1) and all
     # corresponding model files exist. This prevents silent drift where the
     # ensemble aggregates partial subsets (e.g., when some workers failed).
-    # ------------------------------------------------------------------
     subsets: Dict[Tuple[int, int], Dict[int, Dict[str, Any]]] = {}
     for rec in records:
         try:
@@ -301,8 +285,9 @@ def compute_logit_ensemble_predictions_from_saved_models(
         key = (h_hit, subset_idx)
         if key not in subsets:
             subsets[key] = {}
-        # If duplicate fold records exist, keep the first.
-        subsets[key].setdefault(fold_idx, rec)
+        if fold_idx in subsets[key]:
+            raise ValueError(f"Duplicate saved-model fold identity: {key}, fold {fold_idx}")
+        subsets[key][fold_idx] = rec
 
     # Fold indices are deterministic per h_hit seed.
     folds_by_hhit: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
@@ -342,8 +327,7 @@ def compute_logit_ensemble_predictions_from_saved_models(
     for (h_hit, subset_idx), fold_map in sorted(subsets.items()):
         # Require folds 0..n_splits-1 for subset completeness.
         if len(fold_map) != int(n_splits) or any(i not in fold_map for i in range(int(n_splits))):
-            skipped_incomplete_subsets += 1
-            continue
+            raise ValueError(f"Saved-model subset {(h_hit, subset_idx)} lacks its complete folds")
 
         # Resolve + validate feature list (must be consistent across folds).
         features = None
@@ -365,8 +349,9 @@ def compute_logit_ensemble_predictions_from_saved_models(
                     features = None
                     break
         if features is None:
-            skipped_bad_feature_subsets += 1
-            continue
+            raise ValueError(f"Saved-model subset {(h_hit, subset_idx)} has inconsistent feature identities/order")
+        if len(set(features)) != len(features):
+            raise ValueError("Saved-model subset has duplicate features")
 
         # Ensure all model paths exist.
         model_paths: List[str] = []
@@ -378,8 +363,7 @@ def compute_logit_ensemble_predictions_from_saved_models(
                 break
             model_paths.append(str(mp))
         if missing:
-            skipped_missing_model_subsets += 1
-            continue
+            raise ValueError(f"Saved-model subset {(h_hit, subset_idx)} lacks a required model file")
 
         # Folds for this h_hit (deterministic per seed).
         if h_hit not in folds_by_hhit:
@@ -418,19 +402,18 @@ def compute_logit_ensemble_predictions_from_saved_models(
         for fold_idx in range(int(n_splits)):
             try:
                 train_idx, test_idx = folds_by_hhit[h_hit][fold_idx]
-            except Exception:
-                # Should not happen for deterministic folds; treat as subset-invalid.
-                missing = True
-                break
+            except Exception as exc:
+                raise ValueError("Saved-model subset lacks its required fold indices") from exc
 
-            model = xgb.XGBClassifier()
-            model.load_model(model_paths[fold_idx])
+            model = load_classifier_model(model_paths[fold_idx])
 
             margin_train_full = model.predict(X_train_sub, output_margin=True)
             margin_all_full = model.predict(X_all_sub, output_margin=True)
 
             margin_train_full = np.asarray(margin_train_full, dtype=np.float64)
             margin_all_full = np.asarray(margin_all_full, dtype=np.float64)
+            if margin_train_full.shape != (n_train,) or margin_all_full.shape != (n_all,) or not np.isfinite(margin_train_full).all() or not np.isfinite(margin_all_full).all():
+                raise ValueError("Required saved-model margins have invalid shape/nonfinite values")
 
             # For permuted committees, TRAIN-fold margins must be negated for the
             # samples whose labels were swapped during training so the aggregated

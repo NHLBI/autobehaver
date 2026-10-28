@@ -16,30 +16,52 @@ authors = [
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
-# Runtime dependencies are managed by the files in environment/ because this
-# project uses Conda-sensitive packages such as PyTorch, OpenCV, TensorFlow, and
-# DeepLabCut. `python -m pip install -e .` is therefore used to register the
-# local source tree as an editable package after the Conda environment exists;
-# it is not the primary dependency solver for Autobehaver.
+# environment/ pins the scientific stack. Editable installation registers
+# the source package after that environment has been created.
 dependencies = []
 
 [project.optional-dependencies]
+desktop = ["PySide6>=6.6,<7", "paramiko>=3.4,<5"]
+monitoring = [
+  "psutil>=5.9,<8",
+  "nvidia-ml-py>=12,<14",
+]
 dev = [
-  "pytest>=8",
+  "pytest==8.4.1",
+  "pytest-cov==7.1.0",
 ]
 
 [project.scripts]
 autobehaver = "autobehaver.__main__:main"
+autobehaver-desktop = "autobehaver.desktop:main"
+
+[tool.setuptools]
+include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["autobehaver*"]
+exclude = ["autobehaver.resources", "autobehaver.resources.*"]
 
 [tool.setuptools.package-data]
-autobehaver = ["resources/**/*"]
+autobehaver = ["preinf/keypre/feature_schema.json", "postinf/mmgen/feature_schema_catalog.json"]
 
 [tool.setuptools.dynamic]
 version = {attr = "autobehaver._version.__version__"}
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: native model or feature-analysis integration checks",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["autobehaver"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

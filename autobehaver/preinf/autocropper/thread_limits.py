@@ -1,10 +1,4 @@
-"""Thread-limit helpers for autocropper.
-
-The autocropper stage fans out over Python processes, chamber-crop threads,
-OpenCV decoders, ffmpeg subprocesses, and native math libraries. On shared HPC
-nodes that can accidentally create far more runnable threads than Slurm allocated.
-This module centralizes conservative thread caps before heavy libraries are used.
-"""
+"""Limit native-library and decoder threads within Autocropper workers."""
 
 from __future__ import annotations
 
@@ -36,18 +30,10 @@ def configure_native_threading(
     overwrite: bool = False,
     configure_cv2: bool = True,
 ) -> int:
-    """Set conservative native-thread limits and return the effective value.
+    """Set native-library thread limits and return the requested positive cap.
 
-    Parameters
-    ----------
-    native_threads:
-        Number of native threads to allow for libraries such as OpenMP, MKL,
-        OpenBLAS, and OpenCV. Values below 1 are coerced to 1.
-    overwrite:
-        If False, existing environment variables are left alone. This lets users
-        override the cap from the shell. If True, this function enforces the cap.
-    configure_cv2:
-        If True, also call ``cv2.setNumThreads`` when OpenCV is importable.
+    Preserve existing environment settings unless overwrite is true. Apply the
+    OpenCV cap separately when configure_cv2 is true and OpenCV is available.
     """
 
     n_threads = _positive_int(native_threads, default=1)
@@ -74,3 +60,17 @@ def configure_native_threading(
             pass
 
     return n_threads
+
+
+def open_video_capture(video_path):
+    """Open a movie with a bounded FFmpeg decoder thread pool.
+
+    OpenCV's image-operation thread limit does not cap VideoCapture decoding;
+    CAP_PROP_N_THREADS must be supplied when opening the capture.
+    """
+    import cv2
+
+    threads = _positive_int(os.environ.get("OPENCV_FOR_THREADS_NUM"), default=1)
+    return cv2.VideoCapture(
+        str(video_path), cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, threads]
+    )

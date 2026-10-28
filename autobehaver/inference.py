@@ -1,19 +1,43 @@
-"""Inference pipeline for pose/orientation prediction.
+"""Run PosePred checkpoint ensembles and publish aligned per-frame predictions.
 
-Loads one or more trained checkpoints, runs prediction over all files in a directory, applies
-optional smoothing, and writes per-frame inference CSV outputs. Supports ensembles and test-time
-augmentation."""
+Support optional noise-augmented averaging, per-model context vectors and
+label smoothing while preserving original-movie frame identity.
+"""
 
 from __future__ import annotations
 
+from autobehaver.cli_summary import reported_stage, completion_details
+
+from autobehaver.progress import progress
+
 import os
+import hashlib
+import json
 import shutil
 import sys
 import time
-from datetime import datetime
-from typing import List, Optional, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, List, Optional, Tuple
 
+from .preinf.frame_identity import h5_frame_timeline
+from autobehaver.portable_paths import original_name, prediction_path
 import h5py
+from .completion import verified_run, current_identity_scope, file_signature
+
+
+def load_inference_checkpoint(path):
+    """Deserialize each inference checkpoint once; discard training-only state."""
+    signature = file_signature(path)
+    scope = current_identity_scope()
+    cache = scope.setdefault('inference_checkpoints', {}) if scope is not None else {}
+    if signature not in cache:
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        for key in ('optimizer_state_dict', 'scheduler_state_dict', 'scaler_state_dict',
+                    'swa_runtime_state', 'training_runtime_state', 'pretraining_runtime_state'):
+            checkpoint.pop(key, None)
+        cache[signature] = checkpoint
+    return cache[signature]
 import numpy as np
 import pandas as pd
 import torch
@@ -24,8 +48,11 @@ from torch.utils.data import DataLoader
 from .model import PosePredTransformer
 from .datasets import KeypointsDataset
 from .checkpoint import load_checkpoint_model
-from .augmentation import augment_features, select_columns_for_augmentation
+from .augmentation import augment_inference_features, select_columns_for_augmentation, TTA_RANDOM_ALGORITHM
 from .feature_selection import FeaturePlan, compute_schema_hash
+from ._version import __version__
+from .atomic_io import atomic_write_dataframe_csv, atomic_write_json, sha256_file
+from .resource_monitor import record_settings, record_work
 
 __all__ = ['_validate_class_dict', '_labels_by_index_from_class_dict', '_build_reorder_indices', 'check_ensemble_compatibility_and_get_permutations', 'run_inference', 'prepare_data_inference', 'load_model_for_inference', 'perform_inference', 'smooth_bouts_vectorized']
 
@@ -34,14 +61,12 @@ def _validate_class_dict(class_dict: dict, dict_name: str, model_name: str) -> N
     if not isinstance(class_dict, dict) or len(class_dict) == 0:
         raise ValueError(f"{model_name}: Missing or empty {dict_name}_dict in checkpoint. Cannot ensemble safely.")
 
-    # Basic type checks
     for k, v in class_dict.items():
         if not isinstance(k, str):
             raise ValueError(f"{model_name}: {dict_name}_dict has a non-string key: {repr(k)}")
         if not isinstance(v, int):
             raise ValueError(f"{model_name}: {dict_name}_dict has a non-int value for key '{k}': {repr(v)}")
 
-    # Index integrity checks (unique + contiguous 0..C-1)
     values = list(class_dict.values())
     if len(set(values)) != len(values):
         raise ValueError(f"{model_name}: {dict_name}_dict indices are not unique. Found duplicates.")
@@ -87,7 +112,6 @@ def _build_reorder_indices(
     ref_labels_by_index = _labels_by_index_from_class_dict(reference_dict, dict_name=dict_name, model_name="Reference")
     _validate_class_dict(model_dict, dict_name=dict_name, model_name=model_name)
 
-    # Ensure label sets match
     ref_labels = set(reference_dict.keys())
     model_labels = set(model_dict.keys())
     if ref_labels != model_labels:
@@ -101,7 +125,6 @@ def _build_reorder_indices(
 
     reorder = [model_dict[lbl] for lbl in ref_labels_by_index]
 
-    # Validate it's a true permutation
     expected = set(range(len(reference_dict)))
     if set(reorder) != expected or len(reorder) != len(reference_dict):
         raise ValueError(
@@ -116,30 +139,19 @@ def check_ensemble_compatibility_and_get_permutations(
     reference_pose_dict: dict[str, int],
     reference_orient_dict: dict[str, int],
 ) -> Tuple[dict, List[Optional[List[int]]], List[Optional[List[int]]]]:
-    """
-    Loads all checkpoints (CPU) and validates that they are ensemble compatible.
+    """Validate ensemble model/input schemas and align each class-logit order.
 
-    Why this exists:
-      - Ensembling assumes 'logit column i' means the SAME class for every model.
-      - If two checkpoints use different label->index mappings, averaging logits silently corrupts results.
-
-    This function enforces compatibility and returns per-model permutations that align each model's
-    logits into the *reference* class-index ordering.
-
-    Returns:
-      reference_global_vars,
-      pose_permutations: list aligned with checkpoint_paths, each is None (identity) or a list[int]
-      orient_permutations: same as above
+    Return reference metadata plus pose/orientation permutations in checkpoint
+    order. None denotes identity. Average only after class-index meanings match.
     """
     if not checkpoint_paths:
         raise ValueError("No model checkpoints were provided for inference.")
 
-    # Load all checkpoints to CPU and collect minimal metadata
     metas = []
     for p in checkpoint_paths:
         if not os.path.isfile(p):
             raise FileNotFoundError(f"Inference checkpoint not found: {p}")
-        ckpt = torch.load(p, map_location='cpu')
+        ckpt = load_inference_checkpoint(p)
         gv = ckpt.get('global_vars', {})
         if not gv:
             raise ValueError(f"{os.path.basename(p)}: Missing 'global_vars' in checkpoint. Cannot validate ensemble compatibility.")
@@ -154,27 +166,24 @@ def check_ensemble_compatibility_and_get_permutations(
     ref_gv = metas[0]['global_vars']
     ref_name = metas[0]['name']
 
-    # Reference flags / shapes that MUST match for this script's inference pipeline
+    # Ensemble members must share enabled heads and input shape.
     ref_pose_pred = bool(ref_gv.get('pose_pred', False))
     ref_orient_pred = bool(ref_gv.get('orient_pred', False))
     ref_sequence_length = ref_gv.get('sequence_length', None)
     ref_num_features = ref_gv.get('num_features', None)
 
-    # Feature schema validation (prevents silent semantic corruption when num_features matches but
-    # the *meaning/order* of columns differs).
+    # Equal feature width alone does not establish equal feature meanings/order.
     ref_schema_hash = ref_gv.get('feature_schema_hash', None)
     if ref_schema_hash is None:
         ref_inc = ref_gv.get('feature_columns_included', None)
         if isinstance(ref_inc, (list, tuple)) and len(ref_inc) > 0:
             ref_schema_hash = compute_schema_hash([str(x) for x in ref_inc])
 
-    # Sanity: if reference says it predicts a head, we require a non-empty dict
     if ref_pose_pred and len(reference_pose_dict) == 0:
         raise ValueError(f"Reference model '{ref_name}' has pose_pred=True but pose_dict is empty.")
     if ref_orient_pred and len(reference_orient_dict) == 0:
         raise ValueError(f"Reference model '{ref_name}' has orient_pred=True but orient_dict is empty.")
 
-    # Validate the reference dicts themselves
     if ref_pose_pred:
         _validate_class_dict(reference_pose_dict, dict_name='pose', model_name='Reference')
     if ref_orient_pred:
@@ -194,7 +203,6 @@ def check_ensemble_compatibility_and_get_permutations(
         name = meta['name']
         gv = meta['global_vars']
 
-        # Hard requirements (shape + enabled heads)
         if bool(gv.get('pose_pred', False)) != ref_pose_pred:
             raise ValueError(
                 f"Ensemble mismatch: '{name}' pose_pred={gv.get('pose_pred', False)} but reference '{ref_name}' pose_pred={ref_pose_pred}."
@@ -214,7 +222,7 @@ def check_ensemble_compatibility_and_get_permutations(
                 "(All ensemble members must ingest the same feature dimension.)"
             )
 
-        # Feature schema hash (optional but recommended; enforce if reference has it)
+        # Require the reference ordered feature schema when one is recorded.
         gv_schema_hash = gv.get('feature_schema_hash', None)
         if gv_schema_hash is None:
             inc = gv.get('feature_columns_included', None)
@@ -239,7 +247,6 @@ def check_ensemble_compatibility_and_get_permutations(
                     "Choose a reference checkpoint with schema metadata or retrain for consistent checkpoint formats."
                 )
 
-        # Build permutations (identity -> None)
         if ref_pose_pred:
             model_pose_dict = meta['pose_dict']
             reorder = _build_reorder_indices(reference_pose_dict, model_pose_dict, dict_name='pose', model_name=name)
@@ -340,13 +347,18 @@ def _discover_inference_input_files(
     if file_filter:
         needle = str(file_filter).lower()
         before = len(file_list)
-        file_list = [p for p in file_list if needle in os.path.basename(p).lower()]
+        file_list = [p for p in file_list if needle in original_name(p).lower()]
         print(f"Applied file_filter='{file_filter}': {len(file_list)}/{before} files selected.")
 
+    from autobehaver.preinf.autocropper.selection import filter_included_paths
+    file_list = filter_included_paths(file_list)
     stem_to_paths: dict[str, list[str]] = {}
     for p in file_list:
-        stem = os.path.splitext(os.path.basename(p))[0]
-        stem_to_paths.setdefault(stem, []).append(p)
+        # The internal prediction buffers currently use input basenames, while
+        # published outputs use resolved original names. Both must be unique.
+        for stem in ("input:" + Path(p).stem.casefold(),
+                     "output:" + Path(original_name(p)).stem.casefold()):
+            stem_to_paths.setdefault(stem, []).append(p)
     collisions = {stem: paths for stem, paths in stem_to_paths.items() if len(paths) > 1}
     if collisions:
         preview = []
@@ -360,6 +372,179 @@ def _discover_inference_input_files(
     return file_list
 
 
+def _provenance_file_identity(path: str) -> dict[str, Any]:
+    resolved = Path(path).expanduser().resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "sha256": sha256_file(resolved),
+    }
+
+
+def _build_inference_provenance(
+    source_path: str,
+    checkpoint_paths: List[str],
+    settings: dict[str, Any],
+    *,
+    checkpoint_identities: Optional[List[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Build the immutable portion of a per-recording inference manifest."""
+    settings = {**settings, 'label_gap_policy': 'matching-internal-flanks-max4-v1'}
+    inputs = {
+        "source_hdf5": _provenance_file_identity(source_path),
+        "checkpoints": checkpoint_identities
+        if checkpoint_identities is not None
+        else [_provenance_file_identity(path) for path in checkpoint_paths],
+    }
+    provenance_payload = {
+        "schema": "autobehaver.posepred_inference.provenance.v1",
+        "autobehaver_version": __version__,
+        "inputs": inputs,
+        "settings": settings,
+    }
+    # Keep the positional source tied to the predictions, even after the
+    # normalized HDF5 has moved to a different storage location.
+    with h5py.File(source_path, "r") as handle:
+        content_identity = handle.attrs.get("content_identity")
+        source_digest = handle.attrs.get("source_positional_sha256")
+        source_location = handle.attrs.get("source_positional_path")
+        if content_identity:
+            if isinstance(content_identity, bytes):
+                content_identity = content_identity.decode("utf-8")
+            metadata = json.loads(str(content_identity))
+            upstream = metadata.get("source")
+            if isinstance(upstream, dict):
+                source_digest = source_digest or upstream.get("sha256")
+                source_location = source_location or upstream.get("path")
+            elif isinstance(upstream, str):
+                source_digest = source_digest or upstream
+        from autobehaver.completion import receipt_path, receipt_matches
+        if receipt_path(source_path).exists() and not receipt_matches(source_path, content_identity):
+            raise ValueError(f"Normalized input does not match its completed processing record: {source_path}")
+    if isinstance(source_digest, bytes):
+        source_digest = source_digest.decode("utf-8")
+    if source_digest:
+        if len(str(source_digest)) != 64 or any(c not in "0123456789abcdef" for c in str(source_digest).lower()):
+            raise ValueError(f"Normalized input contains an invalid positional source fingerprint: {source_path}")
+        provenance_payload["source_positional_sha256"] = str(source_digest)
+        provenance_payload["positional_source"] = {"sha256": str(source_digest)}
+        if source_location:
+            provenance_payload["positional_source"]["path"] = str(source_location)
+    # Paths and mtimes are useful audit context but are deliberately excluded
+    # from the compatibility fingerprint so byte-identical inputs can move.
+    fingerprint_basis = {
+        "schema": provenance_payload["schema"],
+        "autobehaver_version": __version__,
+        "source_hdf5": {
+            "size_bytes": inputs["source_hdf5"]["size_bytes"],
+            "sha256": inputs["source_hdf5"]["sha256"],
+        },
+        "checkpoints": [
+            {"size_bytes": item["size_bytes"], "sha256": item["sha256"]}
+            for item in inputs["checkpoints"]
+        ],
+        "settings": settings,
+    }
+    if source_digest:
+        fingerprint_basis["source_positional_sha256"] = str(source_digest)
+    from autobehaver.completion import code_digest
+    folder = Path(__file__).resolve().parent
+    fingerprint_basis['scientific_code_sha256'] = code_digest([
+        folder/'inference.py', folder/'label_gaps.py', folder/'datasets.py', folder/'model.py',
+        folder/'feature_selection.py', folder/'window_index.py',
+        folder/'augmentation.py', folder/'inference_runtime.py', folder/'checkpoint.py', folder/'preinf/frame_identity.py'])
+    encoded = json.dumps(fingerprint_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {**provenance_payload, "fingerprint_sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _completed_inference_matches(manifest_path: str, expected: dict[str, Any]) -> bool:
+    """Return true only for a compatible manifest whose declared outputs still match."""
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            actual = json.load(handle)
+        if actual.get("status") != "complete":
+            return False
+        if actual.get("fingerprint_sha256") != expected.get("fingerprint_sha256"):
+            return False
+        manifest_dir = Path(manifest_path).resolve().parent
+        outputs = actual.get("outputs")
+        if not isinstance(outputs, list) or not outputs:
+            return False
+        for output in outputs:
+            declared = Path(str(output["path"]))
+            if declared.is_absolute() or ".." in declared.parts:
+                return False
+            candidate = (manifest_dir / declared).resolve()
+            if not candidate.is_relative_to(manifest_dir):
+                return False
+            if not candidate.is_file() or sha256_file(candidate) != output.get("sha256"):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _archive_selected_predictions(source_files, inference_dir, past_inferences_dir):
+    """Move only the selected recordings' predictions and associated details."""
+    inference_dir = Path(inference_dir).resolve()
+    candidates = set()
+    selected_names = {Path(path).name for path in source_files}
+    selected_originals = {original_name(path) for path in source_files}
+    for source in source_files:
+        main = prediction_path(source, inference_dir)
+        candidates.add(main)
+        manifest = Path(str(main) + ".provenance.json")
+        candidates.add(manifest)
+        candidates.add(prediction_path(source, inference_dir / "inference_details", "logits"))
+        if manifest.is_file():
+            try:
+                for entry in json.loads(manifest.read_text(encoding="utf-8")).get("outputs", []):
+                    declared = Path(entry["path"])
+                    if declared.is_absolute() or ".." in declared.parts:
+                        continue
+                    target = (inference_dir / declared).resolve()
+                    if target == main or target == prediction_path(source, inference_dir / "inference_details", "logits"):
+                        candidates.add(target)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+    # Old outputs may not have a manifest. Context HDF5s retain source identity.
+    for path in (inference_dir / "inference_details").rglob("*.h5"):
+        try:
+            with h5py.File(path, "r") as handle:
+                identities = {str(handle.attrs.get(key, "")) for key in ("source_filename", "source_filename_actual")}
+            if identities & (selected_names | selected_originals):
+                candidates.add(path)
+        except (OSError, ValueError):
+            continue
+    existing = sorted((p for p in candidates if p.is_file()), key=str)
+    if not existing:
+        return
+    import uuid
+    archive = Path(past_inferences_dir) / uuid.uuid4().hex[:12]
+    from autobehaver.portable_paths import record_original_name
+    archived = []
+    # Archive artifacts use short flat names. The complete prior path and name
+    # stay in the archive index and original-name maps, avoiding another deeply
+    # nested copy of context-vector and checkpoint folders on Windows.
+    destinations = [archive / f"{index:04d}{path.suffix}" for index, path in enumerate(existing)]
+    if any(len(str(path.absolute())) > 216 for path in destinations):
+        raise ValueError(f"Prediction backup root is too deep for portable output paths: {archive}")
+    for path, destination in zip(existing, destinations):
+        relative = path.relative_to(inference_dir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        full_name = original_name(path)
+        record_original_name(destination, full_name)
+        shutil.move(str(path), str(destination))
+        archived.append({"original_path": str(relative), "original_name": full_name,
+                         "saved_path": str(destination.relative_to(archive))})
+    atomic_write_json({"operation": "selected_prediction_backup", "files": archived}, archive / "archive.json")
+
+
+@reported_stage("PosePred")
+@verified_run
 def run_inference(
     directory: str,
     inference_model_paths: List[str],
@@ -372,57 +557,32 @@ def run_inference(
     use_tta: bool = False,
     tta_noise_level: float = 0.01,
     *,
+    tta_seed: int = 42,
     output_dir: Optional[str] = None,
     file_filter: Optional[str] = None,
     clobber: bool = True,
-    archive_existing: bool = True,
+    archive_existing: bool = False,
     use_inferences_subdir: bool = True,
     explicit_files: Optional[List[str]] = None,
+    memory_gb: Optional[float] = None,
+    noise_workers: int = 0,
+    vram_fraction: float = .8,
 ) -> None:
-    """
-    Orchestrates the complete inference pipeline for a trained transformer model.
-    
-    Execution Flow:
-    
-    1. **Dataset Preparation**
-       - Load checkpoint to extract training configuration (sequence_length, prediction flags)
-       - Create KeypointsDataset with inference mode enabled for sliding window coverage
-       - Extract class dictionaries (pose_dict, orient_dict) for label mapping
-    
-    2. **Model Loading & Setup**
-       - Load PosePredTransformer architecture from checkpoint parameters
-       - Restore trained weights with proper class count configuration
-       - Extract training parameters (pose_pred, orient_pred, recon) for consistency
-       - Set model to evaluation mode and move to GPU if available
-    
-    3. **Data Processing Setup**
-       - Create DataLoader with performance optimizations (pin_memory, persistent_workers)
-       - Configure batch processing for efficient GPU utilization
-       - Print diagnostic information about loaded class dictionaries
-    
-    4. **Inference Execution**
-       - Run perform_inference() with multi-pass averaging for stability
-       - Process all HDF5 files in directory with sliding window sequences
-       - Generate predictions, probabilities, and context vectors per frame
-       - Handle both pose classification and orientation prediction as configured
-    
-    5. **Results Export**
-       - Save detailed CSV files to 'inferences' subdirectory with timestamps
-       - Include frame numbers, logits, probabilities, predicted labels for each sequence
-       - Archive previous inference results to prevent overwriting
-    
-    Key Features:
-    - **Consistency Guarantee**: Uses exact training configuration from checkpoint
-    - **Multi-pass Averaging**: Performs multiple forward passes per input for prediction averaging
-    - **Complete Coverage**: Sliding window approach ensures all frames are processed
-    - **Detailed Output**: Comprehensive CSV files with all prediction metrics
-    - **Automatic Archiving**: Preserves previous inference results with timestamps
+    """Predict selected feature files with one or more validated checkpoints.
+
+    Preserve existing results when clobbering is disabled. Optional backup
+    rotation applies only to selected outputs after inputs/models validate.
+    Process one recording at a time, then publish probabilities, labels,
+    logits, per-model context vectors and provenance. Frames without complete
+    input windows remain blank on the original-movie timeline.
     """
     max_inference_cvs = len(inference_model_paths)
+    if inf_average < 1 or batch < 0 or num_workers < -1:
+        raise ValueError('Inference requires positive pass count, batch >= 0 (auto), workers >= -1 (auto).')
+    if not 0 < vram_fraction <= .9:
+        raise ValueError('vram_fraction must be > 0 and <= 0.9.')
 
-    # ----------------------------------------------------------------------------------
     # Output routing
-    # ----------------------------------------------------------------------------------
     output_root = output_dir if output_dir else directory
     os.makedirs(output_root, exist_ok=True)
 
@@ -435,88 +595,96 @@ def run_inference(
         past_inferences_dir = os.path.join(output_root, 'past_inferences')
         details_dir_for_archive = os.path.join(output_root, 'inference_details')
 
+    completion_details(output=inference_dir)
+    skipped = 0
     # Archiving moves existing outputs away, so non-clobbering runs disable archive rotation.
     if (not clobber) and archive_existing:
         print("[WARN] clobber=False is incompatible with archive_existing=True. Disabling archive_existing.")
         archive_existing = False
 
-    # Archive existing inference outputs before starting the run, including detailed
-    # sidecar outputs that could otherwise become stale across model sets.
-    if archive_existing:
-        os.makedirs(past_inferences_dir, exist_ok=True)
-        if use_inferences_subdir:
-            os.makedirs(inference_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for filename in os.listdir(inference_dir):
-            if not filename.endswith('_inference.csv'):
-                continue
-            file_path = os.path.join(inference_dir, filename)
-            if os.path.isfile(file_path):
-                new_filename = f"{timestamp}_{filename}"
-                shutil.move(file_path, os.path.join(past_inferences_dir, new_filename))
-
-        if os.path.isdir(details_dir_for_archive):
-            archived_details_dir = os.path.join(past_inferences_dir, f"{timestamp}_inference_details")
-            if os.path.exists(archived_details_dir):
-                shutil.rmtree(archived_details_dir, ignore_errors=True)
-            shutil.move(details_dir_for_archive, archived_details_dir)
-
-    # Resolve the exact file set before loading checkpoint metadata.
-    # This matters for pipeline registry usage where explicit input files may live outside `directory`,
-    # and for safety because outputs are written by file stem.
+    # Resolve selected files before models; explicit inputs may be outside the input directory.
     file_list = _discover_inference_input_files(
         directory,
         explicit_files=explicit_files,
         file_filter=file_filter,
     )
+    from autobehaver.preinf.autocropper.selection import propagate_selection
+    propagate_selection([directory] + [str(Path(p).parent) for p in (explicit_files or file_list)], inference_dir)
     if not file_list:
+        completion_details(status="nothing to process")
         print("No files to process (after filtering / selection).")
         return
 
-    # --- Use the first model as the reference for configuration ---
     main_model_path = inference_model_paths[0]
     print(f"Using '{os.path.basename(main_model_path)}' as the reference for model configuration.")
 
-    # Prepare for inference by getting the selected file list and model configuration from the main model
     file_list, pose_dict, orient_dict, columns_to_noise, feature_plan = prepare_data_inference(
         directory=directory,
-        pretrained_model_path=main_model_path, # Use the main model path here
+        pretrained_model_path=main_model_path, 
         num_workers=num_workers,
         inference_mode=True,
         candidate_files=file_list,
     )
 
-    # Keep existing outputs when clobbering is disabled.
+    provenance_settings = {
+        "inf_average": int(inf_average),
+        "sequence_length_argument": int(sequence_length),
+        "min_pose_bout": int(min_pose_bout),
+        "min_orient_bout": int(min_orient_bout),
+        "use_tta": bool(use_tta),
+        "tta_noise_level": float(tta_noise_level),
+        "tta_seed": int(tta_seed),
+        "tta_random_algorithm": TTA_RANDOM_ALGORITHM,
+        "max_inference_cvs": int(max_inference_cvs),
+    }
+    checkpoint_identities = [_provenance_file_identity(path) for path in inference_model_paths]
+    provenance_by_filename = {
+        os.path.basename(path): _build_inference_provenance(
+            path,
+            inference_model_paths,
+            provenance_settings,
+            checkpoint_identities=checkpoint_identities,
+        )
+        for path in file_list
+    }
+
     if not clobber:
         kept: List[str] = []
         skipped = 0
         for fp in file_list:
             stem = os.path.splitext(os.path.basename(fp))[0]
-            expected = os.path.join(inference_dir, f"{stem}_inference.csv")
-            if os.path.exists(expected):
+            expected = str(prediction_path(fp, inference_dir))
+            manifest = expected + ".provenance.json"
+            provenance = provenance_by_filename[os.path.basename(fp)]
+            if os.path.exists(expected) and _completed_inference_matches(manifest, provenance):
                 skipped += 1
             else:
                 kept.append(fp)
         if skipped:
-            print(f"Skipping {skipped} files with existing inference CSVs in: {inference_dir}")
+            print(f"Skipping {skipped} files with complete, matching inference manifests in: {inference_dir}")
         file_list = kept
+        record_work("inference_files", skipped=skipped)
 
     if not file_list:
+        completion_details(status="nothing to process", unit="Files", counts={"processed": 0, "reused": skipped})
         print("No files to process (after filtering / existing-output check).")
         return
 
-    # --- Validate ensemble compatibility and build class-alignment permutations ---
-    # This prevents silent corruption when different checkpoints use different label->index mappings.
+    # Ensemble class-index alignment.
     _, pose_permutations, orient_permutations = check_ensemble_compatibility_and_get_permutations(
         checkpoint_paths=inference_model_paths,
         reference_pose_dict=pose_dict,
         reference_orient_dict=orient_dict,
     )
 
-    # --- Load ALL models for the ensemble ---
+    # Only rotate selected results after the new inputs and model ensemble have been
+    # validated. A bad path or incompatible checkpoint must not move good data.
+    if archive_existing:
+        _archive_selected_predictions(file_list, inference_dir, past_inferences_dir)
+
     print(f"\nLoading {len(inference_model_paths)} models for ensembling...")
     models = []
-    checkpoint = None # To store the checkpoint of the main model
+    checkpoint = None 
     for i, model_path in enumerate(inference_model_paths):
         print(f" -> Loading model {i+1}/{len(inference_model_paths)} from {os.path.basename(model_path)}")
         model, loaded_checkpoint = load_model_for_inference(
@@ -525,37 +693,58 @@ def run_inference(
             orient_dict=orient_dict
         )
         models.append(model)
-        if i == 0: # Save the checkpoint of the first model
+        if i == 0: 
             checkpoint = loaded_checkpoint
     print("All models loaded successfully.")
+    # The models own their copied weights. Keep only checkpoint metadata while
+    # processing movies so large CPU weight tensors do not remain in the cache.
+    scope = current_identity_scope()
+    if scope is not None:
+        for loaded in scope.get('inference_checkpoints', {}).values():
+            loaded.pop('model_state_dict', None)
+        scope.get('inference_checkpoints', {}).clear()
 
 
-    # Extract the actual run parameters from the main model's checkpoint to ensure consistency
     inference_params = checkpoint.get('global_vars', {})
     inf_pose_pred = inference_params.get('pose_pred', False)
     inf_orient_pred = inference_params.get('orient_pred', False)
     inf_recon = inference_params.get('recon', False)
     inf_sequence_length = inference_params.get('sequence_length', sequence_length)
+    record_settings({"sequence_length": int(inf_sequence_length), "model_count": len(models),
+                     "inf_average": int(inf_average), "use_tta": bool(use_tta),
+                     "tta_seed": int(tta_seed), "tta_random_algorithm": TTA_RANDOM_ALGORITHM})
 
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Print label dictionaries before inference.
     print("\nPose Dict before inference:", pose_dict)
     print("Orient Dict before inference:", orient_dict)
 
+    from .inference_runtime import plan_inference
+    tuning_state = {}
     # Process each file individually to conserve RAM
     for i, file_path in enumerate(file_list):
         print(f"\n--- Processing file {i+1}/{len(file_list)}: {os.path.basename(file_path)} ---")
         
         file_start_time = time.time()
 
-        # Create a temporary dataset and dataloader for the current file
+        # Admit source loading and full-timeline result buffers before allocating them.
+        with h5py.File(file_path, 'r') as hf:
+            rows, columns = hf['data'].shape
+            if 'original_frame_count' in hf.attrs:
+                total_frames = int(hf.attrs['original_frame_count'])
+            else:
+                identity = json.loads(hf.attrs.get('content_identity', '{}'))
+                total_frames = rows + int(identity.get('edge_skip', 0))
+        plan = plan_inference(rows=rows, total_frames=total_frames, columns=columns,
+            sequence_length=inf_sequence_length, model_widths=[int(m.d_model) for m in models],
+            classes=len(pose_dict)+len(orient_dict), batch=batch, num_workers=num_workers,
+            noise_workers=noise_workers, memory_gb=memory_gb,
+            use_noise=use_tta and bool(columns_to_noise) and tta_noise_level != 0)
         single_file_dataset = KeypointsDataset(
             directory=directory,
             metadata=[file_path], 
             sequence_length=inf_sequence_length,
-            num_workers=num_workers,
+            num_workers=plan.loader_workers,
             pose_pred=inf_pose_pred,
             orient_pred=inf_orient_pred,
             recon=inf_recon,
@@ -564,58 +753,59 @@ def run_inference(
             ablation_strict=True,
         )
         
-        if len(single_file_dataset) == 0:
-            print("No valid sequences found in this file. Skipping.")
-            continue
+        dataloader = None
+        try:
+            if len(single_file_dataset) == 0:
+                print("No valid sequences found in this file. Skipping.")
+                record_work("inference_files", skipped=1)
+                continue
             
-        dataloader = DataLoader(single_file_dataset, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True)
+            from .datasets import build_dataloader
+            dataloader = build_dataloader(single_file_dataset, batch_size=plan.host_batch, shuffle=False,
+                num_workers=plan.loader_workers, pin_memory=device.type == 'cuda', prefetch_factor=1)
 
-        # --- Pass the list of models to perform_inference ---
-        perform_inference(
-            models, dataloader, device, directory, inf_average, inf_pose_pred, inf_orient_pred, 
-            inf_recon, inf_sequence_length, pose_dict, orient_dict, use_tta, 
-            tta_noise_level, columns_to_noise, 
-            min_pose_bout, min_orient_bout, max_inference_cvs,
-            model_checkpoint_paths=inference_model_paths,
-            pose_permutations=pose_permutations,
-            orient_permutations=orient_permutations,
-            output_dir=output_root,
-            use_inferences_subdir=use_inferences_subdir,
-        )
+            perform_inference(
+                models, dataloader, device, directory, inf_average, inf_pose_pred, inf_orient_pred, 
+                inf_recon, inf_sequence_length, pose_dict, orient_dict, use_tta, 
+                tta_noise_level, columns_to_noise, 
+                min_pose_bout, min_orient_bout, max_inference_cvs,
+                model_checkpoint_paths=inference_model_paths,
+                pose_permutations=pose_permutations,
+                orient_permutations=orient_permutations,
+                output_dir=output_root,
+                use_inferences_subdir=use_inferences_subdir,
+                provenance_by_filename=provenance_by_filename,
+                tta_seed=tta_seed, noise_workers=plan.noise_workers, requested_batch=batch,
+                tuning_state=tuning_state, vram_fraction=vram_fraction,
+            )
         
-        # Clean up memory before processing the next file
-        del single_file_dataset, dataloader
+        finally:
+            store = single_file_dataset.data_in_memory
+            if dataloader is not None:
+                iterator = getattr(dataloader, '_iterator', None)
+                if iterator is not None:
+                    iterator._shutdown_workers()
+                del dataloader
+            if hasattr(store, 'close'):
+                error = sys.exc_info()
+                store.close(error if error[0] is not None else None)
+            del single_file_dataset, store
 
         file_end_time = time.time()
         duration = file_end_time - file_start_time
         print(f"--- File processing completed in {duration:.2f} seconds ---")
 
-    print("\n--- All files processed. Inference complete. ---")
+    completion_details(unit="Files", counts={"processed": len(file_list), "reused": skipped, "failed": 0})
 
 
 def prepare_data_inference(directory: str, pretrained_model_path: str, num_workers: int, 
                            inference_mode: bool = True, candidate_files: Optional[List[str]] = None) -> tuple[list[str], dict[str, int], dict[str, int], list[int], Optional[FeaturePlan]]:
+    """Resolve selected HDF5 files and model/input metadata without building a dataset.
+
+    Return paths, pose/orientation class dictionaries, augmentation-column
+    indices and the ordered feature plan. ``num_workers`` and ``inference_mode``
+    are retained for call compatibility and are not used here.
     """
-    Prepares for inference by gathering file paths and loading configuration from a trained model checkpoint.
-    
-    This function scans the target directory for all HDF5 files and loads critical configuration
-    details (class mappings, augmentation columns, etc.) from the specified model checkpoint
-    to ensure consistency during inference. It does NOT create the dataset itself.
-    
-    Parameters:
-    - directory: Path to directory containing HDF5 data files for inference.
-    - pretrained_model_path: Path to the checkpoint file (.pth) containing model and config.
-    - num_workers: (Not used in this version but kept for signature consistency).
-    - inference_mode: (Not used in this version but kept for signature consistency).
-    
-    Returns:
-    - all_files: A list of full file paths to all HDF5 files found in the directory.
-    - pose_dict: Dictionary mapping pose class names to integer indices.
-    - orient_dict: Dictionary mapping orientation class names to integer indices.
-    - columns_to_noise: List of column indices for noise augmentation.
-    - feature_plan: Optional FeaturePlan describing which columns to include (for models trained with ablation).
-    """
-    # Determine the exact HDF5 files participating in this inference call.
     if candidate_files is not None:
         all_files = [str(p) for p in candidate_files]
         print(f"Using {len(all_files)} preselected HDF5 files for inference.")
@@ -623,14 +813,11 @@ def prepare_data_inference(directory: str, pretrained_model_path: str, num_worke
         all_files = [os.path.join(directory, f) for f in os.listdir(directory) if (f.endswith('.h5') or f.endswith('.hdf5')) and 'metadata' not in f]
         print(f"Found {len(all_files)} HDF5 files to process for inference.")
 
-    # Load the checkpoint to retrieve saved parameters safely on the CPU
-    checkpoint = torch.load(pretrained_model_path, map_location='cpu')
+    checkpoint = load_inference_checkpoint(pretrained_model_path)
     
-    # Load pose_dict and orient_dict from the checkpoint
     pose_dict = checkpoint.get('pose_dict', {})
     orient_dict = checkpoint.get('orient_dict', {})
 
-    # Extract augmentation column info
     global_vars = checkpoint.get('global_vars', {})
     if not isinstance(global_vars, dict):
         global_vars = {}
@@ -653,7 +840,6 @@ def prepare_data_inference(directory: str, pretrained_model_path: str, num_worke
         raise FileNotFoundError("No suitable HDF5 files found for inference.")
     current_headers = _read_headers_from_hdf5_path(str(all_files[0]))
 
-    # Extract feature schema info (if present)
     feature_plan: Optional[FeaturePlan] = None
     included = global_vars.get('feature_columns_included', None)
     schema_hash = global_vars.get('feature_schema_hash', None)
@@ -691,12 +877,16 @@ def prepare_data_inference(directory: str, pretrained_model_path: str, num_worke
             schema_hash=effective_hash,
             spec={"mode": "checkpoint"},
         )
-    elif ckpt_num_features is not None and len(current_headers) != int(ckpt_num_features):
-        raise ValueError(
-            "Checkpoint does not include feature_columns_included, and the current inference directory "
-            f"has {len(current_headers)} columns while the checkpoint expects {int(ckpt_num_features)}. "
-            "Cannot safely infer the feature mapping."
-        )
+    else:
+        legacy_headers = global_vars.get('headers') or checkpoint.get('headers')
+        if not isinstance(legacy_headers, (list, tuple)) or not legacy_headers:
+            raise ValueError('Cannot safely infer the feature mapping: legacy checkpoint lacks an ordered feature schema. Use a schema-bearing model or supply its verified saved headers in the checkpoint metadata.')
+        included_cols = [str(c) for c in legacy_headers]
+        if ckpt_num_features is not None and len(included_cols) != int(ckpt_num_features):
+            raise ValueError('Legacy checkpoint header count does not match its input width.')
+        feature_plan = FeaturePlan(canonical_columns=list(current_headers), included_columns=included_cols,
+                                   excluded_columns=[c for c in current_headers if c not in included_cols],
+                                   schema_hash=compute_schema_hash(included_cols), spec={'mode': 'legacy-saved-schema'})
 
     if feature_plan is not None:
         headers_for_aug = list(feature_plan.included_columns)
@@ -725,40 +915,10 @@ def prepare_data_inference(directory: str, pretrained_model_path: str, num_worke
 
 def load_model_for_inference(checkpoint_path: str, pose_dict: dict[str, int], 
                             orient_dict: dict[str, int]) -> tuple[PosePredTransformer, dict]:
-    """
-    Prepares and loads a PosePredTransformer model for inference from a checkpoint.
-    
-    This function performs complete model restoration for inference by reading the checkpoint,
-    extracting hyperparameters, building the model architecture, and loading trained weights.
-    The model is always built in inference mode (pretrain_mode=False) regardless of the
-    original training mode to ensure proper prediction head initialization.
-    
-    Model Loading Process:
-    1. Checkpoint file validation and loading
-    2. Hyperparameter extraction from stored checkpoint metadata
-    3. Class count determination from provided dictionaries
-    4. Model architecture instantiation with inference configuration
-    5. Weight loading with graceful handling of pretraining artifacts
-    6. Model verification through layer shape inspection
-    7. Parameter count reporting for validation
-    
-    Parameters:
-    - checkpoint_path: Path to the saved model checkpoint file (.pth format).
-    - pose_dict: Dictionary mapping pose class names to integer indices for prediction.
-    - orient_dict: Dictionary mapping orientation class names to integer indices for prediction.
-    
-    Returns:
-    - model: Fully initialized PosePredTransformer in evaluation mode with loaded weights.
-    - checkpoint: Complete checkpoint dictionary containing all saved state and metadata.
-    
-    Raises:
-    - ValueError: If 'global_vars' are missing from the checkpoint.
-    - SystemExit: If the checkpoint file is not found at the specified path.
-    
-    Notes:
-    - Uses strict=False for weight loading to handle pretraining-to-finetuning transitions
-    - Always builds model without projection head regardless of checkpoint origin
-    - Prints detailed model architecture information for verification
+    """Build a supervised PosePred model from checkpoint metadata and load its weights.
+
+    Exclude the pretraining projection head and preserve saved class meanings.
+    Return the evaluation-mode model and deserialized checkpoint.
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -766,7 +926,7 @@ def load_model_for_inference(checkpoint_path: str, pose_dict: dict[str, int],
         print(f"Error: Checkpoint file not found at {checkpoint_path}. Exiting inference mode.")
         sys.exit(1)
     
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = load_inference_checkpoint(checkpoint_path)
     global_vars = checkpoint.get('global_vars', {})
     if not isinstance(global_vars, dict) or not global_vars:
         raise ValueError("Could not find 'global_vars' in the checkpoint. Cannot build model for inference.")
@@ -795,14 +955,12 @@ def load_model_for_inference(checkpoint_path: str, pose_dict: dict[str, int],
     for key, value in global_vars.items():
         print(f"  {key}: {_format_global_var_for_log(value)}")
 
-    # Determine num_classes from the provided dictionaries
     num_pose_classes = len(pose_dict) if global_vars.get('pose_pred') else 0
     num_orient_classes = len(orient_dict) if global_vars.get('orient_pred') else 0
     
     print(f"Length of pose_dict: {num_pose_classes}")
     print(f"Length of orient_dict: {num_orient_classes}")
     
-    # Instantiate the model with parameters from the checkpoint, but ALWAYS in inference mode.
     model = PosePredTransformer(
         num_features=global_vars['num_features'],
         sequence_length=global_vars['sequence_length'],
@@ -821,7 +979,7 @@ def load_model_for_inference(checkpoint_path: str, pose_dict: dict[str, int],
         num_pose_classes=num_pose_classes,
         num_orient_classes=num_orient_classes,
         positional_encoding_type=global_vars.get('positional_encoding_type', 'learned'),
-        pretrain_mode=False,  # CRITICAL: Always build the model without the projection head for inference
+        pretrain_mode=False,  # Inference uses supervised heads without the pretraining projection head.
         projection_dim=global_vars.get('projection_dim', 128)
     )
     
@@ -829,9 +987,10 @@ def load_model_for_inference(checkpoint_path: str, pose_dict: dict[str, int],
     
     print("\nLoading model weights for inference...")
 
-    load_checkpoint_model(model, optimizer=None, scheduler=None, checkpoint_path=checkpoint_path, scaler=None, load_optimizer_state=False, pretrain_mode=False)
+    load_checkpoint_model(model, optimizer=None, scheduler=None, checkpoint_path=checkpoint_path,
+                          scaler=None, load_optimizer_state=False, pretrain_mode=False,
+                          checkpoint_data=checkpoint)
     
-    # For printing, extract the underlying module if wrapped.
     model_module = model.module if hasattr(model, 'module') else model
     
     print("\nModel parameters after weight loading:")
@@ -865,7 +1024,6 @@ def load_model_for_inference(checkpoint_path: str, pose_dict: dict[str, int],
     print("\nTotal number of parameters:", total_params)
 
     
-    # Return the initialized model and the checkpoint data
     return model, checkpoint
 
 
@@ -893,23 +1051,25 @@ def perform_inference(
     *,
     output_dir: Optional[str] = None,
     use_inferences_subdir: bool = True,
+    provenance_by_filename: Optional[dict[str, dict[str, Any]]] = None,
+    tta_seed: int = 42,
+    noise_workers: int = 1,
+    requested_batch: Optional[int] = None,
+    tuning_state: Optional[dict] = None,
+    vram_fraction: float = .8,
 ) -> None:
-    """
-    Executes batched inference and writes:
-      1) Main inference CSV (probabilities + predicted labels) to: inferences/<movie>_inference.csv
-      2) Logits CSV (raw per-model logits; aligned to reference label indexing) to:
-         inferences/inference_details/<movie>_logits.csv
-      3) Context vectors HDF5 (one file per *model* per movie) to:
-         inferences/inference_details/context_vectors/model_XXX_<ckptstem>/<movie>_context_vectors.h5
+    """Run batched ensemble inference and write aligned CSV/HDF5 outputs.
 
-    Context vectors are saved as the TTA-mean (inf_average) embedding from each model independently
-    (NO cross-model averaging in embedding space). The HDF5 file also stores raw (unsmoothed) ensemble
-    predicted pose/orient indices so you can filter embeddings by the "best" label estimate.
+    Main CSVs contain probabilities and raw/smoothed labels; detail CSVs contain
+    per-model logits in reference class order. Store each model's pass-mean
+    context vectors separately under inference_details/cv, with unsmoothed
+    ensemble/model indices and validity masks. Never average embeddings across
+    models. Publish original-movie timelines with blank unavailable predictions;
+    Frame Number is one-based and Source Frame Index is zero-based.
     """
     for model in models:
         model.eval()
 
-    # Validate that any provided permutation lists match the number of models
     if pose_permutations is not None and len(pose_permutations) != len(models):
         raise ValueError(
             f"pose_permutations length ({len(pose_permutations)}) does not match number of models ({len(models)})."
@@ -923,7 +1083,6 @@ def perform_inference(
             f"model_checkpoint_paths length ({len(model_checkpoint_paths)}) does not match number of models ({len(models)})."
         )
 
-    # --- Output folders ---
     output_root = output_dir if output_dir else main_directory
     os.makedirs(output_root, exist_ok=True)
 
@@ -935,10 +1094,9 @@ def perform_inference(
         details_dir = os.path.join(output_root, 'inference_details')
     os.makedirs(details_dir, exist_ok=True)
 
-    context_vectors_root = os.path.join(details_dir, 'context_vectors')
+    context_vectors_root = os.path.join(details_dir, 'cv')
     os.makedirs(context_vectors_root, exist_ok=True)
 
-    # --- Label reverse maps (index -> name) ---
     reverse_pose_dict = {v: k for k, v in pose_dict.items()}
     reverse_orient_dict = {v: k for k, v in orient_dict.items()}
 
@@ -949,11 +1107,10 @@ def perform_inference(
     if orient_pred and orient_dict:
         orient_labels_in_index_order = [reverse_orient_dict[i] for i in range(len(orient_dict))]
 
-    # --- How many model embeddings to save? (default: all models; can be limited by max_inference_cvs) ---
     n_models = len(models)
     n_save_models = min(max_inference_cvs, n_models)
 
-    # Per-model embedding dimensions (can differ across ensemble members; each gets its own file)
+    # Each model's embedding space remains a separate file.
     model_d_models: List[int] = []
     model_frame_reps: List[str] = []
     for m in range(n_save_models):
@@ -964,15 +1121,29 @@ def perform_inference(
         model_d_models.append(int(d_model))
         model_frame_reps.append(str(getattr(mm, 'frame_representation', 'unknown')))
 
-    # Dataset file map (best-effort). Used to get total_frames for padding/writing.
     dataset_h5_files = getattr(dataloader.dataset, 'h5_files', [])
     filename_to_path = {os.path.basename(str(f)): str(f) for f in dataset_h5_files} if dataset_h5_files else {}
 
-    # --- Results for CSV outputs (still written as before) ---
+    tta_source_identities = {}
+    tta_model_identities = []
+    if use_tta:
+        for model_idx, model in enumerate(models):
+            if model_checkpoint_paths and os.path.isfile(model_checkpoint_paths[model_idx]):
+                tta_model_identities.append(sha256_file(model_checkpoint_paths[model_idx]))
+            else:
+                # The lower-level API also accepts in-memory models without a checkpoint.
+                raw_model = model.module if hasattr(model, 'module') else model
+                digest = hashlib.sha256(type(raw_model).__qualname__.encode('utf-8'))
+                for key, value in sorted(raw_model.state_dict().items()):
+                    tensor = value.detach().cpu().contiguous()
+                    digest.update(f'{key}:{tensor.dtype}:{tuple(tensor.shape)}'.encode('utf-8'))
+                    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+                tta_model_identities.append(digest.hexdigest())
+
     all_main_results: dict[str, list[list]] = {}
     all_logits_results: dict[str, list[list]] = {}
 
-    # --- Buffers for context vectors (one per movie/file) ---
+    # Context-vector buffers by recording.
     # Stored as full-length arrays so downstream can slice by frame number without loading CSV.
     cv_buffers: dict[str, dict] = {}
 
@@ -985,34 +1156,67 @@ def perform_inference(
             safe = safe[:max_len].rstrip('_')
         return safe
 
+    def _context_vector_output_path(
+        *,
+        model_index: int,
+        checkpoint_stem: str,
+        recording_stem: str,
+    ) -> tuple[str, bool]:
+        """Return (path, compacted) for a per-model context-vector file.
+
+        Use a shallow model folder and deterministically compact names when the
+        Windows path budget requires it. Preserve original source names in HDF5
+        metadata; reject an output root that remains too deep.
+        """
+
+        model_out_dir = os.path.join(context_vectors_root, f'm{model_index:02d}')
+        candidate = os.path.join(model_out_dir, f'{recording_stem}_cv.h5')
+        if len(os.path.abspath(candidate + '.tmp')) < 240:
+            return candidate, False
+
+        checkpoint_hash = hashlib.sha256(checkpoint_stem.encode("utf-8")).hexdigest()[:8]
+        recording_hash = hashlib.sha256(recording_stem.encode("utf-8")).hexdigest()[:16]
+        compact_model_dir = os.path.join(
+            context_vectors_root,
+            f"model_{model_index:03d}_{checkpoint_hash}",
+        )
+        compact_path = os.path.join(
+            compact_model_dir,
+            f"recording_{recording_hash}_context_vectors.h5",
+        )
+        if len(os.path.abspath(compact_path + ".tmp")) >= 248:
+            raise OSError(
+                "PosePred output directory is too deep for this Windows HDF5 build. "
+                f"Choose a shorter output directory. Attempted compact path: {compact_path}"
+            )
+        return compact_path, True
+
     def _ensure_cv_buffer(base_filename: str, source_path: str) -> dict:
         if base_filename in cv_buffers:
             return cv_buffers[base_filename]
 
         if not os.path.isfile(source_path):
-            # Try dataset mapping as a fallback
             source_path = filename_to_path.get(base_filename, source_path)
 
         if not os.path.isfile(source_path):
             raise FileNotFoundError(f"Could not locate source HDF5 for '{base_filename}'. Tried: {source_path}")
 
         with h5py.File(source_path, 'r') as h5f:
-            total_frames = int(h5f['data'].shape[0])
+            total_frames, source_frames, complete_timeline = h5_frame_timeline(h5f)
             num_features_local = int(h5f['data'].shape[1])
 
         buf = {
             'source_path': source_path,
+            'complete_timeline': complete_timeline,
+            'source_frames': source_frames,
             'total_frames': total_frames,
             'num_features': num_features_local,
             'frame_number': np.arange(1, total_frames + 1, dtype=np.int32),
             'valid': np.zeros(total_frames, dtype=np.uint8),
-            # Ensemble (raw, unsmoothed) predictions
             'pred_pose_idx_ensemble': (np.full(total_frames, -1, dtype=np.int16) if pose_pred else None),
             'pred_orient_idx_ensemble': (np.full(total_frames, -1, dtype=np.int16) if orient_pred else None),
-            # Model-specific predictions (aligned to reference indexing) for agreement analysis
             'pred_pose_idx_model': ([np.full(total_frames, -1, dtype=np.int16) for _ in range(n_save_models)] if pose_pred else None),
             'pred_orient_idx_model': ([np.full(total_frames, -1, dtype=np.int16) for _ in range(n_save_models)] if orient_pred else None),
-            # Context vectors (one per model)
             'context_vectors': [
                 np.full((total_frames, model_d_models[m]), np.nan, dtype=np.float16)
                 for m in range(n_save_models)
@@ -1023,58 +1227,37 @@ def perform_inference(
 
     total_sequences_processed = 0
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            sequences, filenames, middle_indices = batch[0].to(device), batch[1], batch[2]
-            print(f"Processing batch {batch_idx + 1}/{len(dataloader)}...")
+    from .inference_runtime import EnsembleRunner, computed_batches
+    if tuning_state is None:
+        tuning_state = {}
+    if requested_batch is None:
+        requested_batch = dataloader.batch_size or 1
 
-            batch_logits_pose_all_models: List[torch.Tensor] = []
-            batch_logits_orient_all_models: List[torch.Tensor] = []
-            batch_cls_tokens_all_models: List[torch.Tensor] = []
+    def identity_for(filename):
+        base = os.path.basename(filename)
+        if base not in tta_source_identities:
+            provenance = (provenance_by_filename or {}).get(base, {})
+            identity = provenance.get('inputs', {}).get('source_hdf5', {}).get('sha256')
+            if identity is None:
+                path = filename_to_path.get(base, filename)
+                if not os.path.isabs(path):
+                    path = os.path.join(main_directory, path)
+                identity = sha256_file(path)
+            tta_source_identities[base] = identity
+        return tta_source_identities[base]
 
-            # --- Forward passes for each model (with optional TTA + averaging) ---
-            for model_idx, model in enumerate(models):
-                accumulated_logits_pose = None
-                accumulated_logits_orient = None
-                accumulated_cls_token = None
-
-                for pass_idx in range(inf_average):
-                    sequences_to_process = sequences.clone()
-                    if use_tta:
-                        sequences_to_process = augment_features(
-                            sequences_to_process, 0, tta_noise_level, columns_to_noise
-                        )
-                    with torch.amp.autocast(device_type='cuda', enabled=device.type == 'cuda'):
-                        logits_pose, logits_orient, _, cls_token = model(sequences_to_process)
-
-                    if pose_pred:
-                        accumulated_logits_pose = logits_pose.clone() if accumulated_logits_pose is None else accumulated_logits_pose + logits_pose
-                    if orient_pred:
-                        accumulated_logits_orient = logits_orient.clone() if accumulated_logits_orient is None else accumulated_logits_orient + logits_orient
-                    accumulated_cls_token = cls_token.clone() if accumulated_cls_token is None else accumulated_cls_token + cls_token
-
-                # Average over passes
-                if pose_pred:
-                    if accumulated_logits_pose is None:
-                        raise RuntimeError(f"Model {model_idx+1} produced no pose logits, but pose_pred=True.")
-                    pose_logits_avg = accumulated_logits_pose / inf_average
-                    if pose_permutations is not None and pose_permutations[model_idx] is not None:
-                        # Reorder columns so every model is aligned to the reference pose_dict indexing
-                        pose_logits_avg = pose_logits_avg[:, pose_permutations[model_idx]]
-                    batch_logits_pose_all_models.append(pose_logits_avg)
-
-                if orient_pred:
-                    if accumulated_logits_orient is None:
-                        raise RuntimeError(f"Model {model_idx+1} produced no orient logits, but orient_pred=True.")
-                    orient_logits_avg = accumulated_logits_orient / inf_average
-                    if orient_permutations is not None and orient_permutations[model_idx] is not None:
-                        # Reorder columns so every model is aligned to the reference orient_dict indexing
-                        orient_logits_avg = orient_logits_avg[:, orient_permutations[model_idx]]
-                    batch_logits_orient_all_models.append(orient_logits_avg)
-
-                batch_cls_tokens_all_models.append(accumulated_cls_token / inf_average)
-
-            # --- Ensemble predictions (aligned class indexing) ---
+    with torch.no_grad(), EnsembleRunner(models, device, passes=inf_average,
+            pose_pred=pose_pred, orient_pred=orient_pred, use_tta=use_tta,
+            noise_level=tta_noise_level, columns=columns_to_noise, seed=tta_seed,
+            model_identities=tta_model_identities, noise_workers=noise_workers,
+            pose_permutations=pose_permutations, orient_permutations=orient_permutations,
+            max_batch_size=dataloader.batch_size) as runner:
+        for batch_idx, (filenames, middle_indices, outputs) in enumerate(progress(computed_batches(
+                dataloader, runner, identity_for, requested_batch=requested_batch,
+                tuning_state=tuning_state, vram_fraction=vram_fraction), desc='PosePred inference windows', total=len(dataloader.dataset),
+                advance=lambda result: len(result[0]))):
+            result_started = time.perf_counter()
+            batch_logits_pose_all_models, batch_logits_orient_all_models, batch_cls_tokens_all_models = outputs
             predicted_pose_indices = None
             predicted_pose_labels = None
             ensemble_probs_pose = None
@@ -1095,9 +1278,9 @@ def perform_inference(
                 predicted_orient_indices = np.argmax(ensemble_probs_orient, axis=1)
                 predicted_orient_labels = [reverse_orient_dict[idx] for idx in predicted_orient_indices]
 
-            total_sequences_processed += sequences.size(0)
+            total_sequences_processed += len(filenames)
 
-            # --- Convert embeddings / per-model argmax once per batch (avoid per-row GPU->CPU conversions) ---
+            # Convert per batch to avoid per-row GPU-to-CPU transfers.
             cls_np_all_models: List[np.ndarray] = []
             model_pose_idx_all_models: Optional[List[np.ndarray]] = None
             model_orient_idx_all_models: Optional[List[np.ndarray]] = None
@@ -1119,7 +1302,7 @@ def perform_inference(
                         torch.argmax(batch_logits_orient_all_models[m], dim=1).detach().cpu().numpy().astype(np.int16, copy=False)
                     )
 
-            # --- Update per-file context vector buffers (frame-aligned) ---
+            # Store context vectors on each recording's source-frame timeline.
             basenames = [os.path.basename(str(fn)) for fn in filenames]
             unique_basenames = sorted(set(basenames))
             middle_idx_np = middle_indices.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -1129,14 +1312,12 @@ def perform_inference(
                 src_path = filename_to_path.get(bn, str(filenames[0]))
                 buf = _ensure_cv_buffer(bn, src_path)
 
-                # Mark valid frames and store ensemble predictions
                 buf['valid'][middle_idx_np] = 1
                 if pose_pred and predicted_pose_indices is not None:
                     buf['pred_pose_idx_ensemble'][middle_idx_np] = predicted_pose_indices.astype(np.int16, copy=False)
                 if orient_pred and predicted_orient_indices is not None:
                     buf['pred_orient_idx_ensemble'][middle_idx_np] = predicted_orient_indices.astype(np.int16, copy=False)
 
-                # Store model-specific predictions + embeddings
                 for m in range(n_save_models):
                     buf['context_vectors'][m][middle_idx_np, :] = cls_np_all_models[m]
                     if pose_pred and model_pose_idx_all_models is not None:
@@ -1144,7 +1325,6 @@ def perform_inference(
                     if orient_pred and model_orient_idx_all_models is not None:
                         buf['pred_orient_idx_model'][m][middle_idx_np] = model_orient_idx_all_models[m]
             else:
-                # Multi-file batches: group by base filename
                 for bn in unique_basenames:
                     positions = [j for j, b in enumerate(basenames) if b == bn]
                     if not positions:
@@ -1166,7 +1346,8 @@ def perform_inference(
                         if orient_pred and model_orient_idx_all_models is not None:
                             buf['pred_orient_idx_model'][m][idxs] = model_orient_idx_all_models[m][positions]
 
-            # --- Build rows for CSV outputs (per frame prediction rows only) ---
+            pose_logits_cpu = [values.detach().cpu().numpy() for values in batch_logits_pose_all_models]
+            orient_logits_cpu = [values.detach().cpu().numpy() for values in batch_logits_orient_all_models]
             for i, filename in enumerate(filenames):
                 base_filename = os.path.basename(str(filename))
                 if base_filename not in all_main_results:
@@ -1178,14 +1359,12 @@ def perform_inference(
                 main_row = [frame_number]
                 logits_row = [frame_number]
 
-                # Logits row
                 for model_idx in range(len(models)):
                     if pose_pred:
-                        logits_row.append(batch_logits_pose_all_models[model_idx][i].detach().cpu().numpy().tolist())
+                        logits_row.append(pose_logits_cpu[model_idx][i].tolist())
                     if orient_pred:
-                        logits_row.append(batch_logits_orient_all_models[model_idx][i].detach().cpu().numpy().tolist())
+                        logits_row.append(orient_logits_cpu[model_idx][i].tolist())
 
-                # Main row
                 if pose_pred and ensemble_probs_pose is not None:
                     main_row.extend([round(ensemble_probs_pose[i][pose_dict[label]], 4) for label in pose_dict.keys()])
                 if orient_pred and ensemble_probs_orient is not None:
@@ -1201,13 +1380,37 @@ def perform_inference(
                 all_main_results[base_filename].append(main_row)
                 all_logits_results[base_filename].append(logits_row)
 
+            del outputs, batch_logits_pose_all_models, batch_logits_orient_all_models, batch_cls_tokens_all_models
+            if pose_pred:
+                del ensemble_logits_pose
+            if orient_pred:
+                del ensemble_logits_orient
+            tuning_state['result_processing_seconds'] = tuning_state.get('result_processing_seconds', 0.) + time.perf_counter() - result_started
+            record_work('inference_valid_windows', completed=len(filenames))
+            record_work('inference_batches', completed=1)
+
+        for key, value in runner.metrics.items():
+            tuning_state[key] = tuning_state.get(key, 0.) + value
+        record_settings({'inference_' + key: value for key, value in tuning_state.items()
+                         if isinstance(value, (int, float))})
+        if device.type == 'cuda':
+            properties = torch.cuda.get_device_properties(device)
+            for key, value in [('cuda_peak_allocated_bytes', torch.cuda.max_memory_allocated(device)),
+                               ('cuda_peak_reserved_bytes', torch.cuda.max_memory_reserved(device))]:
+                tuning_state[key] = max(tuning_state.get(key, 0), value)
+            record_settings({'cuda_device_index': torch.cuda.current_device(),
+                'cuda_device_name': properties.name,
+                'cuda_device_uuid': str(getattr(properties, 'uuid', 'unavailable')),
+                'cuda_peak_allocated_bytes': tuning_state['cuda_peak_allocated_bytes'],
+                'cuda_peak_reserved_bytes': tuning_state['cuda_peak_reserved_bytes']})
+
     print("\nInference loop complete. Processing and writing results to separate files...")
+    writing_started = time.perf_counter()
 
-    # --- Write outputs per file ---
-    for base_filename, main_results in all_main_results.items():
+    for base_filename, main_results in progress(all_main_results.items(), desc='Writing PosePred recordings'):
         logits_results = all_logits_results[base_filename]
+        published_paths: list[str] = []
 
-        # Headers
         main_headers = ['Frame Number']
         if pose_pred:
             main_headers.extend([f"Pose-{label}-Prob" for label in pose_dict.keys()])
@@ -1227,11 +1430,10 @@ def perform_inference(
             if orient_pred:
                 logits_headers.append(f'Orient_Logits_M{model_idx+1}')
 
-        # DataFrames for CSV outputs
         main_df = pd.DataFrame(main_results, columns=main_headers)
         logits_df = pd.DataFrame(logits_results, columns=logits_headers)
 
-        # Full timeline (for padding)
+        # Pad the original timeline with blank predictions for unavailable windows.
         buf = cv_buffers.get(base_filename)
         if buf is not None:
             total_frames = int(buf['total_frames'])
@@ -1241,22 +1443,20 @@ def perform_inference(
 
         full_df = pd.DataFrame({'Frame Number': range(1, total_frames + 1)})
 
-        # 1) LOGITS CSV
         final_logits_df = pd.merge(full_df, logits_df, on='Frame Number', how='left')
-        logits_csv_path = os.path.join(details_dir, f"{os.path.splitext(base_filename)[0]}_logits.csv")
+        final_logits_df['Source Frame Index'] = final_logits_df['Frame Number'] - 1
+        logits_csv_path = str(prediction_path(buf["source_path"], details_dir, "logits"))
         print(f"  Writing {len(final_logits_df)} rows to {logits_csv_path}...")
-        final_logits_df.to_csv(logits_csv_path, index=False)
+        atomic_write_dataframe_csv(final_logits_df, logits_csv_path, index=False)
+        published_paths.append(logits_csv_path)
 
-        # 2) CONTEXT VECTORS HDF5 (per model)
         if buf is None:
             print(f"  WARNING: No context-vector buffer found for {base_filename}; skipping HDF5 context vector write.")
         else:
-            # Precompute agreement flags per model (optional but useful)
             valid = buf['valid']
             pred_pose_ens = buf['pred_pose_idx_ensemble']
             pred_orient_ens = buf['pred_orient_idx_ensemble']
 
-            # Determine base output name once
             base_out_stem = os.path.splitext(base_filename)[0]
             timestamp = datetime.now().isoformat()
 
@@ -1264,25 +1464,29 @@ def perform_inference(
                 ckpt_stem = os.path.splitext(os.path.basename(model_checkpoint_paths[m]))[0] if model_checkpoint_paths else f"model_{m+1:03d}"
                 ckpt_stem = _sanitize_for_path(ckpt_stem)
 
-                model_dir_name = f"model_{m+1:03d}_{ckpt_stem}"
-                model_out_dir = os.path.join(context_vectors_root, model_dir_name)
+                cv_h5_path, compacted_artifact_name = _context_vector_output_path(
+                    model_index=m + 1,
+                    checkpoint_stem=ckpt_stem,
+                    recording_stem=base_out_stem,
+                )
+                model_out_dir = os.path.dirname(cv_h5_path)
                 os.makedirs(model_out_dir, exist_ok=True)
 
-                cv_h5_path = os.path.join(model_out_dir, f"{base_out_stem}_context_vectors.h5")
                 tmp_path = cv_h5_path + ".tmp"
 
-                # Datasets to write
                 context_vec = buf['context_vectors'][m]
                 pred_pose_model = buf['pred_pose_idx_model'][m] if pose_pred and buf['pred_pose_idx_model'] is not None else None
                 pred_orient_model = buf['pred_orient_idx_model'][m] if orient_pred and buf['pred_orient_idx_model'] is not None else None
 
                 try:
                     with h5py.File(tmp_path, 'w') as hf:
-                        # Root attributes (metadata)
                         hf.attrs['schema_version'] = "context_vectors_h5_v1"
                         hf.attrs['created_at'] = timestamp
                         hf.attrs['script_name'] = os.path.basename(__file__) if '__file__' in globals() else 'autobehaver_posepred'
                         hf.attrs['source_hdf5'] = buf.get('source_path', '')
+                        hf.attrs['source_filename'] = original_name(buf['source_path'])
+                        hf.attrs['source_filename_actual'] = base_filename
+                        hf.attrs['artifact_name_compacted'] = int(compacted_artifact_name)
                         hf.attrs['checkpoint_path'] = model_checkpoint_paths[m] if model_checkpoint_paths else ''
                         hf.attrs['model_index'] = int(m + 1)
                         hf.attrs['num_models_in_ensemble'] = int(n_models)
@@ -1291,6 +1495,8 @@ def perform_inference(
                         hf.attrs['inf_average'] = int(inf_average)
                         hf.attrs['use_tta'] = int(bool(use_tta))
                         hf.attrs['tta_noise_level'] = float(tta_noise_level)
+                        hf.attrs['tta_seed'] = int(tta_seed)
+                        hf.attrs['tta_random_algorithm'] = TTA_RANDOM_ALGORITHM
                         hf.attrs['pose_pred'] = int(bool(pose_pred))
                         hf.attrs['orient_pred'] = int(bool(orient_pred))
                         hf.attrs['recon'] = int(bool(recon))
@@ -1301,7 +1507,6 @@ def perform_inference(
                         N = context_vec.shape[0]
                         chunk_1d = (min(N, 65536),)
 
-                        # Core indexing datasets
                         hf.create_dataset(
                             'frame_number',
                             data=buf['frame_number'],
@@ -1321,7 +1526,6 @@ def perform_inference(
                             chunks=chunk_1d
                         )
 
-                        # Context vector dataset
                         chunk_frames = min(N, 2048)
                         hf.create_dataset(
                             'context_vector',
@@ -1333,7 +1537,6 @@ def perform_inference(
                             chunks=(chunk_frames, context_vec.shape[1])
                         )
 
-                        # Label vocabularies (index -> string)
                         str_dt = h5py.string_dtype(encoding='utf-8')
                         if pose_pred and pose_labels_in_index_order is not None:
                             hf.create_dataset('pose_labels', data=np.array(pose_labels_in_index_order, dtype=object), dtype=str_dt)
@@ -1406,6 +1609,7 @@ def perform_inference(
                             )
 
                     os.replace(tmp_path, cv_h5_path)
+                    published_paths.append(cv_h5_path)
                     print(f"  Wrote context vectors (model {m+1}/{n_save_models}) to {cv_h5_path}")
                 except Exception as e:
                     try:
@@ -1415,9 +1619,10 @@ def perform_inference(
                         pass
                     raise
 
-        # 3) MAIN INFERENCE CSV (with optional smoothing)
         final_main_df = pd.merge(full_df, main_df, on='Frame Number', how='left')
+        final_main_df['Source Frame Index'] = final_main_df['Frame Number'] - 1
 
+        from autobehaver.label_gaps import fill_short_label_gaps
         if pose_pred and min_pose_bout > 1:
             print(f"    -> Applying pose label smoothing (min_bout={min_pose_bout})...")
             final_main_df['Smoothed Pose Label'] = smooth_bouts_vectorized(
@@ -1427,6 +1632,8 @@ def perform_inference(
                 prefix='Pose',
                 exempt_labels=['Jump']
             )
+        elif pose_pred:
+            final_main_df['Smoothed Pose Label'], _ = fill_short_label_gaps(final_main_df['Predicted Pose Label'])
         if orient_pred and min_orient_bout > 1:
             print(f"    -> Applying orient label smoothing (min_bout={min_orient_bout})...")
             final_main_df['Smoothed Orient Label'] = smooth_bouts_vectorized(
@@ -1435,29 +1642,72 @@ def perform_inference(
                 min_bout=min_orient_bout,
                 prefix='Orient'
             )
+        elif orient_pred:
+            final_main_df['Smoothed Orient Label'], _ = fill_short_label_gaps(final_main_df['Predicted Orient Label'])
 
-        main_csv_path = os.path.join(inference_dir, f"{os.path.splitext(base_filename)[0]}_inference.csv")
+        main_csv_path = str(prediction_path(buf["source_path"], inference_dir))
         print(f"  Writing {len(final_main_df)} rows to {main_csv_path}...")
-        final_main_df.to_csv(main_csv_path, index=False)
+        atomic_write_dataframe_csv(final_main_df, main_csv_path, index=False)
+        published_paths.append(main_csv_path)
 
+        provenance = dict((provenance_by_filename or {}).get(base_filename, {}))
+        if provenance:
+            provenance['source_frame_offset'] = 0
+            provenance['frame_identity'] = 'original-movie-v1'
+            provenance['original_frame_count'] = total_frames
+            provenance['complete_movie_coverage'] = bool(buf.get('complete_timeline', False)) if buf else False
+            provenance['filled_label_frames'] = {
+                name.lower(): int((final_main_df[f'Predicted {name} Label'].isna()
+                                   & final_main_df[f'Smoothed {name} Label'].notna()).sum())
+                for name in ('Pose', 'Orient')
+                if f'Predicted {name} Label' in final_main_df
+            }
+            manifest_path = main_csv_path + ".provenance.json"
+            manifest_dir = Path(manifest_path).resolve().parent
+            provenance.update(
+                {
+                    "status": "complete",
+                    "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "outputs": [
+                        {
+                            "path": os.path.relpath(Path(path).resolve(), manifest_dir),
+                            "size_bytes": int(Path(path).stat().st_size),
+                            "sha256": sha256_file(path),
+                        }
+                        for path in published_paths
+                    ],
+                }
+            )
+            atomic_write_json(provenance, manifest_path)
+
+        record_work("inference_files", completed=1)
+        record_work("inference_output_rows", completed=len(final_main_df))
+
+    tuning_state['finalization_seconds'] = tuning_state.get('finalization_seconds', 0.) + time.perf_counter() - writing_started
+    record_settings({'inference_finalization_seconds': tuning_state['finalization_seconds']})
     print(f"\nTotal sequences processed: {total_sequences_processed}")
 
 
 def smooth_bouts_vectorized(labels, probs_df, min_bout, prefix, exempt_labels=None):
-    """
-    Smooths a sequence of labels by re-evaluating short bouts based on the
-    cumulative probability of flanking behaviors. (VECTORIZED IMPLEMENTATION)
+    """Smooth short bouts using adjacent labels and cumulative flank probabilities.
 
-    Exempts any labels in `exempt_labels` from being considered 'short'
-    (e.g., 'Jump'), so they are never rewritten by smoothing.
+    First replace short bouts between matching valid neighbors, then recheck
+    current short bouts and choose the supported flank. Preserve exempt labels
+    and unresolved missing gaps. Bridge brief internal gaps with matching flanks.
+    Use positional row alignment, independent of a
+    caller's pandas index, and return a label array.
     """
+    from autobehaver.label_gaps import fill_short_label_gaps
+    labels, _filled = fill_short_label_gaps(labels)
     exempt_labels = set(exempt_labels or [])
-    s = pd.Series(labels, dtype="object")
+    # All indices below are positions, not a caller's pandas index labels.
+    s = pd.Series(labels, dtype="object").reset_index(drop=True)
+    if len(s) != len(probs_df):
+        raise ValueError("Smoothing labels and probability rows must align exactly")
     if s.empty or s.isna().all():
         return s.to_numpy()
 
     is_blank = s.isna() | (s == "")
-    # Work only on non-blank runs
     work = s.mask(is_blank, other="__BLANK__")
     df = pd.DataFrame({'label': work})
 
@@ -1465,32 +1715,60 @@ def smooth_bouts_vectorized(labels, probs_df, min_bout, prefix, exempt_labels=No
     df['is_blank'] = df['label'] == "__BLANK__"
     df['bout_length'] = df.groupby('bout_id')['label'].transform('size')
 
-    # Never mark exempt labels as "short"
     df['is_exempt'] = df['label'].isin(exempt_labels)
     df['is_short'] = (~df['is_blank']) & (~df['is_exempt']) & (df['bout_length'] < min_bout)
 
-    bout_info = df.loc[~df['is_blank']].drop_duplicates('bout_id').set_index('bout_id')
+    # Retain blank bouts: omitting them invents neighbors across missing data.
+    bout_info = df.drop_duplicates('bout_id').set_index('bout_id')
     bout_info['prev_label'] = bout_info['label'].shift(1)
     bout_info['next_label'] = bout_info['label'].shift(-1)
     df = df.join(bout_info[['prev_label','next_label']], on='bout_id')
 
     df['smoothed_label'] = df['label']
 
-    easy = df['is_short'] & (df['prev_label'] == df['next_label']) & df['prev_label'].notna()
+    easy = (df['is_short'] & (df['prev_label'] == df['next_label'])
+            & df['prev_label'].notna() & (df['prev_label'] != "__BLANK__"))
     df.loc[easy, 'smoothed_label'] = df.loc[easy, 'prev_label']
 
     df['bout_id_smoothed'] = (df['smoothed_label'].ne(df['smoothed_label'].shift())).cumsum()
     df['bout_length_smoothed'] = df.groupby('bout_id_smoothed')['smoothed_label'].transform('size')
 
-    complex_ids = df.loc[(~df['is_blank']) & (df['bout_length_smoothed'] < min_bout) & (~df['is_exempt']), 'bout_id_smoothed'].unique()
+    current_exempt = df['smoothed_label'].isin(exempt_labels)
+    complex_ids = df.loc[(~df['is_blank']) & (df['bout_length_smoothed'] < min_bout)
+                         & (~current_exempt), 'bout_id_smoothed'].unique()
+    processed = np.zeros(len(df), dtype=bool)
+    # Initial bout ids are consecutive. Cache their anchors once instead of
+    # scanning every frame for each candidate bout.
+    bout_starts = np.flatnonzero(df['bout_id_smoothed'].ne(df['bout_id_smoothed'].shift()).to_numpy())
+    smoothed = df['smoothed_label'].to_numpy(copy=True)
+    original_exempt = df['is_exempt'].to_numpy()
 
     for bid in complex_ids:
-        idx = df.index[df['bout_id_smoothed'] == bid]
-        start_idx, end_idx = idx.min(), idx.max()
+        anchor = int(bout_starts[bid - 1])
+        current_label = smoothed[anchor]
+        if current_label == "__BLANK__" or current_label in exempt_labels:
+            continue
+        # Earlier candidates can change adjacency. Recheck the CURRENT bout,
+        # and process each current group at most once in this second pass.
+        start_idx = end_idx = anchor
+        while (end_idx - start_idx + 1 < min_bout and start_idx > 0
+               and smoothed[start_idx - 1] == current_label):
+            start_idx -= 1
+        while (end_idx - start_idx + 1 < min_bout and end_idx + 1 < len(df)
+               and smoothed[end_idx + 1] == current_label):
+            end_idx += 1
+        if (end_idx - start_idx + 1 >= min_bout
+                or processed[start_idx:end_idx + 1].any()
+                or original_exempt[start_idx:end_idx + 1].any()):
+            continue
 
-        prev_label = df['smoothed_label'].iloc[start_idx - 1] if start_idx > 0 else None
-        next_label = df['smoothed_label'].iloc[end_idx + 1] if end_idx < len(df) - 1 else None
-        if prev_label in [None, "__BLANK__"] and next_label in [None, "__BLANK__"]:
+        prev_label = smoothed[start_idx - 1] if start_idx > 0 else None
+        next_label = smoothed[end_idx + 1] if end_idx < len(df) - 1 else None
+        if prev_label in [None, "__BLANK__"]:
+            prev_label = None
+        if next_label in [None, "__BLANK__"]:
+            next_label = None
+        if prev_label is None and next_label is None:
             continue
 
         def prob_sum(lbl):
@@ -1500,11 +1778,19 @@ def smooth_bouts_vectorized(labels, probs_df, min_bout, prefix, exempt_labels=No
             return probs_df.iloc[start_idx:end_idx+1][col].sum() if col in probs_df.columns else 0.0
 
         prev_sum, next_sum = prob_sum(prev_label), prob_sum(next_label)
-        winner = prev_label if prev_sum > next_sum else (next_label if next_sum > prev_sum else (prev_label or next_label))
-        df.loc[start_idx:end_idx, 'smoothed_label'] = winner
+        # A blank/missing flank is never a candidate, even when its numerical
+        # evidence ties a valid neighbor at zero.
+        if prev_label is None:
+            winner = next_label
+        elif next_label is None:
+            winner = prev_label
+        else:
+            winner = prev_label if prev_sum >= next_sum else next_label
+        smoothed[start_idx:end_idx + 1] = winner
+        processed[start_idx:end_idx + 1] = True
 
-    out = df['smoothed_label'].replace({"__BLANK__": np.nan}).to_numpy()
+    out = pd.Series(smoothed).replace({"__BLANK__": np.nan}).to_numpy()
 
-    return out
-
-
+    # Valid-label smoothing can make previously different gap flanks match.
+    # Finalize the gap rule here so MMGen reads the same saved label timeline.
+    return fill_short_label_gaps(out)[0]

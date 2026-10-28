@@ -1,4 +1,4 @@
-"""Unit tests for kinematics helpers (mmgen)."""
+"""Check MMGen kinematic summaries against small numerical references."""
 
 
 import unittest
@@ -9,10 +9,29 @@ from autobehaver.postinf.mmgen.kinematics import (
     extract_bout_features_simple,
     _reconstruct_kinematic_table_from_aggregates,
     HEAD_KEYPOINTS,
-    _safe_tail_means_from_array,
+    _calculate_leg_kinematics,
+    _calculate_angular_leg_kinematics,
 )
 
 class TestKinematics(unittest.TestCase):
+    def test_paired_leg_statistics_preserve_signed_values_and_missing_pair_behavior(self):
+        left = np.array([1., -2., 3., np.nan])
+        right = np.array([-1., 2., -3., 4.])
+        expected = (np.mean([np.nanmean(left), np.nanmean(right)]),
+                    np.mean([np.nanstd(left, ddof=1), np.nanstd(right, ddof=1)]))
+        for helper, columns, parts in [
+            (_calculate_leg_kinematics,
+             ['partaccel_FrontTarsusLeft_inst', 'partaccel_FrontTarsusRight_inst'],
+             ['partaccel', 'FrontTarsus']),
+            (_calculate_angular_leg_kinematics,
+             ['partangular_accel_FrontJointLeft_FrontTarsusLeft_inst',
+              'partangular_accel_FrontJointRight_FrontTarsusRight_inst'],
+             ['partangular_accel', 'FrontJoint', 'FrontTarsus']),
+        ]:
+            frame = pd.DataFrame(dict(zip(columns, [left, right])))
+            np.testing.assert_allclose(helper(frame, '_inst', *parts), expected)
+            self.assertTrue(all(np.isnan(helper(frame.drop(columns=columns[1]), '_inst', *parts))))
+
     def test_head_movement_frame_signals_drop_worst_likelihood(self):
         # Create 3 frames, 5 head keypoints
         n = 3
@@ -61,26 +80,6 @@ class TestKinematics(unittest.TestCase):
         self.assertAlmostEqual(float(out_jerk[2]), exp2_jerk, places=6)
 
 
-    def test_tail_means_min_3_frame_guardrail(self):
-        # For n=20, 5% would be 1 frame, but we enforce minimum 3 frames per tail.
-        arr = np.arange(20, dtype=float)
-        low, high = _safe_tail_means_from_array(arr, pmin=5, pmax=95, min_tail_frames=3)
-        # Bottom 3: 0,1,2 -> mean=1; Top 3: 17,18,19 -> mean=18
-        self.assertAlmostEqual(float(low), 1.0, places=6)
-        self.assertAlmostEqual(float(high), 18.0, places=6)
-
-        # For n=100, 5% is 5 frames; should use 5-frame tails
-        arr2 = np.arange(100, dtype=float)
-        low2, high2 = _safe_tail_means_from_array(arr2, pmin=5, pmax=95, min_tail_frames=3)
-        # Bottom 5: 0..4 -> mean=2; Top 5: 95..99 -> mean=97
-        self.assertAlmostEqual(float(low2), 2.0, places=6)
-        self.assertAlmostEqual(float(high2), 97.0, places=6)
-
-        # Too few samples -> NaN
-        arr3 = np.array([1.0, 2.0])
-        low3, high3 = _safe_tail_means_from_array(arr3, pmin=5, pmax=95, min_tail_frames=3)
-        self.assertTrue(np.isnan(low3))
-        self.assertTrue(np.isnan(high3))
 
 
     def test_bb_minmax_uses_percentile_thresholds_and_20_frame_guard(self):
@@ -100,6 +99,7 @@ class TestKinematics(unittest.TestCase):
         )
         self.assertEqual(len(out), 1)
         self.assertAlmostEqual(float(out.loc[0, "speed_min"]), float(np.nanpercentile(np.arange(20, dtype=float), 5)), places=6)
+        self.assertFalse(any(column.endswith('_asym') for column in out))
         self.assertAlmostEqual(float(out.loc[0, "speed_max"]), float(np.nanpercentile(np.arange(20, dtype=float), 95)), places=6)
 
         df_short = pd.DataFrame({"speed_inst": np.arange(19, dtype=float)})
@@ -120,15 +120,15 @@ class TestKinematics(unittest.TestCase):
         self.assertTrue(np.isnan(out_short.loc[0, "speed_min"]))
         self.assertTrue(np.isnan(out_short.loc[0, "speed_max"]))
 
-    def test_reconstruct_kinematics_includes_asym_and_drops_extrema_std(self):
+    def test_reconstruct_kinematics_pools_leg_means_and_drops_extrema_std(self):
         agg_df = pd.DataFrame(
             {
                 "individual": ["fly1"],
                 "group": ["grp"],
                 "bout_type": ["Walking"],
-                "frontleg_velocity_core_asym__sum": [3.0],
-                "frontleg_velocity_core_asym__sum_sq": [2.2],
-                "frontleg_velocity_core_asym__count": [6],
+                "frontleg_velocity_core_mean__sum": [3.0],
+                "frontleg_velocity_core_mean__sum_sq": [2.2],
+                "frontleg_velocity_core_mean__count": [6],
                 "speed_min__sum": [12.0],
                 "speed_min__sum_sq": [30.0],
                 "speed_min__count": [6],
@@ -139,13 +139,13 @@ class TestKinematics(unittest.TestCase):
         )
         out = _reconstruct_kinematic_table_from_aggregates({"_inst": agg_df}, min_bout_count_for_features=6)["_inst"]
         self.assertEqual(len(out), 1)
-        self.assertIn("frontleg_velocity_core_asym_mean", out.columns)
-        self.assertIn("frontleg_velocity_core_asym_std", out.columns)
+        self.assertIn("frontleg_velocity_core_mean_mean", out.columns)
+        self.assertIn("frontleg_velocity_core_mean_std", out.columns)
         self.assertIn("speed_min_mean", out.columns)
         self.assertIn("speed_max_mean", out.columns)
         self.assertNotIn("speed_min_std", out.columns)
         self.assertNotIn("speed_max_std", out.columns)
-        self.assertAlmostEqual(float(out.loc[0, "frontleg_velocity_core_asym_mean"]), 0.5, places=6)
+        self.assertAlmostEqual(float(out.loc[0, "frontleg_velocity_core_mean_mean"]), 0.5, places=6)
 
 if __name__ == "__main__":
     unittest.main()

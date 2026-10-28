@@ -1,7 +1,4 @@
-"""Import-level smoke tests.
-
-These tests ensure that key modules can be imported without pulling in optional dependencies
-(e.g., OpenCV) unless explicitly requested."""
+"""Check core imports and deferred loading of rendering dependencies."""
 
 
 import sys
@@ -17,7 +14,7 @@ class TestImports(unittest.TestCase):
             pipeline, worker, feature_matrix, bouts, kinematics, transitions,
             occupancy, measurements, postural, time_budgets, hdf_store
         )
-        # Basic sanity: key modules have expected attributes
+        # Public summary functions must remain available.
         self.assertTrue(hasattr(bouts, "extract_bouts_from_label_sequence"))
         self.assertTrue(hasattr(feature_matrix, "create_feature_matrix"))
 
@@ -25,9 +22,8 @@ class TestImports(unittest.TestCase):
         # infmovie should be importable without OpenCV at import time
         from autobehaver.postinf.infmovie import movies
 
-        # Movie module should not import cv2 at module import time (lazy import).
-        # (If some other module already imported cv2, this might not hold, so we check
-        # that movies itself didn't bind cv2.)
+        # The rendering module defers OpenCV loading until rendering is requested.
+        # Inspect its bindings because other tests may already have loaded OpenCV.
         self.assertFalse("cv2" in movies.__dict__)
 
 if __name__ == "__main__":

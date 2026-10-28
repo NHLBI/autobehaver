@@ -1,29 +1,24 @@
-"""Feature matrix loading, validation, and normalization.
+"""Load, validate, and normalize FeatureImp matrices.
 
-This module contains the feature-matrix preprocessing used by FeatureImp.
-
-Normalization behavior:
-
-* Identify numeric feature columns and exclude non-numeric columns.
-* Treat "TimeBudget" and true transition-probability features as compositional.
-* Apply CLR transformation row-wise within each compositional set.
-* Z-score standardize *all* numeric features using mean/std computed from a
-  control subset of animals.
-
-The saved normalization parameters are retained as run provenance and for
-internal validation of completed analyses.
+Remove unavailable declared features and absent transitions before row-wise CLR
+transformation, then standardize numeric features against the control subset. Save the
+normalization parameters as run provenance.
 """
 
 from __future__ import annotations
 
 import gc
+import csv
 import hashlib
 import json
 import os
+from collections import Counter
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from autobehaver.atomic_io import atomic_write_dataframe_csv, atomic_write_json, sha256_file
+from .matrix_input import verify_upstream_receipt, validate_numeric_columns
 
 
 DEFAULT_ID_COLUMNS = ['individual', 'group', 'sex']
@@ -39,7 +34,21 @@ def validate_feature_matrix(
         required_id_cols = list(DEFAULT_ID_COLUMNS)
 
     try:
-        df = pd.read_csv(matrix_path)
+        with open(matrix_path, newline="", encoding="utf-8-sig") as handle:
+            raw_headers = next(csv.reader(handle), [])
+        if not raw_headers:
+            return False, "Feature matrix has no header row", None
+        blank_headers = [index for index, value in enumerate(raw_headers) if not str(value).strip()]
+        if blank_headers:
+            return False, f"Blank column name(s) at positions: {blank_headers[:20]}", None
+        duplicate_headers = sorted(
+            value for value, count in Counter(raw_headers).items() if count > 1
+        )
+        if duplicate_headers:
+            return False, f"Duplicate column names: {duplicate_headers[:20]}", None
+
+        from .matrix_input import read_feature_matrix
+        df = read_feature_matrix(matrix_path)
 
         missing_cols = [col for col in required_id_cols if col not in df.columns]
         if missing_cols:
@@ -51,6 +60,41 @@ def validate_feature_matrix(
 
         if len(df) == 0:
             return False, "DataFrame is empty", None
+
+        for column in required_id_cols:
+            blank = df[column].isna() | df[column].astype(str).str.strip().eq("")
+            if bool(blank.any()):
+                return False, f"Required identity column {column!r} contains blank values", None
+
+        individual_ids = df["individual"].astype(str).str.strip()
+        if individual_ids.duplicated().any():
+            duplicates = sorted(
+                set(individual_ids[individual_ids.duplicated(keep=False)].tolist())
+            )[:20]
+            return False, f"Duplicate individual identifiers: {duplicates}", None
+
+        candidate_feature_cols = [
+            column
+            for column in df.columns
+            if column not in set(required_id_cols) | set(OPTIONAL_ID_COLUMNS)
+        ]
+        validate_numeric_columns(df, candidate_feature_cols)
+        df.attrs['input_provenance'] = verify_upstream_receipt(matrix_path)
+        numeric_feature_cols = df[candidate_feature_cols].select_dtypes(include=[np.number]).columns
+        if len(numeric_feature_cols) == 0:
+            return False, "No numeric feature columns found", None
+        numeric_values = df[list(numeric_feature_cols)].to_numpy(dtype=np.float64, copy=False)
+        if np.isinf(numeric_values).any():
+            return False, "Numeric feature matrix contains infinite values", None
+
+        if "total_frames_analyzed" in df.columns:
+            try:
+                total_frames = pd.to_numeric(df["total_frames_analyzed"], errors="raise")
+            except Exception:
+                return False, "total_frames_analyzed contains non-numeric values", None
+            populated = total_frames.dropna()
+            if bool((populated <= 0).any()):
+                return False, "total_frames_analyzed must be positive when provided", None
 
         return True, None, df
 
@@ -84,12 +128,10 @@ def _is_compositional_feature(feature_name: str) -> bool:
 
 
 def infer_compositional_sets(feature_columns: Sequence[str]) -> Dict[str, List[str]]:
-    """Infer compositional feature sets from feature names.
+    """Group time-budget columns and true transition-probability columns for CLR
+    transformation.
 
-    This matches the historical normalization logic used by FeatureImp, while
-    constraining transition compositionality to true transition-probability
-    columns (for example ``Transition_Pose_A_to_B``) rather than every feature
-    whose name merely begins with ``Transition_``.
+    Other Transition-prefixed summaries remain ordinary numeric features.
     """
     compositional_cols = [
         str(col) for col in feature_columns
@@ -100,9 +142,10 @@ def infer_compositional_sets(feature_columns: Sequence[str]) -> Dict[str, List[s
     for col in compositional_cols:
         parts = col.split('_')
         if _is_timebudget_feature(col):
-            if 'Given' in col:
-                key_parts = parts[:3] + [parts[-1]]
-                key = '_'.join(key_parts)
+            if col.startswith('TimeBudget_PoseGivenOrient_'):
+                key = 'TimeBudget_PoseGivenOrient_' + parts[-1]
+            elif col.startswith('TimeBudget_OrientGivenPose_'):
+                key = 'TimeBudget_OrientGivenPose_' + parts[-1]
             else:
                 key = '_'.join(parts[:2])
         elif _is_transition_probability_feature(col):
@@ -198,8 +241,18 @@ def _filter_transition_probability_features(
 
 
 def _clr_transform(values: np.ndarray, epsilon: float = 1e-12) -> np.ndarray:
-    """Apply a centered log-ratio transform to a 1D compositional vector."""
+    """Apply centered log-ratios after replacing exact zeros with positive epsilon.
+
+    A vector containing NaN remains entirely unavailable; negative or infinite
+    components are rejected.
+    """
     arr = np.asarray(values, dtype=np.float64)
+    if not np.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("CLR epsilon must be positive and finite")
+    if np.isinf(arr).any() or np.any(arr[np.isfinite(arr)] < 0):
+        raise ValueError("Compositions must contain nonnegative finite values or unavailable NaNs")
+    if np.isnan(arr).any():
+        return np.full_like(arr, np.nan)
     arr = np.where(arr == 0, epsilon, arr)
     gmean = np.exp(np.mean(np.log(arr)))
     return np.log(arr / gmean)
@@ -210,7 +263,7 @@ def _apply_clr_to_dataframe(
     df: pd.DataFrame,
     compositional_sets: Mapping[str, Sequence[str]],
 ) -> pd.DataFrame:
-    """Apply CLR transformation in-place (copy returned for chaining)."""
+    """Transform each compositional set row-wise in place and return the same DataFrame."""
     for _key, cols in compositional_sets.items():
         cols_list = [str(c) for c in cols]
         if len(cols_list) == 0:
@@ -219,7 +272,7 @@ def _apply_clr_to_dataframe(
             lambda row: _clr_transform(row.values),
             axis=1,
             result_type='expand',
-        ).fillna(0)
+        )
     return df
 
 
@@ -279,12 +332,20 @@ def normalize_feature_matrix(
     save_folder = analysis_folder_path if analysis_folder_path else results_dir
 
     normalized_output_path = os.path.join(save_folder, 'NORMALIZED_FEATURE_MATRIX.csv')
-    if skip_if_normalized_exists and os.path.exists(normalized_output_path):
-        print(f"Normalized matrix already exists at {normalized_output_path}. Skipping normalization.")
-        return normalized_output_path
-
     if raw_matrix_path is None:
         raw_matrix_path = os.path.join(results_dir, 'MASTER_FEATURE_MATRIX.csv')
+    receipt_path = os.path.join(save_folder, 'NORMALIZATION_RECEIPT.json')
+    upstream_input = verify_upstream_receipt(raw_matrix_path)
+    identity = {'raw_sha256': sha256_file(raw_matrix_path), 'source_sha256': sha256_file(__file__),
+                'matrix_input': upstream_input,
+                'control_group_tag': control_group_tag or 'CONTROL', 'training_group_a': training_group_a, 'training_group_b': training_group_b}
+    if skip_if_normalized_exists and os.path.exists(normalized_output_path):
+        if not os.path.isfile(receipt_path):
+            raise ValueError('Normalized matrix lacks a verified receipt; use a fresh analysis folder')
+        receipt = json.loads(open(receipt_path, encoding='utf-8').read())
+        if receipt.get('identity') != identity or receipt.get('normalized_sha256') != sha256_file(normalized_output_path) or receipt.get('params_sha256') != sha256_file(os.path.join(save_folder, 'NORMALIZATION_PARAMS.json')):
+            raise ValueError('Normalized matrix inputs/settings/outputs changed; reuse rejected')
+        return normalized_output_path
 
     if not os.path.exists(raw_matrix_path):
         print(f"Error: '{raw_matrix_path}' not found. Cannot normalize.")
@@ -313,8 +374,13 @@ def normalize_feature_matrix(
     print(f"  - Groups: {sorted(df['group'].unique())}")
 
     id_cols_for_feature_selection = ['individual', 'group', 'sex']
-    candidate_feature_cols = [col for col in df.columns if col not in id_cols_for_feature_selection]
+    candidate_feature_cols = [col for col in df.columns if col not in set(id_cols_for_feature_selection) | set(OPTIONAL_ID_COLUMNS)]
 
+    # Work on the analysis copy only. Empty declared master placeholders must
+    # leave before CLR, otherwise one missing component poisons a whole set.
+    globally_empty_features = [c for c in candidate_feature_cols if df[c].isna().all()]
+    df.drop(columns=globally_empty_features, inplace=True)
+    candidate_feature_cols = [c for c in candidate_feature_cols if c not in globally_empty_features]
     numeric_cols = df[candidate_feature_cols].select_dtypes(include=[np.number]).columns.tolist()
     non_numeric_cols = [col for col in candidate_feature_cols if col not in numeric_cols]
 
@@ -365,7 +431,9 @@ def normalize_feature_matrix(
     failed_sets = []
     failed_max_dev: Dict[str, float] = {}
     for key, cols in compositional_sets.items():
-        sums = df[list(cols)].sum(axis=1)
+        values = df[list(cols)]
+        applicable = np.isfinite(values.to_numpy(dtype=float)).all(axis=1)
+        sums = values.loc[applicable].sum(axis=1)
         max_dev = float(np.max(np.abs(sums))) if len(sums) else 0.0
         if not np.allclose(sums, 0):
             failed_sets.append(key)
@@ -401,9 +469,39 @@ def normalize_feature_matrix(
 
     control_means = control_df[numeric_features].mean()
     control_stds = control_df[numeric_features].std()
-    control_stds[control_stds == 0] = 1
+    control_counts = control_df[numeric_features].count()
+    insufficient = (control_counts < 2) | ~np.isfinite(control_stds)
+    unsupported_reference = [str(c) for c in control_counts.index[insufficient]]
+    if unsupported_reference:
+        df.drop(columns=unsupported_reference, inplace=True)
+        numeric_features = [c for c in numeric_features if c not in unsupported_reference]
+        control_means = control_means[numeric_features]
+        control_stds = control_stds[numeric_features]
+        print(f"Excluded {len(unsupported_reference)} features with fewer than two finite control observations.")
 
-    df[numeric_features] = (df[numeric_features] - control_means) / control_stds
+    # CLR transforms can make a mathematically constant component differ only
+    # by floating-point roundoff (typically around 1e-16).  Treating that
+    # residue as a real standard deviation amplifies platform-specific noise
+    # into order-one Z-scores.  Use an absolute floor comfortably above double
+    # precision roundoff; a reference-constant feature then normalizes to its
+    # centered value without division by numerical noise.
+    zscore_std_floor = 1e-12
+    near_zero_control_std = control_stds.abs() <= zscore_std_floor
+    near_zero_control_std_features = [str(c) for c in control_stds.index[near_zero_control_std]]
+    control_stds.loc[near_zero_control_std] = 1.0
+    if near_zero_control_std_features:
+        print(
+            f"Stabilized {len(near_zero_control_std_features)} control-reference "
+            f"standard deviation(s) <= {zscore_std_floor:g}."
+        )
+
+    zscore_round_decimals = 12
+    normalized_numeric = (
+        (df[numeric_features] - control_means) / control_stds
+    ).round(decimals=zscore_round_decimals)
+    # IEEE-754 signed zero is numerically equal but serializes differently on
+    # different platforms; canonicalize it at the reproducibility boundary.
+    df[numeric_features] = normalized_numeric.mask(normalized_numeric == 0, 0.0)
     print("Z-score normalization applied based on control group parameters.")
 
     print("\nChecking for and removing fully empty columns before saving...")
@@ -435,7 +533,10 @@ def normalize_feature_matrix(
         'scalar_feature_columns': kept_scalar_cols,
         'compositional_feature_columns': kept_compositional_cols,
         'compositional_sets': kept_compositional_sets,
+        'clr_input_compositional_sets': {str(k): list(v) for k,v in compositional_sets.items()},
         'non_numeric_columns_ignored': [str(c) for c in non_numeric_cols],
+        'globally_empty_features_removed_before_normalization': globally_empty_features,
+        'matrix_input_provenance': df.attrs.get('input_provenance', {}),
         'transition_filtering': {
             'enabled': True,
             'control_zero_or_nan_rule': True,
@@ -445,16 +546,23 @@ def normalize_feature_matrix(
             'dropped_transition_feature_count': int(len(dropped_transition_records)),
             'dropped_transition_features': [str(rec['feature']) for rec in dropped_transition_records],
         },
-        'normalization_method': 'clr_then_zscore_v2_transition_filtering',
+        'zscore_std_floor': float(zscore_std_floor),
+        'zscore_std_floor_feature_count': int(len(near_zero_control_std_features)),
+        'zscore_std_floor_features': near_zero_control_std_features,
+        'zscore_round_decimals': int(zscore_round_decimals),
+        'control_finite_counts': {str(k): int(v) for k, v in control_counts.items()},
+        'unsupported_control_reference_features': unsupported_reference,
+        'unavailable_composition_policy': 'retain_entire_incomplete_set_as_nan',
+        'normalization_method': 'clr_then_zscore_v4_canonical_rounding',
         'numeric_feature_schema_sha256': compute_feature_schema_sha256(kept_numeric_features),
     }
     params_path = os.path.join(save_folder, 'NORMALIZATION_PARAMS.json')
-    with open(params_path, 'w') as f:
-        json.dump(norm_params, f, indent=4)
+    atomic_write_json(norm_params, params_path)
     print(f"Normalization parameters saved to {params_path}")
 
     output_path = os.path.join(save_folder, 'NORMALIZED_FEATURE_MATRIX.csv')
-    df.to_csv(output_path, index=False)
+    atomic_write_dataframe_csv(df, output_path, index=False)
+    atomic_write_json({'identity': identity, 'normalized_sha256': sha256_file(output_path), 'params_sha256': sha256_file(params_path)}, receipt_path)
     print(f"Normalized feature matrix saved to {output_path}")
 
     gc.collect()

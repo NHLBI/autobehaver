@@ -1,4 +1,4 @@
-"""Worker helpers for standardized measurements extraction."""
+"""Extract bounded measurement candidates for one MMGen recording."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .measurements import extract_standardized_measurements_summary
+from .measurements import extract_measurement_candidates
 
 
 def compute_measurement_result(
@@ -19,22 +19,15 @@ def compute_measurement_result(
     individual_id: str,
     group: str,
     sex: str,
-) -> Optional[dict]:
-    """Compute standardized measurement output for one recording.
-
-    Returns a compact per-recording summary row (dict) rather than frame-level
-    measurement DataFrames. This prevents mmgen from accumulating large raw
-    measurement tables in RAM across many recordings.
-
-    Behavior preserved:
-    - only runs if config['make_measurements'] is True
-    - requires masked_orients to be present
+) -> Optional[pd.DataFrame]:
+    """Return a bounded measurement candidate table when measurements are enabled and
+    orientation labels are available.
     """
 
     if config.get("make_measurements") and masked_orients is not None:
         runtime = config.get("runtime_settings")
         random_seed = getattr(runtime, "random_seed", None)
-        return extract_standardized_measurements_summary(
+        return extract_measurement_candidates(
             masked_poses,
             masked_orients,
             aligned_poscalc_df,

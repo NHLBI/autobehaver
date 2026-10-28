@@ -1,4 +1,4 @@
-"""Module entry point for ``python -m autobehaver.preinf.keyprenorm``."""
+"""Run the KeyPreNorm command-line entry point."""
 
 from __future__ import annotations
 

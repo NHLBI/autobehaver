@@ -1,8 +1,7 @@
-"""Permutation-label utilities for FeatureImp.
+"""Shuffle training-fold labels within sex strata and restore predictions to the
+original binary label frame.
 
-The retained permutation-test path trains models on sex-stratified permuted
-training labels.  Report-generation utilities that compared real and permuted
-runs are kept in a focused module separate from model training.
+Test-fold labels remain unchanged.
 """
 
 from __future__ import annotations

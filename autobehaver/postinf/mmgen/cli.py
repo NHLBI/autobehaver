@@ -3,118 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
-from typing import Any, Dict, Sequence
-
-import yaml
-
-from autobehaver.argparse_utils import add_bool_pair, normalize_argv
-from autobehaver.pipeline_layout import apply_main_dir_overrides, config_main_dir_default
+from typing import Sequence
 
 
-def _load_config_defaults(config_path: str) -> Dict[str, Any]:
-    """Load mmgen defaults from the global pipeline YAML config.
-
-    The config is expected to contain a top-level `mmgen:` section.
-    All relative paths are resolved relative to the config file's directory.
-    """
-
-    cfg_path = Path(config_path).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
-    with cfg_path.open("r") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError("Pipeline config must be a YAML mapping (dict) at the top level")
-
-    section = data.get("mmgen", {})
-    if section is None:
-        section = {}
-    if not isinstance(section, dict):
-        raise ValueError("Expected 'mmgen' section in config to be a mapping (dict)")
-
-    base_dir = cfg_path.parent
-
-    def _resolve_path(v: str) -> str:
-        p = Path(str(v).strip())
-        if not p.is_absolute():
-            p = (base_dir / p).resolve()
-        return str(p)
-
-    defaults: Dict[str, Any] = {}
-
-    global_main_dir = config_main_dir_default(data, base_dir)
-    if global_main_dir:
-        defaults["main_dir"] = global_main_dir
-
-    v = section.get("main_dir")
-    if isinstance(v, str) and v.strip() != "":
-        defaults["main_dir"] = _resolve_path(v)
-
-    # I/O paths
-    if isinstance(section.get("inference_csv_dir"), str) and section.get("inference_csv_dir").strip() != "":
-        defaults["inference_csv_dir"] = _resolve_path(section.get("inference_csv_dir"))
-    if isinstance(section.get("poscalc_dir"), str) and section.get("poscalc_dir").strip() != "":
-        defaults["poscalc_dir"] = _resolve_path(section.get("poscalc_dir"))
-    if isinstance(section.get("output_dir"), str) and section.get("output_dir").strip() != "":
-        defaults["output_dir"] = _resolve_path(section.get("output_dir"))
-
-    # Core params
-    for k in ("inf_tag", "min_bout", "edge_skip", "num_workers", "input_batch_size", "random_seed"):
-        if k in section and section.get(k) is not None:
-            defaults[k] = section.get(k)
-
-    # Feature toggles / analysis scope
-    for k in (
-        "make_measurements",
-        "calculate_occupancy",
-        "calculate_postural_features",
-        "generate_quiver_plots",
-        "run_transition_statistics",
-        "make_detailed_transition_outputs",
-        "filter_features_by_bout_count",
-    ):
-        if k in section and section.get(k) is not None:
-            defaults[k] = bool(section.get(k))
-    for k in ("min_bout_count_for_features", "min_bout_count_for_transitions"):
-        if k in section and section.get(k) is not None:
-            defaults[k] = section.get(k)
-
-    # Robustness / filtering
-    for k in ("resume", "finalize_only", "process_only", "append_new_data", "plan_only"):
-        if k in section and section.get(k) is not None:
-            defaults[k] = bool(section.get(k))
-    if "file_filter" in section and section.get("file_filter") is not None:
-        fv = str(section.get("file_filter")).strip()
-        defaults["file_filter"] = fv if fv != "" else None
-
-    # Calibration overrides
-    for k in ("chamber_diameter_px", "mm_per_px", "video_fps"):
-        if k in section and section.get(k) is not None:
-            defaults[k] = section.get(k)
-
-    # Temporary-file policy
-    if "keep_temp_files" in section and section.get("keep_temp_files") is not None:
-        defaults["keep_temp_files"] = bool(section.get("keep_temp_files"))
-
-    # Output toggles
-    for k in ("master_matrix", "full_outputs"):
-        if k in section and section.get(k) is not None:
-            defaults[k] = bool(section.get(k))
-    # Optional deterministic sharding
-    for k in ("num_shards", "shard_index", "shard_by", "merge_shards", "matrix_first_shards", "finalize_shard_matrix", "merge_matrix_parts", "append_batch_id"):
-        if k in section and section.get(k) is not None:
-            if k in {"merge_shards", "matrix_first_shards", "finalize_shard_matrix", "merge_matrix_parts"}:
-                defaults[k] = bool(section.get(k))
-            else:
-                defaults[k] = section.get(k)
-
-    return defaults
+from autobehaver.argparse_utils import add_bool_pair, parse_cli_args
+from autobehaver.resource_monitor import add_monitor_arguments, monitored_cli, record_settings
+from autobehaver.pipeline_layout import apply_main_dir_overrides
 
 
-def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the MMGen processing, finalization, and shard argument parser."""
     p = argparse.ArgumentParser(
         description=(
             "Autobehaver post-inference: master matrix generation (mmgen).\n\n"
@@ -123,24 +21,19 @@ def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentPar
         )
     )
 
-    # Global pipeline config (optional)
-    p.add_argument("--config", help="Global pipeline YAML config file")
-
     p.add_argument(
         "--main_dir",
-        default=(defaults or {}).get("main_dir"),
+        default=None,
         required=False,
         help=(
-            "Optional project root containing the standardized numbered pipeline folders. "
-            "For mmgen this fills inference_csv_dir=<main_dir>/6_posepred_inference, "
-            "poscalc_dir=<main_dir>/4_keypoint_features, and output_dir=<main_dir>/8_master_matrix."
+            'Project root for standard MMGen input and output folders; explicit paths take precedence.'
         ),
     )
 
     # I/O (canonical)
     p.add_argument("--inference_csv_dir", required=False, help="Directory containing Autobehaver inference CSVs.")
     p.add_argument("--poscalc_dir", required=False, help="Directory containing positional_calcs CSVs.")
-    p.add_argument("--output_dir", required=False, help="Directory to write mmgen outputs.")
+    p.add_argument("--output_dir", required=False, help='Directory for MMGen outputs.')
 
     # Matching / parsing
     p.add_argument("--inf_tag", default="_normalized_inference", help="Suffix tag used to match inference to poscalc files.")
@@ -148,6 +41,18 @@ def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentPar
     # Bout params
     p.add_argument("--min_bout", type=int, default=5, help="Minimum bout length in frames.")
     p.add_argument("--edge_skip", type=int, default=5, help="Frames to skip at start/end for some computations.")
+    p.add_argument("--source_frame_offset", type=int, default=0,
+                   help='Offset from legacy one-based Frame Number to original KeyPre rows. Use 5 only for inputs that removed five leading rows; original-frame-indexed inputs use 0.')
+    add_bool_pair(
+        p,
+        "allow_unsafe_alignment_fallback",
+        default=False,
+        help=(
+            "Opt in to the historical positional/inference row truncation heuristic. "
+            "Disabled by default because it can silently associate the wrong frames."
+        ),
+        dest="allow_unsafe_alignment_fallback",
+    )
 
     # Parallelism / seeds
     p.add_argument("--num_workers", type=int, default=16, help="Multiprocessing workers.")
@@ -185,8 +90,9 @@ def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentPar
     add_bool_pair(
         p,
         "keep_temp_files",
-        default=True,
-        help="Keep temporary on-disk HDF5 tables after successful run.",
+        default=False,
+        help="Keep temporary on-disk HDF5 tables after successful completion; normally removed. "
+             "Failures, resume, and standalone processing/finalization stages retain required stores.",
         dest="keep_temp_files",
     )
     p.add_argument("--input_batch_size", type=int, default=20, help="How many inference CSVs to process per aggregation batch.")
@@ -203,7 +109,7 @@ def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentPar
         p,
         "full_outputs",
         default=True,
-        help="Emit the numbered root-level mmgen outputs (1_, 2_, 3_, ... 12_) during finalization.",
+        help='Write the numbered MMGen summary reports during finalization.',
         dest="full_outputs",
     )
     # Robustness / scheduling
@@ -256,15 +162,14 @@ def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentPar
             "Required for sharded append processing and shard merge/finalize steps."
         ),
     )
+    p.add_argument("--file_list", help="Explicit batch list of logical chamber recording stems")
     p.add_argument(
         "--file_filter",
         default=None,
         help="Optional substring filter applied to inference CSV filenames (e.g., trial3)",
     )
 
-    # ------------------------------------------------------------------
     # Deterministic sharding (optional)
-    # ------------------------------------------------------------------
     p.add_argument(
         "--num_shards",
         type=int,
@@ -343,43 +248,26 @@ def build_parser(defaults: Dict[str, Any] | None = None) -> argparse.ArgumentPar
     p.add_argument("--mm_per_px", type=float, default=0.0169896744624207, help="Real-world calibration: mm per pixel.")
     p.add_argument("--video_fps", type=float, default=40.0, help="Video FPS used for time conversions.")
 
-    # Apply config-derived defaults last.
-    if defaults:
-        p.set_defaults(**defaults)
-
-    return p
+    return add_monitor_arguments(p)
 
 
+@monitored_cli("mmgen")
 def main(argv: Sequence[str] | None = None) -> None:
-    # Two-stage parse so --config can provide defaults.
-    tmp_parser = argparse.ArgumentParser(add_help=False)
-    tmp_parser.add_argument("--config")
-    if argv is None:
-        tmp_ns, _ = tmp_parser.parse_known_args()
-        argv_list = sys.argv[1:]
-    else:
-        argv_list = list(argv)
-        tmp_ns, _ = tmp_parser.parse_known_args(argv_list)
-
-    cfg_path = getattr(tmp_ns, "config", None)
-
-    defaults: Dict[str, Any] = {}
-    if cfg_path:
-        defaults = _load_config_defaults(cfg_path)
-
-    parser = build_parser(defaults=defaults)
-    argv_list = normalize_argv(argv_list, parser=parser)
-    args = parser.parse_args(argv_list)
+    """Resolve MMGen runtime settings and run the requested workflow."""
+    parser = build_parser()
+    args = parse_cli_args(parser, argv)
     apply_main_dir_overrides(args, stage="mmgen")
 
     if any(bool(getattr(args, name, False)) for name in ["matrix_first_shards", "finalize_shard_matrix"]):
         args.master_matrix = True
         args.full_outputs = False
 
+    record_settings(args)
+
     if not args.inference_csv_dir or not args.poscalc_dir or not args.output_dir:
         raise SystemExit(
             "mmgen requires --inference_csv_dir, --poscalc_dir, and --output_dir "
-            "(or provide them via --config mmgen section)"
+            "(or provide --main_dir)"
         )
 
     if args.finalize_only and args.process_only:
@@ -457,6 +345,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         inf_tag=args.inf_tag,
         min_bout=args.min_bout,
         edge_skip=args.edge_skip,
+        source_frame_offset=args.source_frame_offset,
         num_workers=args.num_workers,
         random_seed=args.random_seed,
         make_measurements=args.make_measurements,
@@ -475,10 +364,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         chamber_diameter_px=chamber_diameter,
         mm_per_px=args.mm_per_px,
         video_fps=args.video_fps,
+        allow_unsafe_alignment_fallback=bool(args.allow_unsafe_alignment_fallback),
         resume=bool(args.resume),
         finalize_only=bool(args.finalize_only),
         process_only=bool(args.process_only),
         file_filter=args.file_filter,
+        file_list=args.file_list,
         num_shards=int(getattr(args, "num_shards", 1)),
         shard_index=int(getattr(args, "shard_index", 0)),
         shard_by=str(getattr(args, "shard_by", "hash")),

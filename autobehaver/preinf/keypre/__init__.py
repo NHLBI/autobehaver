@@ -1,7 +1,4 @@
-"""Keypoint preprocessing (keypre).
-
-This stage reads DeepLabCut outputs and produces per-frame engineered features.
-"""
+"""Derive per-frame engineered features from DeepLabCut outputs with KeyPre."""
 
 from .config import KeypreConfig
 

@@ -1,4 +1,4 @@
-"""Multiprocessing-safe logging helpers for keyprenorm."""
+"""Route KeyPreNorm worker logs through a parent-process queue listener."""
 
 from __future__ import annotations
 
@@ -10,7 +10,44 @@ import multiprocessing as mp
 from typing import List, Optional, Tuple
 
 
+class _OwnedQueueListener(QueueListener):
+    """Restore caller logging and release the stage's queue when it stops."""
+
+    def __init__(self, queue, *handlers, **kwargs):
+        super().__init__(queue, *handlers, **kwargs)
+        root = logging.getLogger()
+        self._previous_handlers = list(root.handlers)
+        self._previous_level = root.level
+        logger = logging.getLogger("keyprenorm")
+        self._previous_logger_state = (logger.level, logger.propagate)
+        self._closed = False
+
+    def stop(self):
+        if self._closed:
+            return
+        # No later message may enter a queue whose consumer has stopped.
+        root = logging.getLogger()
+        other_handlers = [handler for handler in root.handlers
+                          if not (isinstance(handler, QueueHandler)
+                                  and handler.queue is self.queue)
+                          and handler not in self._previous_handlers]
+        root.handlers[:] = self._previous_handlers + other_handlers
+        root.setLevel(self._previous_level)
+        logger = logging.getLogger("keyprenorm")
+        logger.setLevel(self._previous_logger_state[0])
+        logger.propagate = self._previous_logger_state[1]
+        try:
+            super().stop()
+        finally:
+            self.queue.close()
+            self.queue.join_thread()
+            for handler in self.handlers:
+                handler.close()
+            self._closed = True
+
+
 def _parse_log_level(level_str: str) -> int:
+    """Resolve a logging level name or raise for an invalid name."""
     level = getattr(logging, str(level_str).upper(), None)
     if not isinstance(level, int):
         raise ValueError(f"Invalid --log_level '{level_str}'. Use DEBUG, INFO, WARNING, ERROR.")
@@ -18,14 +55,13 @@ def _parse_log_level(level_str: str) -> int:
 
 
 def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.Queue, QueueListener]:
-    """Configure multiprocessing-safe logging using a QueueListener.
+    """Start a logging queue listener and return (queue, listener).
 
-    Returns:
-        (log_queue, listener). Caller must stop the listener at shutdown.
+    The caller must stop the listener after workers and final logging finish.
     """
     level = _parse_log_level(log_level)
 
-    log_queue: mp.Queue = mp.Queue(-1)
+    log_queue: mp.Queue = mp.get_context("spawn").Queue(-1)
 
     fmt = logging.Formatter(
         fmt="%(asctime)s | %(levelname)s | %(processName)s | %(message)s",
@@ -46,16 +82,14 @@ def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.
         fh.setLevel(level)
         handlers.append(fh)
 
-    listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
+    listener = _OwnedQueueListener(log_queue, *handlers, respect_handler_level=True)
     listener.start()
 
-    # Root logger in the main process sends to the queue
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(level)
     root.addHandler(QueueHandler(log_queue))
 
-    # Ensure our named logger propagates to root
     keyprenorm_logger = logging.getLogger("keyprenorm")
     keyprenorm_logger.propagate = True
     keyprenorm_logger.setLevel(level)
@@ -64,7 +98,7 @@ def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.
 
 
 def setup_worker_logging(log_queue: mp.Queue, log_level: str) -> None:
-    """Attach a QueueHandler in a worker process."""
+    """Route worker log records to the parent-process queue."""
     level = _parse_log_level(log_level)
     root = logging.getLogger()
     root.handlers.clear()

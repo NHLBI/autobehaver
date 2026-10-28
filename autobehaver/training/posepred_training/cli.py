@@ -1,9 +1,4 @@
-"""CLI wrapper for pose prediction training.
-
-Preferred entrypoint:
-
-    python -m autobehaver.training.posepred_training ...
-"""
+"""Expose the shared PosePred argument parser and training CLI."""
 
 from ...cli import build_parser, main
 

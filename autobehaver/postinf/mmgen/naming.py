@@ -1,27 +1,19 @@
-"""Naming and ID parsing helpers for mmgen.
+"""Parse MMGen group, sex, recording, and animal identities from filenames.
 
-This module contains small, shared helpers that are used across the mmgen
-pipeline (orchestration, worker processing, and optional movie generation).
-
-These functions are shared across mmgen so that filename parsing and identity
-collapse logic live in one place. They provide a
-single source of truth.
+Trial remains part of animal identity; movie numbers distinguish recordings before
+aggregation.
 """
 
 from __future__ import annotations
 
 import re
+from autobehaver.portable_paths import original_name
 
 
 def parse_group_and_individual(filename: str):
-    """Parse a filename to extract group label, unique individual ID, and sex.
+    """Parse group, recording identity, and sex from the original logical filename."""
 
-    Notes
-    -----
-    This logic defines the current filename parsing contract used across mmgen.
-    implementation to avoid changing downstream outputs.
-    """
-
+    filename = original_name(filename)
     # Remove file extensions and common tags
     base = (
         filename.replace("_normalized_inference.csv", "")
@@ -29,7 +21,7 @@ def parse_group_and_individual(filename: str):
         .replace(".csv", "")
     )
 
-    # --- Sex and Group Extraction ---
+    # Sex and Group Extraction
     sex = "Unknown"
     if "_FEMALE_" in base:
         sex = "FEMALE"
@@ -41,7 +33,7 @@ def parse_group_and_individual(filename: str):
         # Fallback for simpler names
         group = base.split("_")[0]
 
-    # --- Individual ID Extraction ---
+    # Individual ID Extraction
     # Extract components separately: trial is part of identity, movie is a recording number
     trial_match = re.search(r"trial(\d+)", base)
     movie_match = re.search(r"movie(\d+)", base)
@@ -53,7 +45,7 @@ def parse_group_and_individual(filename: str):
     rpi = rpi_match.group(1) if rpi_match else ""
     chamber = chamber_match.group(1) if chamber_match else ""
 
-    # A robust individual ID combines the unique parts.
+    # Combine the recording-identity tokens in a stable order.
     # Individual identity = rpi + chamber + trial (trial is part of identity)
     # Movie is included in the full individual_id for per-file tracking, but gets collapsed later
     individual = f"{group}_{sex}_{rpi}_{trial}_{movie}_{chamber}"

@@ -1,0 +1,4 @@
+# Local/HPC scientific runtime. The full OpenCV build keeps Moviechecker usable.
+-r requirements-core.txt
+opencv-python==4.10.0.84
+torch==2.10.0

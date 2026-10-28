@@ -9,6 +9,8 @@ from autobehaver.postinf.mmgen.ledger import (
     build_row_identity_summary_df,
     build_source_ledger_df,
     write_batch_manifest_json,
+    write_row_identity_summary_csv,
+    write_source_ledger_csv,
 )
 from autobehaver.postinf.mmgen.mapping import create_animal_mapping
 from autobehaver.postinf.mmgen.naming import collapse_individual_id, parse_group_and_individual
@@ -24,8 +26,8 @@ class TestMMGenLedger(unittest.TestCase):
         out.mkdir()
 
         names = [
-            "CONTROL-PLPdeltaR-plus_FEMALE_plp_deltaR_experiment_trial1_rpi-1_movie0_20250501124915PM_chamber5_positional_calcs_normalized_inference.csv",
-            "CONTROL-PLPdeltaR-plus_FEMALE_plp_deltaR_experiment_trial1_rpi-1_movie1_20250501134915PM_chamber5_positional_calcs_normalized_inference.csv",
+            "CONTROL-Example-reference_FEMALE_example_experiment_trial1_rpi-1_movie0_20250501124915PM_chamber5_positional_calcs_normalized_inference.csv",
+            "CONTROL-Example-reference_FEMALE_example_experiment_trial1_rpi-1_movie1_20250501134915PM_chamber5_positional_calcs_normalized_inference.csv",
         ]
         for name in names:
             (inf / name).write_text("Smoothed Pose Label,Smoothed Orient Label\nWalking,Floor\n")
@@ -116,6 +118,8 @@ class TestMMGenLedger(unittest.TestCase):
                     {"individual": collapsed, "group": group, "sex": sex, "Feature_A": 1.23}
                 ]),
             )
+            write_source_ledger_csv(str(out), ledger_df)
+            write_row_identity_summary_csv(str(out), row_df)
             manifest_path = write_batch_manifest_json(
                 output_dir=str(out),
                 inference_csv_dir=str(inf),

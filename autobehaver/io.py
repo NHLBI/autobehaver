@@ -1,39 +1,41 @@
-"""I/O helpers for Autobehaver.
-
-Includes utilities for discovering input files, reading HDF5 feature arrays, and extracting basic
-metadata required to configure the model and data pipeline."""
+"""Read HDF5 feature headers and serialize portable artifact paths."""
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import h5py
 import numpy as np
 
 
-__all__ = ['get_headers_from_first_hdf5', 'get_num_features_from_first_hdf5']
+__all__ = ['get_headers_from_first_hdf5', 'get_num_features_from_first_hdf5', 'portable_relpath']
+
+
+def portable_relpath(path: str | os.PathLike[str], start: str | os.PathLike[str]) -> str:
+    """Serialize a relative path with POSIX separators.
+
+    Use native paths for filesystem access. Preserve an absolute path when
+    Windows drives differ and no relative path can represent the location.
+    """
+
+    try:
+        relative = os.path.relpath(os.fspath(path), start=os.fspath(start))
+    except (OSError, ValueError):
+        # Different Windows drives cannot be expressed as a relative path.
+        # Preserve the absolute location, but still serialize separators
+        # consistently.
+        return Path(path).expanduser().resolve().as_posix()
+    return Path(relative).as_posix()
 
 
 def get_headers_from_first_hdf5(input_folder: str) -> list[str]:
-    """
-    Retrieves feature/column names from the first suitable HDF5 file in the specified folder.
+    """Read headers from a usable HDF5 feature array in the folder.
 
-    IMPORTANT:
-    - The behavior model expects the HDF5 file to contain a 2D dataset named 'data' with shape (T, F).
-    - The feature (column) names are expected to be stored under the key 'columns'.
-
-    This function is used to determine feature/column names so downstream code can apply augmentation
-    policies based on feature semantics.
-
-    If no column-name metadata is found, this function will fall back to returning
-    generic names ["col_0", ..., "col_{F-1}"] and will print a warning. In that case,
-    any name-based feature-selection policy may be less accurate.
-
-    Parameters:
-    - input_folder: Directory containing HDF5 files.
-
-    Returns:
-    - list[str]: Feature names of length F.
+    Feature data is expected as ``data`` with shape (T, F). Read ``columns``
+    from file attributes, data attributes or a root dataset. Missing or
+    length-mismatched headers fall back to col_0 through col_{F-1}; these names
+    cannot preserve semantic feature selection.
     """
     files = os.listdir(input_folder)
     hdf5_files = sorted(
@@ -104,21 +106,9 @@ def get_headers_from_first_hdf5(input_folder: str) -> list[str]:
 
 
 def get_num_features_from_first_hdf5(input_folder: str) -> int:
-    """
-    Determines the number of features (columns) from the first suitable HDF5 file in the specified folder.
+    """Return F from the first usable HDF5 ``data`` array of shape (T, F).
 
-    This function scans the folder for HDF5 files and returns the second dimension (F) of the 2D
-    dataset named 'data' with shape (T, F).
-
-    Parameters:
-    - input_folder: str
-        Path to directory containing HDF5 files.
-
-    Returns:
-    - int: number of features (F).
-
-    Raises:
-    - FileNotFoundError: If no suitable HDF5 file with a 2D 'data' dataset is found.
+    Raise FileNotFoundError when no suitable array is found.
     """
     files = os.listdir(input_folder)
     hdf5_files = sorted(

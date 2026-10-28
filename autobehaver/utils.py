@@ -1,7 +1,4 @@
-"""Miscellaneous helper utilities used across Autobehaver.
-
-This module contains small, general-purpose helpers that do not belong to a single submodule.
-"""
+"""Manage cached memory, report GPU memory and seed data-loader workers."""
 
 from __future__ import annotations
 

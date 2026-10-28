@@ -1,4 +1,4 @@
-"""Core supervised pose prediction training helpers."""
+"""Expose supervised PosePred preparation, model setup and training loops."""
 
 from ..._training_core import main_worker, model_setup, prepare_data, train_one_epoch, validate_one_epoch
 

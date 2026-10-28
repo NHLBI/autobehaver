@@ -1,54 +1,15 @@
 name: autobehaver
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 
 dependencies:
-  - python=3.10
-  - pip>=23
+  - python=3.12
+  - pip>=26.2
+  - setuptools>=83
+  - wheel>=0.46.2
   - ffmpeg
-  - hdf5
-  - pytables=3.8
-
-  # Runtime libraries needed on some older HPC systems.
-  - libstdcxx-ng>=12
-  - libgcc-ng>=12
-  - lerc
-
-  # Core scientific stack used by the non-DLC Autobehaver stages.
-  # DeepLabCut/TensorFlow are intentionally not installed here; use
-  # environment/environment-dlc-tf.yml or an HPC DLC module for the DLC stage.
-  - six
-  - numpy=1.23.5
-  - pandas>=1.5,<2.3
-  - scipy>=1.10
-  - scikit-learn>=1.2
-  - statsmodels>=0.14
-  - matplotlib>=3.7
-  - seaborn>=0.12
-  - opencv>=4.8
-  - imageio
-  - imageio-ffmpeg
-  - h5py>=3.8
-  - pyyaml>=6
-  - pytest>=8
-  - tqdm>=4.65
-  - joblib>=1.2
-  - openpyxl>=3.1
-  - xgboost>=1.7
-  - shap>=0.42
-  - gseapy>=1.0
-  - wandb>=0.16
-  - pillow
-  - scikit-image
-
-  # GPU-capable PyTorch for PosePred training/inference. This environment file is
-  # primarily intended for Linux/CUDA systems. CPU-only, macOS, or different-CUDA
-  # users may need to replace these PyTorch lines with the install recipe
-  # recommended by PyTorch for their platform.
-  - pytorch=2.3.1
-  - torchvision=0.18.1
-  - torchaudio=2.3.1
-  - pytorch-cuda=11.8
+  - pip:
+      # Relative paths use this file's directory; local OpenCV enables review windows.
+      - -r requirements-local-core.txt
+      - -e ..

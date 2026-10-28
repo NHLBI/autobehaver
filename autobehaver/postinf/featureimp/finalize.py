@@ -1,15 +1,7 @@
-"""Finalization / aggregation helpers for the featureimp pipeline.
+"""Aggregate FeatureImp SHAP results and predictions into summaries, plots, and
+formatted workbooks.
 
-This module contains the import-heavy "end of pipeline" logic:
-
-- Aggregating committee outputs into final SHAP summaries and reports
-- Generating consolidated SHAP summary spreadsheets
-- Writing averaged prediction spreadsheets
-- Handling analogous outputs for permutation-test runs
-
-The goal is to keep the staged orchestration modules focused on planning,
-shard execution, and merge/finalize control flow while isolating
-import-heavy plotting/spreadsheet code.
+Permutation runs use separate output prefixes.
 """
 
 from __future__ import annotations
@@ -19,6 +11,7 @@ import os
 import warnings
 
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -107,7 +100,6 @@ def _build_consolidated_shap_summary_df(
         consolidated_df sorted by Global_Importance.
     """
 
-    # Validate
     if avg_shap_values is None or getattr(avg_shap_values, 'size', 0) == 0:
         raise ValueError("avg_shap_values is empty")
 
@@ -178,7 +170,7 @@ def _build_consolidated_shap_summary_df(
     consolidated_df = global_shap_df.copy()
     consolidated_df.rename(columns={'mean_abs_shap_global': 'Global_Importance'}, inplace=True)
 
-    # Apply overrides (phase4 weighted-excess global importance)
+    # Apply the supplied weighted-excess global-importance values.
     if global_importance_overrides:
         try:
             overrides_dict = dict(global_importance_overrides)
@@ -360,19 +352,34 @@ def _build_consolidated_shap_summary_df(
 
 
 
+
+def _hybrid_report_shap(all_values, oof_values, all_rows, training_rows):
+    """Use OOF training rows and all-model nontraining rows without mutating inputs."""
+    values = np.array(all_values, dtype=np.float32, copy=True)
+    oof = np.asarray(oof_values, dtype=np.float32)
+    all_ids = pd.Index(all_rows["individual"].astype(str))
+    training_ids = pd.Index(training_rows["individual"].astype(str))
+    if not all_ids.is_unique or not training_ids.is_unique:
+        raise ValueError("Hybrid SHAP report requires unique individual identifiers")
+    positions = all_ids.get_indexer(training_ids)
+    if (positions < 0).any() or values.ndim != 2 or oof.shape != (len(training_ids), values.shape[1]) or len(values) != len(all_ids):
+        raise ValueError("Hybrid SHAP report rows or feature dimensions do not align")
+    values[positions] = oof
+    return values
+
 def _aggregate_and_summarize_permuted_results(df, selected_features, all_permuted_performance,
                                               all_permuted_shap_values, le, paths, permutation_idx,
                                               permuted_insample_shap, permuted_oof_shap, df_for_training,
                                               train_groups_list, n_splits, permuted_all_groups_avg_probas=None,
                                               permuted_all_groups_avg_shap_values=None, df_for_shap_and_agg=None,
                                               permuted_insample_probas=None, permuted_oof_probas=None,
-                                              all_fold_indices=None):
-    """
-    Aggregates results from permuted models and generates output files with PERMUTED_N_ prefix.
+                                              all_fold_indices=None, primary_is_weighted=False):
+    """Aggregate results from permuted models and generates output files with
+    PERMUTED_N_ prefix.
     Similar to _aggregate_and_summarize_results but for permuted models.
     """
     print(f"\n--- Aggregating Permuted Results (Permutation {permutation_idx + 1}) ---")
-    print("Note: Probabilities have been flipped to be relative to true labels for direct comparison with real models.")
+    print("Training Prob_* columns use held-out predictions; non-training columns use the committee average.")
     
     # Modify paths to include permutation prefix
     permuted_paths = paths.copy()
@@ -473,7 +480,7 @@ def _aggregate_and_summarize_permuted_results(df, selected_features, all_permute
     if permuted_outofsample_df is not None and permuted_insample_df is not None:
         _combine_insample_outofsample_summaries(permuted_insample_df, permuted_outofsample_df, permuted_paths)
     
-    # --- Generate AVERAGED_PREDICTIONS_FULL.xlsx for all groups (similar to real models) ---
+    # Generate AVERAGED_PREDICTIONS_FULL.xlsx for all groups (similar to real models)
     if permuted_all_groups_avg_probas is not None and df_for_shap_and_agg is not None:
         print(f"\n--- Saving Averaged Predictions for All Groups (Permutation {permutation_idx + 1}) ---")
         num_classes = len(le.classes_)
@@ -560,7 +567,6 @@ def _aggregate_and_summarize_permuted_results(df, selected_features, all_permute
         else:
             all_predictions_df = non_training_predictions_df
         
-        # Save to Excel with formatting
         all_predictions_path = os.path.join(permuted_analysis_folder, f'AVERAGED_PREDICTIONS_PERMUTED_{permutation_idx}.xlsx')
         save_predictions_with_formatting(all_predictions_df, all_predictions_path)
         print(f"Averaged predictions for all groups saved to {all_predictions_path}")
@@ -568,7 +574,7 @@ def _aggregate_and_summarize_permuted_results(df, selected_features, all_permute
         print(f"  - Non-training groups: {len(non_training_predictions_df)} samples with committee-average Prob_* columns only")
 
     
-    # --- Generate SHAP_CONSOLIDATED_SUMMARY.xlsx for all groups ---
+    # Generate SHAP_CONSOLIDATED_SUMMARY.xlsx for all groups
     if permuted_all_groups_avg_shap_values is not None and df_for_shap_and_agg is not None:
         print(f"\n--- Generating Full Analysis for All Groups (Permutation {permutation_idx + 1}) ---")
         
@@ -578,7 +584,9 @@ def _aggregate_and_summarize_permuted_results(df, selected_features, all_permute
         permuted_paths['shap_values_folder'] = permuted_shap_values_folder
         
         avg_shap_file_path = os.path.join(permuted_shap_values_folder, f'all_groups_avg_shap_values_PERMUTED_{permutation_idx}.mmap')
-        all_groups_avg_shap_values_f32 = permuted_all_groups_avg_shap_values.astype(np.float32)
+        all_groups_avg_shap_values_f32 = _hybrid_report_shap(
+            permuted_all_groups_avg_shap_values, permuted_oof_shap,
+            df_for_shap_and_agg, df_for_training)
         
         print(f"  - Saving to memmap: {avg_shap_file_path}")
         print(f"  - Memmap shape: {all_groups_avg_shap_values_f32.shape}, dtype: float32")
@@ -598,6 +606,7 @@ def _aggregate_and_summarize_permuted_results(df, selected_features, all_permute
             le=le,
             paths=permuted_paths,
             avg_shap_values_override=all_groups_avg_shap_values_f32,
+            primary_is_weighted=primary_is_weighted,
         )
 
 
@@ -613,6 +622,7 @@ def _aggregate_and_summarize_results(
     avg_shap_values_override=None,
     extra_consolidated_shap_arrays=None,
     extra_feature_annotations_df=None,
+    primary_is_weighted=None,
 ):
     """
     Aggregate per-specialist outputs into final SHAP summaries and reports.
@@ -642,7 +652,7 @@ def _aggregate_and_summarize_results(
 
     feature_stats_df = None
 
-    # --- Performance Report ---
+    # Performance Report
     # Clean performance results
     cleaned_performance_results = [_clean_performance_dict_for_json(p) for p in performance_results]
 
@@ -675,7 +685,7 @@ def _aggregate_and_summarize_results(
             print(f"  (Based on {len(train_accuracies)} specialist models)")
 
 
-    # --- Aggregate Standard SHAP Values ---
+    # Aggregate Standard SHAP Values
     avg_shap_values = None
     if avg_shap_values_override is not None:
         avg_shap_values = np.asarray(avg_shap_values_override, dtype=np.float32)
@@ -729,11 +739,6 @@ def _aggregate_and_summarize_results(
         print("WARNING: Found inf values in SHAP data. Replacing with NaN.")
         avg_shap_values = np.where(np.isinf(avg_shap_values), np.nan, avg_shap_values)
     
-    # Note: Per-individual summary is now generated in the main analysis section
-    # by combining in-sample and out-of-sample sheets. This combined version
-    # (from aggregated SHAP values) is no longer needed and has been removed.
-    # The individual summary is now only created from the in-sample/out-of-sample
-    # breakdown files for better clarity and consistency.
 
     # Build consolidated summary for the primary SHAP view
     consolidated_df = _build_consolidated_shap_summary_df(
@@ -751,7 +756,8 @@ def _aggregate_and_summarize_results(
     )
 
     # Optional: additional consolidated-summary tabs (e.g. weighted / unweighted).
-    primary_is_weighted = global_importance_overrides is not None
+    if primary_is_weighted is None:
+        primary_is_weighted = global_importance_overrides is not None
     consolidated_df = _clean_consolidated_shap_output_df(consolidated_df)
     consolidated_sheets = {}
     sheet_order = []
@@ -848,4 +854,3 @@ def _aggregate_and_summarize_results(
         print(f"Global importance ranking saved to: {ranking_path}")
     except Exception as e:
         print(f"WARNING: Could not write GLOBAL_IMPORTANCE_RANKING CSV: {e}")
-

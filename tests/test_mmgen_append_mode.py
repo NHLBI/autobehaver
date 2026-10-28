@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pandas as pd
 
 from autobehaver.postinf.mmgen.append_mode import run_mmgen_append_new_data
+from autobehaver.postinf.mmgen import append_mode as app, integrity
+from autobehaver.atomic_io import sha256_file, atomic_write_json
 from autobehaver.postinf.mmgen.core import MMGenConfig
 from autobehaver.postinf.mmgen.ledger import SOURCE_LEDGER_FILENAME
 from autobehaver.postinf.mmgen.naming import collapse_individual_id, parse_group_and_individual
@@ -36,11 +38,13 @@ class TestMMGenAppendMode(unittest.TestCase):
             "source_path": str(source_path),
             "source_exists": True,
             "source_file_size_bytes": int(s_stat.st_size),
+            "source_file_sha256": sha256_file(source_path),
             "source_file_mtime_utc": datetime.fromtimestamp(s_stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
             "poscalc_file": pos_name,
             "poscalc_path": str(pos_path),
             "poscalc_exists": True,
             "poscalc_file_size_bytes": int(p_stat.st_size),
+            "poscalc_file_sha256": sha256_file(pos_path),
             "poscalc_file_mtime_utc": datetime.fromtimestamp(p_stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
             "n_frames": 100,
             "group": group,
@@ -52,6 +56,22 @@ class TestMMGenAppendMode(unittest.TestCase):
             "chamber": "chamber5",
             "trial": 1,
         }
+
+    def _seal_generation(self, out, inf, pos):
+        cfg = MMGenConfig(inference_csv_dir=str(inf), poscalc_dir=str(pos), output_dir=str(out), emit_full_outputs=False)
+        names = pd.read_csv(out / SOURCE_LEDGER_FILENAME)['source_file'].tolist()
+        calc = app._cfg_calculation(cfg)
+        sources = integrity.source_identities(names, inference_csv_dir=str(inf), poscalc_dir=str(pos), inf_tag=cfg.inf_tag)
+        ident = dict(calculation=calc, calculation_sha256=integrity.content_hash(calc), sources=sources,
+                     sources_sha256=integrity.content_hash(sources))
+        for relative in app.CORE_ARTIFACTS:
+            target = out / relative
+            if not target.exists():
+                target.write_text('{}' if target.suffix == '.json' else 'row_identity\n')
+        atomic_write_json(ident, out / app.IDENTITY_RELATIVE_PATH)
+        atomic_write_json(dict(calculation_sha256=ident['calculation_sha256'], sources_sha256=ident['sources_sha256'],
+                               artifacts={name: sha256_file(out/name) for name in app.CORE_ARTIFACTS}),
+                          out / app.OUTPUT_RECEIPT_FILENAME)
 
     def test_append_new_data_updates_canonical_matrix_and_ledger(self):
         with tempfile.TemporaryDirectory() as td:
@@ -76,8 +96,8 @@ class TestMMGenAppendMode(unittest.TestCase):
             c_row = collapse_individual_id(parse_group_and_individual(c0)[1])
 
             existing_matrix = pd.DataFrame([
-                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "Feature_A": 1.0},
-                {"individual": b_row, "group": "GROUPB", "sex": "MALE", "Feature_A": 2.0},
+                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 1.0},
+                {"individual": b_row, "group": "GROUPB", "sex": "MALE", "BoutSummary_Pose_Walking_bout_frequency": 2.0},
             ])
             existing_matrix.to_csv(out / "MASTER_FEATURE_MATRIX.csv", index=False)
 
@@ -87,6 +107,7 @@ class TestMMGenAppendMode(unittest.TestCase):
             ])
             existing_ledger.to_csv(out / SOURCE_LEDGER_FILENAME, index=False)
 
+            self._seal_generation(out, inf, pos)
             captured = {}
 
             def _fake_delta_run(inf_csv_folder_path, poscalc_folder_path, output_folder_path, min_bout, edge_skip, inf_tag, **kwargs):
@@ -94,14 +115,16 @@ class TestMMGenAppendMode(unittest.TestCase):
                 out_dir = Path(output_folder_path)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 pd.DataFrame([
-                    {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "Feature_A": 10.0},
-                    {"individual": c_row, "group": "GROUPC", "sex": "FEMALE", "Feature_A": 3.0},
+                    {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 10.0},
+                    {"individual": c_row, "group": "GROUPC", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 3.0},
                 ]).to_csv(out_dir / "MASTER_FEATURE_MATRIX.csv", index=False)
                 pd.DataFrame([
                     self._ledger_row(inf, pos, a0),
                     self._ledger_row(inf, pos, a1),
                     self._ledger_row(inf, pos, c0),
                 ]).to_csv(out_dir / SOURCE_LEDGER_FILENAME, index=False)
+                self._seal_generation(out_dir, inf, pos)
+                (out_dir / "temp_store.h5").write_bytes(b"verified test temporary store")
 
             cfg = MMGenConfig(
                 inference_csv_dir=str(inf),
@@ -119,9 +142,9 @@ class TestMMGenAppendMode(unittest.TestCase):
 
             merged = pd.read_csv(out / "MASTER_FEATURE_MATRIX.csv")
             self.assertEqual(set(merged["individual"].tolist()), {a_row, b_row, c_row})
-            self.assertEqual(float(merged.loc[merged["individual"] == a_row, "Feature_A"].iloc[0]), 10.0)
-            self.assertEqual(float(merged.loc[merged["individual"] == b_row, "Feature_A"].iloc[0]), 2.0)
-            self.assertEqual(float(merged.loc[merged["individual"] == c_row, "Feature_A"].iloc[0]), 3.0)
+            self.assertEqual(float(merged.loc[merged["individual"] == a_row, "BoutSummary_Pose_Walking_bout_frequency"].iloc[0]), 10.0)
+            self.assertEqual(float(merged.loc[merged["individual"] == b_row, "BoutSummary_Pose_Walking_bout_frequency"].iloc[0]), 2.0)
+            self.assertEqual(float(merged.loc[merged["individual"] == c_row, "BoutSummary_Pose_Walking_bout_frequency"].iloc[0]), 3.0)
 
             merged_ledger = pd.read_csv(out / SOURCE_LEDGER_FILENAME)
             self.assertEqual(set(merged_ledger["source_file"].tolist()), {a0, a1, b0, c0})
@@ -148,10 +171,11 @@ class TestMMGenAppendMode(unittest.TestCase):
             a_row = collapse_individual_id(parse_group_and_individual(a0)[1])
 
             pd.DataFrame([
-                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "Feature_A": 1.0},
+                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 1.0},
             ]).to_csv(out / "MASTER_FEATURE_MATRIX.csv", index=False)
             pd.DataFrame([self._ledger_row(inf, pos, a0)]).to_csv(out / SOURCE_LEDGER_FILENAME, index=False)
 
+            self._seal_generation(out, inf, pos)
             # Mutate the already-processed inference file so append mode sees it as changed.
             (inf / a0).write_text("Smoothed Pose Label,Smoothed Orient Label\nWalking,Floor\nStanding,Floor\n")
 
@@ -182,11 +206,12 @@ class TestMMGenAppendMode(unittest.TestCase):
             a_row = collapse_individual_id(parse_group_and_individual(a0)[1])
 
             pd.DataFrame([
-                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "Feature_A": 1.0},
+                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 1.0},
             ]).to_csv(out / "MASTER_FEATURE_MATRIX.csv", index=False)
             pd.DataFrame([self._ledger_row(inf, pos, a0)]).to_csv(out / SOURCE_LEDGER_FILENAME, index=False)
 
-            # Mutate the already-processed file, but use a file_filter that only directly selects the *new* file.
+            self._seal_generation(out, inf, pos)
+            # An unselected changed recording must still invalidate the append plan.
             (inf / a0).write_text("Smoothed Pose Label,Smoothed Orient Label\nWalking,Floor\nStanding,Floor\n")
 
             cfg = MMGenConfig(
@@ -225,14 +250,15 @@ class TestMMGenAppendMode(unittest.TestCase):
             c_row = collapse_individual_id(parse_group_and_individual(c0)[1])
 
             pd.DataFrame([
-                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "Feature_A": 1.0},
-                {"individual": b_row, "group": "GROUPB", "sex": "MALE", "Feature_A": 2.0},
+                {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 1.0},
+                {"individual": b_row, "group": "GROUPB", "sex": "MALE", "BoutSummary_Pose_Walking_bout_frequency": 2.0},
             ]).to_csv(out / "MASTER_FEATURE_MATRIX.csv", index=False)
             pd.DataFrame([
                 self._ledger_row(inf, pos, a0),
                 self._ledger_row(inf, pos, b0),
             ]).to_csv(out / SOURCE_LEDGER_FILENAME, index=False)
 
+            self._seal_generation(out, inf, pos)
             plan_cfg = MMGenConfig(
                 inference_csv_dir=str(inf),
                 poscalc_dir=str(pos),
@@ -305,19 +331,22 @@ class TestMMGenAppendMode(unittest.TestCase):
             def _fake_merge(*, output_folder, num_shards, **kwargs):
                 self.assertEqual(int(num_shards), 2)
                 Path(output_folder, "temp_store.h5").write_bytes(b"merged")
+                stores = [Path(output_folder, "temp_store.h5"), *Path(output_folder).glob("_mmgen_shards/*/temp_store.h5")]
+                kwargs["verified_store_identities"].extend((str(path), sha256_file(path)) for path in stores)
                 return str(Path(output_folder, "temp_store.h5"))
 
             def _fake_finalize(inf_csv_folder_path, poscalc_folder_path, output_folder_path, min_bout, edge_skip, inf_tag, **kwargs):
                 out_dir = Path(output_folder_path)
                 pd.DataFrame([
-                    {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "Feature_A": 10.0},
-                    {"individual": c_row, "group": "GROUPC", "sex": "FEMALE", "Feature_A": 3.0},
+                    {"individual": a_row, "group": "GROUPA", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 10.0},
+                    {"individual": c_row, "group": "GROUPC", "sex": "FEMALE", "BoutSummary_Pose_Walking_bout_frequency": 3.0},
                 ]).to_csv(out_dir / "MASTER_FEATURE_MATRIX.csv", index=False)
                 pd.DataFrame([
                     self._ledger_row(inf, pos, a0),
                     self._ledger_row(inf, pos, a1),
                     self._ledger_row(inf, pos, c0),
                 ]).to_csv(out_dir / SOURCE_LEDGER_FILENAME, index=False)
+                self._seal_generation(out_dir, inf, pos)
 
             with patch("autobehaver.postinf.mmgen.append_mode.merge_shard_temp_stores", side_effect=_fake_merge), \
                  patch("autobehaver.postinf.mmgen.append_mode.pipeline.run_post_inference_analysis", side_effect=_fake_finalize):
@@ -336,9 +365,9 @@ class TestMMGenAppendMode(unittest.TestCase):
 
             merged = pd.read_csv(out / "MASTER_FEATURE_MATRIX.csv")
             self.assertEqual(set(merged["individual"].tolist()), {a_row, b_row, c_row})
-            self.assertEqual(float(merged.loc[merged["individual"] == a_row, "Feature_A"].iloc[0]), 10.0)
-            self.assertEqual(float(merged.loc[merged["individual"] == b_row, "Feature_A"].iloc[0]), 2.0)
-            self.assertEqual(float(merged.loc[merged["individual"] == c_row, "Feature_A"].iloc[0]), 3.0)
+            self.assertEqual(float(merged.loc[merged["individual"] == a_row, "BoutSummary_Pose_Walking_bout_frequency"].iloc[0]), 10.0)
+            self.assertEqual(float(merged.loc[merged["individual"] == b_row, "BoutSummary_Pose_Walking_bout_frequency"].iloc[0]), 2.0)
+            self.assertEqual(float(merged.loc[merged["individual"] == c_row, "BoutSummary_Pose_Walking_bout_frequency"].iloc[0]), 3.0)
 
             latest_report = json.loads((out / "MMGEN_APPEND_LATEST.json").read_text())
             self.assertEqual(latest_report["counts"]["active_num_shards"], 2)

@@ -1,17 +1,18 @@
-"""Matrix-first shard helpers for mmgen.
+"""Finalize MMGen stores into shard-local matrices and merge verified animal-row
+partitions.
 
-This module implements the first milestone of the matrix-first redesign:
-- finalize one existing shard-local temp store into a shard-local master matrix
-- merge shard-local master matrices into the final MASTER_FEATURE_MATRIX.csv
-
-The implementation deliberately reuses the existing mmgen finalization/math so the
-resulting matrix stays aligned with the global finalize path while avoiding
-one giant merged temp-store bottleneck for the matrix-only workflow.
+Reuse the standard finalization calculations without constructing a single merged
+frame-level store.
 """
 
 from __future__ import annotations
 
+from autobehaver.progress import progress
+
 import json
+import inspect
+from contextlib import ExitStack
+from functools import wraps
 import os
 import re
 import socket
@@ -23,12 +24,16 @@ import pandas as pd
 
 from autobehaver import __version__ as AUTOBEHAVER_VERSION
 
-from .discovery import list_inference_csv_files
+from .io import read_metadata_csv
 from .feature_matrix import reorder_master_matrix_columns, write_feature_units_manifest
 from .hdf_store import cleanup_temp_store
-from .locks import DirLock
+from .locks import ShardLock
+from .publication import canonical_generation
 from .runtime import MMGenRuntimeSettings
-from .sharding import select_files_for_shard
+from .cohort import read_shard_cohort, verify_shard_membership
+from .integrity import IDENTITY_FILENAME, content_hash, validate_commits, read_store_identity
+from .naming import collapse_individual_id, parse_group_and_individual
+from autobehaver.atomic_io import atomic_write_json, atomic_write_dataframe_csv, sha256_file
 
 
 SHARDS_DIRNAME_DEFAULT = "_mmgen_shards"
@@ -38,10 +43,14 @@ FINAL_MATRIX_MERGE_MANIFEST = "MATRIX_PARTS_MERGED.json"
 
 
 def get_shard_output_dir(output_dir: str, num_shards: int, shard_index: int, *, shards_dirname: str = SHARDS_DIRNAME_DEFAULT) -> str:
+    """Return the canonical output directory for one MMGen shard."""
     return os.path.join(output_dir, str(shards_dirname), f"shard_{int(shard_index):03d}_of_{int(num_shards):03d}")
 
 
 def discover_shard_output_dirs(output_dir: str, num_shards: int | None = None, *, shards_dirname: str = SHARDS_DIRNAME_DEFAULT) -> list[Path]:
+    """Discover one complete shard-directory series or report missing or ambiguous
+    partitions.
+    """
     shards_root = Path(output_dir) / str(shards_dirname)
     if not shards_root.exists():
         raise FileNotFoundError(f"Shard root not found: {shards_root}")
@@ -91,6 +100,9 @@ def _load_selected_files_from_manifest(
     shard_index: int,
     shard_by: str,
 ) -> list[str] | None:
+    """Require the selected-file manifest to match the requested shard count, index, and
+    strategy.
+    """
     payload = _read_done_payload(manifest_path)
     if not isinstance(payload, dict):
         return None
@@ -139,9 +151,11 @@ def _canonical_matrix_runtime_settings(settings: dict | None) -> dict:
 
 
 def _matrix_merge_consistency_signature(*, matrix_done: dict, process_done: dict | None = None) -> dict:
+    """Extract the settings and identities that must agree across matrix shards."""
     if not isinstance(matrix_done, dict):
         raise RuntimeError("Shard matrix completion marker is missing or invalid; cannot validate merge consistency")
     signature = {
+        "calculation_sha256": matrix_done.get("calculation_sha256"),
         "matrix_schema_version": int(matrix_done.get("matrix_schema_version", -1)),
         "package_version": matrix_done.get("package_version"),
         "min_bout": matrix_done.get("min_bout"),
@@ -156,7 +170,7 @@ def _matrix_merge_consistency_signature(*, matrix_done: dict, process_done: dict
     return signature
 
 
-def _acquire_or_fail(lock: DirLock, *, lock_dir: Path, error_header: str, metadata: dict) -> bool:
+def _acquire_or_fail(lock: ShardLock, *, lock_dir: Path, error_header: str, metadata: dict) -> bool:
     try:
         lock.acquire(metadata=metadata)
         return True
@@ -164,7 +178,7 @@ def _acquire_or_fail(lock: DirLock, *, lock_dir: Path, error_header: str, metada
         raise RuntimeError(
             f"{error_header}\n"
             f"  lock: {lock_dir}\n\n"
-            "If you are sure no relevant job is running, delete the lock directory and retry. "
+            "Native locks release automatically when their writer exits. "
             f"(Original error: {e})"
         )
 
@@ -187,6 +201,9 @@ def _validate_required_matrix_columns(df: pd.DataFrame, *, source_label: str, re
 
 
 def _require_completed_shard_processing(*, work_dir: Path, shard_dir: Path, expected_selected_files: int | None) -> dict:
+    """Require exact selected-source coverage and valid commit identities before
+    finalization.
+    """
     process_done_path = work_dir / "SHARD_DONE.json"
     process_done = _read_done_payload(process_done_path)
     if not isinstance(process_done, dict):
@@ -214,10 +231,21 @@ def _require_completed_shard_processing(*, work_dir: Path, shard_dir: Path, expe
             "Shard manifest / finalize request disagrees with completed shard-processing counts. "
             f"Shard {shard_dir} expected {int(expected_selected_files)} selected files, but SHARD_DONE.json reports {selected_n}."
         )
+    identity = read_store_identity(work_dir)
+    if process_done.get('calculation_sha256') != identity['calculation_sha256'] or process_done.get('sources_sha256') != identity['sources_sha256']:
+        raise RuntimeError('Shard completion identity changed')
+    store = shard_dir/'temp_store.h5'
+    if process_done.get('temp_store_sha256') != sha256_file(store):
+        raise RuntimeError('Shard completion store changed')
+    if validate_commits(store, identity) != set(identity['sources']):
+        raise RuntimeError('Shard exact source commits incomplete')
     return process_done
 
 
-def finalize_shard_temp_store(*, inference_csv_dir: str, poscalc_dir: str, output_dir: str, min_bout: int, edge_skip: int, inf_tag: str, runtime_settings: MMGenRuntimeSettings, file_filter: str | None, num_shards: int, shard_index: int, shard_by: str, shards_dirname: str = SHARDS_DIRNAME_DEFAULT, caller_holds_shard_lock: bool = False) -> str | None:
+def _finalize_shard_temp_store_owned(*, inference_csv_dir: str, poscalc_dir: str, output_dir: str, min_bout: int, edge_skip: int, inf_tag: str, runtime_settings: MMGenRuntimeSettings, file_filter: str | None, num_shards: int, shard_index: int, shard_by: str, shards_dirname: str = SHARDS_DIRNAME_DEFAULT, caller_holds_shard_lock: bool = False, file_list: str | None = None) -> str | None:
+    """Verify one completed animal-row shard and finalize its declared matrix and
+    provenance.
+    """
     if int(num_shards) <= 1:
         raise ValueError("finalize_shard_temp_store requires num_shards > 1")
     shard_dir = Path(get_shard_output_dir(output_dir, int(num_shards), int(shard_index), shards_dirname=shards_dirname))
@@ -237,18 +265,18 @@ def finalize_shard_temp_store(*, inference_csv_dir: str, poscalc_dir: str, outpu
         shard_by=str(shard_by),
     )
     if shard_files is None:
-        inf_files = list_inference_csv_files(inference_csv_dir)
-        if file_filter is not None and str(file_filter).strip() != "":
-            needle = str(file_filter).strip().lower()
-            inf_files = [f for f in inf_files if needle in str(f).lower()]
-        shard_files = select_files_for_shard(inf_files, num_shards=int(num_shards), shard_index=int(shard_index), strategy=str(shard_by))
+        raise RuntimeError('Shard selected-file manifest is missing; regenerate the shard from the frozen cohort.')
+    cohort = read_shard_cohort(Path(output_dir) / shards_dirname, int(num_shards))
 
-    _require_completed_shard_processing(
+    process_done = _require_completed_shard_processing(
         work_dir=work_dir,
         shard_dir=shard_dir,
         expected_selected_files=(None if shard_files is None else int(len(shard_files))),
     )
 
+    identity = read_store_identity(work_dir)
+    verify_shard_membership(cohort, int(shard_index),
+        markers=[_read_done_payload(shard_manifest_path), process_done], sources=identity['sources'])
     if not shard_files:
         payload = {
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -258,127 +286,99 @@ def finalize_shard_temp_store(*, inference_csv_dir: str, poscalc_dir: str, outpu
             "n_selected_files": 0,
             "n_matrix_rows": 0,
             "matrix_path": None,
+            "calculation_sha256":identity["calculation_sha256"],
+            "sources_sha256":identity["sources_sha256"],
+            "cohort_sha256":cohort["cohort_sha256"],
+            "row_identities":[],
+            "artifacts":{},
+            "package_version":str(AUTOBEHAVER_VERSION),
+            "matrix_schema_version":int(MATRIX_SCHEMA_VERSION),
+            "runtime_settings":asdict(replace(runtime_settings, emit_master_matrix=True, emit_full_outputs=False)),
+            "min_bout":int(min_bout), "edge_skip":int(edge_skip), "inf_tag":str(inf_tag),
+            "file_filter":None if file_filter is None else str(file_filter),
         }
-        done_marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        atomic_write_json(payload, done_marker_path)
         if not bool(runtime_settings.keep_temp_files):
             cleanup_temp_store(str(temp_store_path), keep_temp_files=False)
         return None
 
-    shard_lock_dir = work_dir / "_mmgen_shard.lock"
-    shard_lock: DirLock | None = None
-    shard_lock_acquired = False
-    if not bool(caller_holds_shard_lock):
-        shard_lock = DirLock(shard_lock_dir, timeout_sec=0.0)
-        _acquire_or_fail(
-            shard_lock,
-            lock_dir=shard_lock_dir,
-            error_header=(
-                "[mmgen] Shard lifecycle lock already exists. Another shard processing/finalize job may already be running for this shard.\n"
-                f"  shard: {int(shard_index)}/{int(num_shards)-1}"
-            ),
-            metadata={
-                "kind": "mmgen_shard_lifecycle_finalize",
-                "num_shards": int(num_shards),
-                "shard_index": int(shard_index),
-                "shard_by": str(shard_by),
-                "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-                "host": socket.gethostname(),
-            },
-        )
-        shard_lock_acquired = True
+    from . import pipeline
 
-    lock_dir = work_dir / "_mmgen_shard_matrix.lock"
-    lock = DirLock(lock_dir, timeout_sec=0.0)
-    _acquire_or_fail(
-        lock,
-        lock_dir=lock_dir,
-        error_header=(
-            "[mmgen] Shard-matrix finalize lock already exists. Another finalize job may already be running for this shard.\n"
-            f"  shard: {int(shard_index)}/{int(num_shards)-1}"
-        ),
-        metadata={
-            "kind": "mmgen_shard_matrix_finalize",
-            "num_shards": int(num_shards),
-            "shard_index": int(shard_index),
-            "shard_by": str(shard_by),
-            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-            "host": socket.gethostname(),
-        },
+    shard_runtime_settings = replace(runtime_settings, emit_master_matrix=True, emit_full_outputs=False)
+    pipeline.run_post_inference_analysis(
+        inference_csv_dir,
+        poscalc_dir,
+        str(shard_dir),
+        int(min_bout),
+        int(edge_skip),
+        str(inf_tag),
+        runtime_settings=shard_runtime_settings,
+        resume=False,
+        finalize_only=True,
+        process_only=False,
+        file_filter=None,
+        num_shards=1,
+        shard_index=0,
+        shard_by="hash",
+        selected_files=shard_files,
+        drop_all_na_feature_columns=False,
+        write_provenance_artifacts=False,
+        spatial_in_memory_for_matrix=True,
+        caller_holds_shard_lock=bool(caller_holds_shard_lock),
     )
-
-    try:
-        from . import pipeline
-
-        shard_runtime_settings = replace(runtime_settings, emit_master_matrix=True, emit_full_outputs=False)
-        pipeline.run_post_inference_analysis(
-            inference_csv_dir,
-            poscalc_dir,
-            str(shard_dir),
-            int(min_bout),
-            int(edge_skip),
-            str(inf_tag),
-            runtime_settings=shard_runtime_settings,
-            resume=False,
-            finalize_only=True,
-            process_only=False,
-            file_filter=None,
-            num_shards=1,
-            shard_index=0,
-            shard_by="hash",
-            selected_files=shard_files,
-            drop_all_na_feature_columns=False,
-            write_provenance_artifacts=False,
-            spatial_in_memory_for_matrix=True,
-            caller_holds_shard_lock=bool(caller_holds_shard_lock),
-        )
-        matrix_path = shard_dir / "MASTER_FEATURE_MATRIX.csv"
-        if not matrix_path.exists():
-            raise FileNotFoundError(f"Shard finalization completed but shard matrix was not written: {matrix_path}")
-        try:
-            n_rows = int(len(pd.read_csv(matrix_path, usecols=["individual"])))
-        except Exception:
-            n_rows = -1
-        payload = {
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "package_version": str(AUTOBEHAVER_VERSION),
-            "matrix_schema_version": int(MATRIX_SCHEMA_VERSION),
-            "num_shards": int(num_shards),
-            "shard_index": int(shard_index),
-            "shard_by": str(shard_by),
-            "n_selected_files": int(len(shard_files)),
-            "n_matrix_rows": int(n_rows),
-            "matrix_path": str(matrix_path.resolve()),
-            "runtime_settings": asdict(shard_runtime_settings),
-            "min_bout": int(min_bout),
-            "edge_skip": int(edge_skip),
-            "inf_tag": str(inf_tag),
-            "file_filter": (None if file_filter is None else str(file_filter)),
-        }
-        done_marker_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        if not bool(runtime_settings.keep_temp_files):
-            cleanup_temp_store(str(temp_store_path), keep_temp_files=False)
-        return str(matrix_path)
-    finally:
-        try:
-            lock.release()
-        except Exception:
-            pass
-        if shard_lock_acquired and shard_lock is not None:
-            try:
-                shard_lock.release()
-            except Exception:
-                pass
+    matrix_path = shard_dir / "MASTER_FEATURE_MATRIX.csv"
+    if not matrix_path.exists():
+        raise FileNotFoundError(f"Shard finalization completed but shard matrix was not written: {matrix_path}")
+    df = read_metadata_csv(matrix_path)
+    _validate_required_matrix_columns(df, source_label=str(matrix_path))
+    _validate_unique_individuals(df, source_label=str(matrix_path))
+    expected_ids = {collapse_individual_id(parse_group_and_individual(str(Path(inference_csv_dir)/f))[1]) for f in shard_files}
+    if set(df['individual'].astype(str)) != expected_ids:
+        raise RuntimeError('Shard matrix rows differ from exact selected source identities')
+    n_rows = len(df)
+    units_path = shard_dir/'MASTER_FEATURE_MATRIX_UNITS.csv'
+    if not units_path.is_file():
+        raise RuntimeError('Required matrix units manifest missing')
+    payload = {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "calculation_sha256":identity["calculation_sha256"],
+        "sources_sha256":identity["sources_sha256"],
+        "cohort_sha256":cohort["cohort_sha256"],
+        "row_identities":sorted(expected_ids),
+        "artifacts":{matrix_path.name:sha256_file(matrix_path), units_path.name:sha256_file(units_path)},
+        "package_version": str(AUTOBEHAVER_VERSION),
+        "matrix_schema_version": int(MATRIX_SCHEMA_VERSION),
+        "num_shards": int(num_shards),
+        "shard_index": int(shard_index),
+        "shard_by": str(shard_by),
+        "n_selected_files": int(len(shard_files)),
+        "n_matrix_rows": int(n_rows),
+        "matrix_path": str(matrix_path.resolve()),
+        "runtime_settings": asdict(shard_runtime_settings),
+        "min_bout": int(min_bout),
+        "edge_skip": int(edge_skip),
+        "inf_tag": str(inf_tag),
+        "file_filter": (None if file_filter is None else str(file_filter)),
+    }
+    atomic_write_json(payload, done_marker_path)
+    if not bool(runtime_settings.keep_temp_files):
+        cleanup_temp_store(str(temp_store_path), keep_temp_files=False)
+    return str(matrix_path)
 
 
-def merge_matrix_part_files(*, output_dir: str, num_shards: int | None = None, mm_per_px: float = 0.0169896744624207, video_fps: float = 40.0, shards_dirname: str = SHARDS_DIRNAME_DEFAULT) -> str:
+def _merge_matrix_part_files_owned(*, output_dir: str, num_shards: int | None = None, mm_per_px: float = 0.0169896744624207, video_fps: float = 40.0, shards_dirname: str = SHARDS_DIRNAME_DEFAULT) -> str:
+    """Verify compatible disjoint animal-row shards and publish their concatenated
+    master matrix.
+    """
     shard_dirs = discover_shard_output_dirs(output_dir, num_shards=num_shards, shards_dirname=shards_dirname)
+    cohort = read_shard_cohort(Path(output_dir) / shards_dirname, len(shard_dirs))
     matrix_parts: list[pd.DataFrame] = []
     seen_ids: set[str] = set()
     merged_from: list[str] = []
     union_columns: list[str] = ["individual", "group", "sex"]
     expected_signature: dict | None = None
     expected_signature_source: str | None = None
-    for shard_dir in shard_dirs:
+    for shard_index, shard_dir in enumerate(progress(shard_dirs, desc='MMGen checking matrix parts')):
         shard_dir = Path(shard_dir)
         work_dir = shard_dir / "_mmgen_work"
         if not work_dir.exists():
@@ -401,12 +401,21 @@ def merge_matrix_part_files(*, output_dir: str, num_shards: int | None = None, m
                 f"Cannot determine selected-file count for shard {shard_dir}. Expected {SHARD_MATRIX_DONE_FILENAME}, {SHARD_MANIFEST_FILENAME}, or SHARD_DONE.json."
             )
 
-        if int(selected_n) == 0:
-            if not isinstance(matrix_done, dict):
-                raise RuntimeError(
-                    f"Shard {shard_dir} appears to have zero selected files, but {SHARD_MATRIX_DONE_FILENAME} is missing. Run --finalize_shard_matrix for this shard before merging matrix parts."
-                )
-            continue
+        identity = read_store_identity(work_dir)
+        if identity['calculation_sha256'] != content_hash(identity['calculation']) or identity['sources_sha256'] != content_hash(identity['sources']):
+            raise RuntimeError('Matrix part identity contents changed')
+        verify_shard_membership(cohort, shard_index,
+            markers=[shard_manifest, process_done, matrix_done], sources=identity['sources'])
+        if int(selected_n) != len(identity['sources']):
+            raise RuntimeError('Matrix part selected-source count differs from exact source inventory')
+        if not isinstance(matrix_done, dict) or matrix_done.get('calculation_sha256') != identity['calculation_sha256'] or matrix_done.get('sources_sha256') != identity['sources_sha256']:
+            raise RuntimeError('Matrix part identity invalid or obsolete')
+        for name, digest in matrix_done.get('artifacts', {}).items():
+            path = shard_dir/name
+            if not path.is_file() or sha256_file(path) != digest:
+                raise RuntimeError(f'Matrix part output changed: {path}')
+        if int(selected_n) > 0 and set(matrix_done.get('artifacts', {})) != {'MASTER_FEATURE_MATRIX.csv','MASTER_FEATURE_MATRIX_UNITS.csv'}:
+            raise RuntimeError('Matrix part artifact inventory incomplete')
 
         signature = _matrix_merge_consistency_signature(matrix_done=matrix_done, process_done=process_done)
         if expected_signature is None:
@@ -418,14 +427,28 @@ def merge_matrix_part_files(*, output_dir: str, num_shards: int | None = None, m
                 f"Reference: {expected_signature_source}; mismatch: {work_dir / SHARD_MATRIX_DONE_FILENAME}."
             )
 
+        if int(selected_n) == 0:
+            if matrix_done.get('artifacts') != {} or matrix_done.get('row_identities') != [] or matrix_done.get('n_matrix_rows') != 0:
+                raise RuntimeError('Empty matrix part contains nonempty artifacts or rows')
+            if not isinstance(matrix_done, dict):
+                raise RuntimeError(
+                    f"Shard {shard_dir} appears to have zero selected files, but {SHARD_MATRIX_DONE_FILENAME} is missing. Run --finalize_shard_matrix for this shard before merging matrix parts."
+                )
+            continue
+
         if not matrix_path.exists():
             raise FileNotFoundError(f"Missing shard matrix part: {matrix_path}")
         if not isinstance(matrix_done, dict):
             raise RuntimeError(f"Shard matrix part exists but completion marker is missing: {work_dir / SHARD_MATRIX_DONE_FILENAME}")
 
-        df = pd.read_csv(matrix_path)
+        df = read_metadata_csv(matrix_path)
         _validate_required_matrix_columns(df, source_label=str(matrix_path))
         _validate_unique_individuals(df, source_label=str(matrix_path))
+        expected_ids = {collapse_individual_id(parse_group_and_individual(identity['sources'][f].get('original_name',f))[1]) for f in identity['sources']}
+        if set(df['individual'].astype(str)) != expected_ids or sorted(expected_ids) != matrix_done.get('row_identities'):
+            raise RuntimeError('Matrix part row identity inventory changed')
+        if int(matrix_done.get('n_matrix_rows', -1)) != len(df):
+            raise RuntimeError('Matrix part row count differs from saved data')
         for col in df.columns:
             if col not in union_columns:
                 union_columns.append(col)
@@ -439,21 +462,76 @@ def merge_matrix_part_files(*, output_dir: str, num_shards: int | None = None, m
         raise RuntimeError(f"No shard matrix parts were found under {Path(output_dir) / shards_dirname}")
     aligned_parts = [df.reindex(columns=union_columns) for df in matrix_parts]
     merged = pd.concat(aligned_parts, axis=0, ignore_index=True, sort=False)
-    merged.dropna(axis=1, how="all", inplace=True)
+    from .feature_schema import complete_master_schema, write_schema_metadata, schema_metadata
+    merged = complete_master_schema(merged)
     _validate_unique_individuals(merged, source_label="merged matrix parts")
     merged = merged.sort_values(by=["group", "individual"], kind="stable").reset_index(drop=True)
     merged = reorder_master_matrix_columns(merged)
+    sources = {}
+    calculation = None
+    for shard in shard_dirs:
+        item = read_store_identity(Path(shard)/'_mmgen_work')
+        if calculation is not None and calculation != item['calculation']:
+            raise RuntimeError('Matrix parts calculation mismatch')
+        calculation = item['calculation']
+        if set(sources).intersection(item['sources']):
+            raise RuntimeError('Matrix parts duplicate source recordings')
+        sources.update(item['sources'])
+    if set(sources) != {record['source_file'] for record in cohort['files']}:
+        raise RuntimeError('Matrix parts do not cover the complete frozen cohort.')
+    expected_union_ids = {collapse_individual_id(parse_group_and_individual(sources[f].get('original_name',f))[1]) for f in sources}
+    if set(merged['individual'].astype(str)) != expected_union_ids:
+        raise RuntimeError('Merged rows differ from exact source animal inventory')
     output_path = Path(output_dir) / "MASTER_FEATURE_MATRIX.csv"
-    merged.to_csv(output_path, index=False)
-    write_feature_units_manifest(master_matrix=merged, output_dir=str(output_path.parent), mm_per_px=float(mm_per_px), fps=float(video_fps))
+    atomic_write_dataframe_csv(merged, output_path, index=False)
+    write_schema_metadata(output_path.parent)
+    saved_settings = calculation.get('runtime_settings', calculation)
+    saved_mm = saved_settings.get('mm_per_px') or mm_per_px
+    saved_fps = saved_settings.get('video_fps') or video_fps
+    write_feature_units_manifest(master_matrix=merged, output_dir=str(output_path.parent),
+                                 mm_per_px=float(saved_mm), fps=float(saved_fps))
     manifest = {
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "n_shard_parts": int(len(matrix_parts)),
         "n_rows": int(len(merged)),
         "n_columns": int(len(merged.columns)),
+        "declared_feature_schema": schema_metadata(),
         "schema_union_columns": list(merged.columns),
         "output_path": str(output_path.resolve()),
         "merged_from": merged_from,
     }
-    (Path(output_dir) / FINAL_MATRIX_MERGE_MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    identity = {'calculation':calculation,'calculation_sha256':content_hash(calculation),
+                'sources':sources,'sources_sha256':content_hash(sources)}
+    atomic_write_json(identity, Path(output_dir)/'_mmgen_work'/IDENTITY_FILENAME)
+    manifest['cohort_sha256'] = cohort['cohort_sha256']
+    manifest['calculation_sha256'] = identity['calculation_sha256']
+    manifest['sources_sha256'] = identity['sources_sha256']
+    manifest['artifacts'] = {name:sha256_file(Path(output_dir)/name) for name in ['MASTER_FEATURE_MATRIX.csv','MASTER_FEATURE_MATRIX_UNITS.csv','MASTER_FEATURE_MATRIX_SCHEMA.json']}
+    atomic_write_json(manifest, Path(output_dir)/FINAL_MATRIX_MERGE_MANIFEST)
+    atomic_write_json(manifest, Path(output_dir)/'MMGEN_OUTPUT_RECEIPT.json')
     return str(output_path)
+
+
+@wraps(_finalize_shard_temp_store_owned)
+def finalize_shard_temp_store(**kwargs):
+    """Own validation and publication of empty and nonempty shards alike."""
+    bound = inspect.signature(_finalize_shard_temp_store_owned).bind(**kwargs)
+    bound.apply_defaults()
+    options = bound.arguments
+    if int(options['num_shards']) <= 1:
+        raise ValueError('finalize_shard_temp_store requires num_shards > 1')
+    shard_dir = Path(get_shard_output_dir(options['output_dir'], options['num_shards'], options['shard_index'], shards_dirname=options['shards_dirname']))
+    work_dir = shard_dir / '_mmgen_work'
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as owned:
+        if not options['caller_holds_shard_lock']:
+            owned.enter_context(ShardLock(work_dir / '_mmgen_shard.lock'))
+        owned.enter_context(ShardLock(work_dir / '_mmgen_shard_matrix.lock'))
+        options['caller_holds_shard_lock'] = True
+        return _finalize_shard_temp_store_owned(**options)
+
+
+@wraps(_merge_matrix_part_files_owned)
+def merge_matrix_part_files(**kwargs):
+    with canonical_generation(kwargs['output_dir']):
+        return _merge_matrix_part_files_owned(**kwargs)

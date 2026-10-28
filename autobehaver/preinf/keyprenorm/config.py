@@ -1,4 +1,4 @@
-"""Configuration dataclass for keyprenorm."""
+"""Define runtime options and output paths for KeyPreNorm."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class KeypreNormConfig:
-    """Runtime configuration for the keyprenorm stage."""
+    """Store runtime options for KeyPreNorm."""
 
     input_dir: str
 
@@ -35,24 +35,18 @@ class KeypreNormConfig:
     # Processing behavior
     clobber: bool = False
 
-    num_workers: int = 14
+    # 0 = automatic; positive values are an upper limit, still constrained by RAM/CPUs.
+    num_workers: int = 0
+    memory_gb: float | None = None
     edge_skip: int = 5
 
-    # Fixed-length mode (max_rows>0) vs variable-length (max_rows=0)
-    max_rows: int = 64750
-    require_full_length: bool = False
-
-    # Optional utilities
-    size_check: bool = False
     batch_size: int = 10
 
     # Logging
     log_level: str = "INFO"
     log_file: Optional[str] = None
 
-    # ------------------------------------------------------------------
     # Project registry (optional)
-    # ------------------------------------------------------------------
     # When enabled, keyprenorm can:
     #   * discover inputs from the project registry (keypre_csv_relpath)
     #   * upsert outputs back into the registry (keyprenorm_h5_relpath,
@@ -61,6 +55,7 @@ class KeypreNormConfig:
     registry_csv: Optional[str] = None
     registry_lock_timeout_sec: int = 120
     registry_lock_stale_sec: int = 60 * 60
+    file_list: str | None = None
 
     def resolved_registry_csv(self) -> Optional[str]:
         """Return the registry CSV path if enabled."""

@@ -1,14 +1,5 @@
-"""Lightweight logging helpers for FeatureImp post-analysis stages.
-
-This module exists to reduce support burden:
-- when an optional post-analysis stage fails, we write a persistent error log
-  into the analysis folder (so users can debug without re-running interactively).
-- we also support small per-stage MANIFEST.json files for provenance.
-
-Design constraints
-------------------
-* Keep this module dependency-light (stdlib only) so it can be imported in
-  minimal environments.
+"""Write FeatureImp postanalysis manifests and persistent error logs using
+standard-library dependencies.
 """
 
 from __future__ import annotations
@@ -64,7 +55,7 @@ def build_stage_manifest(
     _outputs = dict(outputs or {})
     _summary = dict(summary or {})
 
-    # --- Global importance source bookkeeping ---
+    # Global importance source bookkeeping
     # Many downstream post-analysis stages depend (directly or indirectly) on the canonical
     # feature-importance ranking in GLOBAL_IMPORTANCE_RANKING{file_suffix}.csv.
     # We record which semantics the Global_Importance column represents.

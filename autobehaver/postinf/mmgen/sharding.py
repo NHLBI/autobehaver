@@ -1,27 +1,18 @@
-"""Deterministic, communication-free sharding utilities for mmgen.
+"""Assign MMGen files deterministically to independent processing shards.
 
-The intent is to support *blind sharding* across multiple HPC jobs/nodes:
-
-  - Each shard independently discovers the same universe of input files.
-  - Each shard deterministically selects its subset based only on filenames.
-  - No coordination / shared state is required.
-
-This allows you to run (for example) 10 parallel jobs:
-
-    python -m autobehaver.postinf.mmgen --process_only --num_shards 10 --shard_index 0
-    ...
-    python -m autobehaver.postinf.mmgen --process_only --num_shards 10 --shard_index 9
-
-and later merge those shard stores.
+Animal-row assignment keeps all recordings of an animal together for matrix merging and
+append workflows.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from typing import Iterable, List
 
 from .naming import collapse_individual_id, parse_group_and_individual
+from autobehaver.portable_paths import original_name
 
 
 def _stable_hash_int(text: str) -> int:
@@ -86,8 +77,13 @@ def select_files_for_shard(
     num_shards: int,
     shard_index: int,
     strategy: str = "hash",
+    inference_csv_dir: str = "",
 ) -> List[str]:
-    """Filter a list of filenames down to those assigned to this shard."""
+    """Select the files assigned to one shard.
+
+    For row_identity, distribute sorted animal identities round-robin and keep all of an
+    animal's recordings together; other strategies use the original logical filename.
+    """
 
     if num_shards <= 1:
         return list(files)
@@ -103,26 +99,27 @@ def select_files_for_shard(
     # shard receives at least one row and all files for a row stay together.
     if str(strategy).strip().lower() == "row_identity":
         row_by_file: dict[str, str] = {}
-        unique_rows: list[str] = []
-        seen_rows: set[str] = set()
         for f in files_list:
             try:
-                _group, individual_id, _sex = parse_group_and_individual(str(f))
+                _group, individual_id, _sex = parse_group_and_individual(os.path.join(inference_csv_dir, str(f)))
                 row_identity = collapse_individual_id(str(individual_id))
             except Exception:
                 # Fall back to the raw basename if parsing fails.
                 row_identity = str(f)
             row_by_file[str(f)] = str(row_identity)
-            if str(row_identity) not in seen_rows:
-                seen_rows.add(str(row_identity))
-                unique_rows.append(str(row_identity))
-
-        unique_rows = sorted(unique_rows)
-        row_to_shard = {rid: (i % int(num_shards)) for i, rid in enumerate(unique_rows)}
-        return [f for f in files_list if row_to_shard.get(row_by_file.get(f, f), -1) == int(shard_index)]
+        assignments = assign_rows_to_shards(row_by_file, num_shards=int(num_shards))
+        return [f for f in files_list if assignments[f] == int(shard_index)]
 
     out: List[str] = []
     for f in files_list:
-        if assign_shard(str(f), num_shards=num_shards, strategy=strategy) == int(shard_index):
+        resolved = original_name(os.path.join(inference_csv_dir, str(f)))
+        if assign_shard(resolved, num_shards=num_shards, strategy=strategy) == int(shard_index):
             out.append(str(f))
     return out
+
+
+def assign_rows_to_shards(row_by_file: dict[str, str], *, num_shards: int) -> dict[str, int]:
+    """Assign the complete sorted animal cohort once, keeping recordings together."""
+    rows = sorted(set(row_by_file.values()))
+    row_to_shard = {row: index % int(num_shards) for index, row in enumerate(rows)}
+    return {name: row_to_shard[row] for name, row in row_by_file.items()}

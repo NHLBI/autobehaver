@@ -1,4 +1,4 @@
-"""Unit tests for unit conversion helpers (mmgen)."""
+"""Check MMGen unit conversions."""
 
 
 import unittest
@@ -28,10 +28,9 @@ class TestUnits(unittest.TestCase):
 
 
 
-    def test_unit_manifest_labels_curvature_and_kinematic_asymmetry(self):
+    def test_unit_manifest_labels_curvature_and_postural_asymmetry(self):
         self.assertEqual(_infer_unit_for_feature_name("KinematicBB_Pose_Walking_curvature_min_mean"), ("rad/mm", "curvature"))
-        self.assertEqual(_infer_unit_for_feature_name("KinematicBB_Pose+Orient_Walking+Floor_frontleg_velocity_core_asym_mean"), ("unitless", "left-right asymmetry index"))
-        self.assertEqual(_infer_unit_for_feature_name("KinematicTW_Pose_Walking_frontleg_velocity_mean_asym"), ("unitless", "left-right asymmetry index"))
+        self.assertEqual(_infer_unit_for_feature_name("Postural_Floor_overall_asymmetry_LR_mean"), ("mm", "linear distance"))
 
 if __name__ == "__main__":
     unittest.main()

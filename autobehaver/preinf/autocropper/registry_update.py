@@ -1,19 +1,13 @@
-"""Project-registry update for autocropper.
+"""Update the project registry from Autocropper per-movie logs.
 
-Autocropper writes per-movie JSON logs under:
-  <run_dir>/movie_logs/<full_movie_stem>_log.json
-
-This helper reads those logs after the autocropper run and upserts rows into the
-project-wide registry CSV.
-
-We intentionally update the registry once per autocropper run in the parent
-process to avoid multiprocessing contention.
+Write once in the parent process to avoid worker contention.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from autobehaver.portable_paths import original_name
 import re
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +29,7 @@ def _is_failure_string(s: Any) -> bool:
 
 
 def _parse_chamber_number(chamber_id: str) -> int | None:
+    """Return the chamber number from a chamber identifier, if present."""
     m = re.search(r"chamber(\d+)", str(chamber_id), flags=re.IGNORECASE)
     if not m:
         return None
@@ -57,7 +52,7 @@ def update_registry_from_autocropper_logs(
     lock_timeout_sec: int = 120,
     lock_stale_sec: int = 3600,
 ) -> None:
-    """Update the project registry with autocropper outputs."""
+    """Upsert cropped outputs and mark explicitly excluded chambers inactive."""
 
     movie_logs_dir = Path(run_dir) / "movie_logs"
     if not movie_logs_dir.exists():
@@ -82,8 +77,8 @@ def update_registry_from_autocropper_logs(
         if selected_names and movie_name not in selected_names:
             continue
 
-        full_movie_path = (Path(input_movies_dir) / movie_name).resolve()
-        full_movie_stem = Path(movie_name).stem
+        full_movie_path = Path(data['source_path']).resolve() if data.get('source_path') else (Path(input_movies_dir) / movie_name).resolve()
+        full_movie_stem = Path(original_name(full_movie_path)).stem
 
         identity: dict[str, Any] = {}
         try:
@@ -101,10 +96,19 @@ def update_registry_from_autocropper_logs(
                 identity[k_out] = data.get(k_log)
 
         cropped_files = data.get("cropped_files") or {}
-        if not isinstance(cropped_files, dict) or not cropped_files:
-            continue
+        if not isinstance(cropped_files, dict):
+            cropped_files = {}
+
+        for chamber_id in data.get("excluded_chambers") or []:
+            rows.append({
+                "recording_id": f"{full_movie_stem}_{chamber_id}",
+                "active": False,
+                "updated_at": now,
+            })
 
         for chamber_id, file_info in sorted(cropped_files.items()):
+            if chamber_id in (data.get('missing_required_chambers') or []) or chamber_id in (data.get('crop_failures') or {}):
+                continue
             if _is_failure_string(file_info):
                 continue
 
@@ -117,8 +121,8 @@ def update_registry_from_autocropper_logs(
                     continue
 
             chamber_number = _parse_chamber_number(str(chamber_id))
-            label_prefix = extract_label_prefix(
-                cropped_stem=cropped_path.stem,
+            label_prefix = (data.get("chamber_labels") or {}).get(str(chamber_id)) or extract_label_prefix(
+                cropped_stem=Path(original_name(cropped_path)).stem,
                 full_movie_stem=full_movie_stem,
                 chamber_id=str(chamber_id),
             )

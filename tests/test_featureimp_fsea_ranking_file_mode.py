@@ -128,6 +128,7 @@ def test_featureimp_global_fsea_from_file_writes_outputs_and_uses_grouped_featur
                     "Term": ["PoseStats_Walking", "Spatial_Frac"],
                     "FDR": [0.01, 0.20],
                     "NES": [1.4, 1.1],
+                    "ES": [.4, .3],
                 }
             )
 

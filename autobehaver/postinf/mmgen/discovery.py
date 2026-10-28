@@ -1,15 +1,9 @@
-"""Input discovery and diagnostics for mmgen.
-
-This module contains helpers for:
-  - listing inference CSVs in an input folder
-  - printing the detailed diagnostic summary of filenames (sex/genotype counts)
-
-The helpers here keep file discovery rules explicit and shared across mmgen stages.
-"""
+"""Discover MMGen inference files and report filename-derived sex and group counts."""
 
 from __future__ import annotations
 
 import os
+from autobehaver.portable_paths import load_name_maps
 
 import pandas as pd
 
@@ -25,6 +19,7 @@ def list_inference_csv_files(inference_csv_dir: str) -> list[str]:
     - Does NOT sort; ordering matches os.listdir().
     """
 
+    load_name_maps(inference_csv_dir)
     return [
         f
         for f in os.listdir(inference_csv_dir)
@@ -32,21 +27,12 @@ def list_inference_csv_files(inference_csv_dir: str) -> list[str]:
     ]
 
 
-def print_inference_file_diagnostic(inf_files: list[str]) -> None:
-    """Print diagnostic information about inference files.
-
-    This prints:
-      - total file count
-      - counts by Sex-Genotype combination
-      - per-combination file listing
-      - warnings for parse errors / unknown sex
-
-    Kept as a standalone function to keep pipeline orchestration smaller.
+def print_inference_file_diagnostic(inf_files: list[str], inference_csv_dir: str = "") -> None:
+    """Report input counts and filename-derived sex/group combinations, including parse
+    failures.
     """
 
-    # ========================================================================
     # DIAGNOSTIC: Print all input files and their parsed labels
-    # ========================================================================
     print("\n" + "=" * 80)
     print("DIAGNOSTIC: Input Files During Feature Generation")
     print("=" * 80)
@@ -57,7 +43,7 @@ def print_inference_file_diagnostic(inf_files: list[str]) -> None:
     file_info: list[dict[str, str]] = []
     for filename in sorted(inf_files):
         try:
-            group, individual_id, sex = parse_group_and_individual(filename)
+            group, individual_id, sex = parse_group_and_individual(os.path.join(inference_csv_dir, filename))
             file_info.append(
                 {
                     "filename": filename,
@@ -81,7 +67,6 @@ def print_inference_file_diagnostic(inf_files: list[str]) -> None:
     file_df = pd.DataFrame(file_info)
     file_df["sex_genotype"] = file_df["sex"].astype(str) + "_" + file_df["group"].astype(str)
 
-    # Print summary
     print("\nSample counts by Sex-Genotype combination (from filenames):")
     print("-" * 80)
     counts = file_df["sex_genotype"].value_counts().sort_index()
@@ -89,7 +74,6 @@ def print_inference_file_diagnostic(inf_files: list[str]) -> None:
         sex_val, group_val = combo.split("_", 1)
         print(f"  {sex_val:10s} | {group_val:40s} | {count:3d} files")
 
-    # Print detailed listing
     print("\nDetailed file listing by Sex-Genotype combination:")
     print("-" * 80)
     for combo in sorted(file_df["sex_genotype"].unique()):

@@ -1,116 +1,45 @@
-"""CLI for the DLC inference wrapper stage.
-
-The global config file is expected to contain a top-level ``dlc:`` section.
-CLI arguments override config defaults.
-"""
+"""Command-line options for DeepLabCut inference."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Optional, Sequence
 
-import yaml
 
-from autobehaver.argparse_utils import add_bool_pair
-from autobehaver.pipeline_layout import apply_main_dir_overrides, config_main_dir_default
+from autobehaver.argparse_utils import add_bool_pair, parse_cli_args
+from autobehaver.resource_monitor import add_monitor_arguments, monitored_cli, record_settings
+from autobehaver.pipeline_layout import apply_main_dir_overrides
 
 from .config import DEFAULT_DLC_CONFIG_PATH, DLCInferencerConfig
 from .core import run_dlc
 
 
-def _load_config_defaults(config_path: str) -> Dict[str, Any]:
-    """Load defaults from a global YAML config file.
-
-    DLC reads:
-      - the ``dlc:`` section (stage-specific)
-      - the top-level ``registry:`` section (project-wide registry settings)
-
-    Stage keys override registry defaults when they overlap.
-    """
-
-    cfg_path = Path(config_path).expanduser().resolve()
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
-    with cfg_path.open("r") as f:
-        data = yaml.safe_load(f) or {}
-
-    base_dir = cfg_path.parent
-    resolved: Dict[str, Any] = {}
-
-    global_main_dir = config_main_dir_default(data, base_dir)
-    if global_main_dir:
-        resolved["main_dir"] = global_main_dir
-
-    # --- Project registry (global) ---
-    reg = data.get("registry", {})
-    if reg is None:
-        reg = {}
-    if isinstance(reg, dict):
-        if "enabled" in reg:
-            resolved["registry_enabled"] = bool(reg.get("enabled"))
-        if "csv" in reg and isinstance(reg.get("csv"), str) and str(reg.get("csv")).strip() != "":
-            p = Path(str(reg.get("csv")).strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved["registry_csv"] = str(p)
-        if "lock_timeout_sec" in reg and reg.get("lock_timeout_sec") is not None:
-            try:
-                resolved["registry_lock_timeout_sec"] = int(reg.get("lock_timeout_sec"))
-            except Exception:
-                pass
-        if "lock_stale_sec" in reg and reg.get("lock_stale_sec") is not None:
-            try:
-                resolved["registry_lock_stale_sec"] = int(reg.get("lock_stale_sec"))
-            except Exception:
-                pass
-
-    section = data.get("dlc", {})
-    if section is None:
-        section = {}
-    if not isinstance(section, dict):
-        raise ValueError("Expected 'dlc' section in config to be a mapping (dict)")
-
-    path_keys = {
-        "main_dir",
-        "input_dir",
-        "output_dir",
-        "dlc_config",
-        "registry_csv",
-    }
-
-    # Stage section overrides registry defaults when present.
-    for k, v in section.items():
-        if k in path_keys and isinstance(v, str) and v.strip() != "":
-            p = Path(v.strip())
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            resolved[k] = str(p)
-        else:
-            resolved[k] = v
-
-    return resolved
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the DeepLabCut command-line parser with runtime defaults."""
+    defaults = DLCInferencerConfig(input_dir="", dlc_config=DEFAULT_DLC_CONFIG_PATH)
     p = argparse.ArgumentParser(
         description="Run DeepLabCut inference on cropped videos and optionally create labeled videos.",
     )
+    p.add_argument('--scratch_dir', default=defaults.scratch_dir,
+                   help='Temporary working directory; otherwise use configured local job scratch.')
 
-    p.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to global pipeline YAML config (reads the 'dlc:' section).",
-    )
 
     p.add_argument(
         "--dlc_config",
         type=str,
         default=None,
         help="Path to the DLC project config.yaml file (trained model).",
+    )
+    p.add_argument(
+        "--dlc_python",
+        type=str,
+        default=defaults.dlc_python,
+        help=(
+            "Optional Python executable or cluster wrapper for the isolated DeepLabCut backend "
+            "(for example python-DLC). Run this CLI with the supported main Python environment."
+        ),
     )
 
     p.add_argument(
@@ -134,7 +63,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--output_dir",
         type=str,
-        default=None,
+        default=defaults.output_dir,
         help=(
             "Directory to write DLC outputs (.csv/.h5/_meta.pickle). "
             "If omitted, outputs go next to each video (DLC default)."
@@ -145,7 +74,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--videos",
         nargs="*",
-        default=None,
+        default=defaults.videos,
         help=(
             "Optional explicit list of video files (paths or basenames in --input_dir). "
             "If provided, only these are processed."
@@ -155,14 +84,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--video_glob",
         type=str,
-        default=None,
+        default=defaults.video_glob,
         help="Glob pattern to select videos in --input_dir (e.g., '*.mp4' or 'session*_cam1.mp4').",
     )
 
     add_bool_pair(
         p,
         "recursive",
-        default=False,
+        default=defaults.recursive,
         help="Search recursively under --input_dir when using --video_glob (or default pattern).",
         dest="recursive",
     )
@@ -170,25 +99,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--videotype",
         type=str,
-        default=".mp4",
+        default=defaults.videotype,
         help="Video file extension / type (default: .mp4).",
     )
 
     # Pipeline convenience
+    p.add_argument("--file_list", help="Explicit batch list of logical chamber recording stems")
     p.add_argument(
         "--file_filter",
         type=str,
-        default=None,
+        default=defaults.file_filter,
         help="Only process videos whose filename contains this substring (case-insensitive).",
     )
 
     add_bool_pair(
         p,
         "clobber",
-        default=False,
+        default=defaults.clobber,
         help=(
-            "Overwrite existing DLC outputs in --output_dir (reprocess videos). "
-            "Default: disabled (safe)."
+            'Reprocess selected videos and replace validated DeepLabCut outputs (default: disabled).'
         ),
         dest="clobber",
     )
@@ -196,7 +125,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dlc_tag_to_remove",
         type=str,
-        default=None,
+        default=defaults.dlc_tag_to_remove,
         help=(
             "Optional: remove this exact substring from DLC CSV output filenames in --output_dir after inference. "
             "(This is the long model-specific DLC tag, e.g. 'DLC_resnet50_...shuffle1_1000000')."
@@ -208,7 +137,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_bool_pair(
         p,
         "keep_dlc_tag",
-        default=False,
+        default=defaults.keep_dlc_tag,
         help=(
             "Keep the DLC tag in output CSV filenames even if dlc_tag_to_remove is set. "
             "Default: strip the tag when dlc_tag_to_remove is provided."
@@ -220,22 +149,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--shuffle",
         type=int,
-        default=1,
+        default=defaults.shuffle,
         help="Shuffle index of the trained model to use (must match training).",
     )
 
     p.add_argument(
         "--max_retries",
         type=int,
-        default=10,
-        help="Maximum number of retry attempts for failed videos.",
+        default=defaults.max_retries,
+        help='Maximum total inference attempts per video, including the initial batch.',
     )
 
     # Movie options
     add_bool_pair(
         p,
         "make_movie",
-        default=False,
+        default=defaults.make_movie,
         help="Create DLC labeled videos after inference (source frames + keypoint dots).",
         dest="make_movie",
     )
@@ -243,10 +172,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_bool_pair(
         p,
         "skip_analysis",
-        default=False,
+        default=defaults.skip_analysis,
         help=(
-            "Skip inference and ONLY try to create labeled videos "
-            "(expects DLC .h5/.csv/_meta.pickle outputs already exist)."
+            'Skip inference and use verified existing DeepLabCut outputs; combine with --make_movie to create labeled videos.'
         ),
         dest="skip_analysis",
     )
@@ -254,35 +182,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dotsize",
         type=int,
-        default=24,
-        help="Dot size for keypoints in labeled videos (default 24; increase for presentations).",
+        default=defaults.dotsize,
+        help='Dot size for keypoints in labeled videos (default: 24).',
     )
 
     p.add_argument(
         "--pcutoff",
         type=float,
-        default=0.6,
+        default=defaults.pcutoff,
         help="Likelihood cutoff for showing points in labeled videos (lower shows more points).",
     )
 
     p.add_argument(
         "--colormap",
         type=str,
-        default="rainbow",
+        default=defaults.colormap,
         help="Matplotlib colormap name for bodypart colors (default: rainbow).",
     )
 
     p.add_argument(
         "--exclude_bodyparts",
         nargs="*",
-        default=["Front", "Back"],
+        default=defaults.exclude_bodyparts,
         help="Bodyparts to exclude from display (default: Front Back).",
     )
 
     p.add_argument(
         "--color_by",
         type=str,
-        default="bodypart",
+        default=defaults.color_by,
         choices=["bodypart", "individual"],
         help="Color points by bodypart (single animal) or by individual (multi-animal).",
     )
@@ -290,14 +218,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trailpoints",
         type=int,
-        default=0,
+        default=defaults.trailpoints,
         help="Number of previous frames to show as a trail (default 0).",
     )
 
     add_bool_pair(
         p,
         "fastmode",
-        default=True,
+        default=defaults.fastmode,
         help="Use fast OpenCV rendering mode.",
         dest="fastmode",
     )
@@ -305,14 +233,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--codec",
         type=str,
-        default="mp4v",
+        default=defaults.codec,
         help="Codec for output video (default mp4v).",
     )
 
     add_bool_pair(
         p,
         "overwrite",
-        default=True,
+        default=defaults.overwrite,
         help="Overwrite existing labeled videos if supported by your DLC version.",
         dest="overwrite",
     )
@@ -321,7 +249,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_bool_pair(
         p,
         "registry_enabled",
-        default=False,
+        default=defaults.registry_enabled,
         help=(
             "Use/update the project-wide registry CSV. When enabled, DLC selects videos from the registry "
             "and upserts dlc_csv_relpath."
@@ -331,7 +259,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--registry_csv",
         type=str,
-        default=None,
+        default=defaults.registry_csv,
         help=(
             "Path to the project registry CSV. If omitted and registry_enabled is True, "
             "defaults to <project_root>/registry.csv (project_root inferred from input/output dirs)."
@@ -340,81 +268,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--registry_lock_timeout_sec",
         type=int,
-        default=120,
+        default=defaults.registry_lock_timeout_sec,
         help="Seconds to wait for registry lock before failing (default 120).",
     )
     p.add_argument(
         "--registry_lock_stale_sec",
         type=int,
-        default=60 * 60,
-        help="Consider registry lock stale after this many seconds (default 3600).",
+        default=defaults.registry_lock_stale_sec,
+        help="Legacy option retained for compatibility; locks release when their process exits.",
     )
 
-    return p
+    return add_monitor_arguments(p)
 
 
+@monitored_cli("dlc")
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    # Two-pass parse so we can apply pipeline-config defaults.
+    """Parse runtime options and run DeepLabCut."""
     parser = build_arg_parser()
-
     argv_list = list(argv) if argv is not None else sys.argv[1:]
 
-    pre = parser.parse_known_args(argv_list)[0]
-
-    if pre.config:
-        defaults = _load_config_defaults(pre.config)
-
-        mapped: Dict[str, Any] = {}
-        for k in ("input_dir", "output_dir", "dlc_config"):
-            if k in defaults:
-                mapped[k] = defaults[k]
-
-        passthrough = {
-            "shuffle",
-            "videotype",
-            "recursive",
-            "video_glob",
-            "max_retries",
-            "make_movie",
-            "skip_analysis",
-            "dotsize",
-            "pcutoff",
-            "colormap",
-            "exclude_bodyparts",
-            "color_by",
-            "trailpoints",
-            "fastmode",
-            "codec",
-            "overwrite",
-            "file_filter",
-            "clobber",
-            "dlc_tag_to_remove",
-            "keep_dlc_tag",
-            "registry_enabled",
-            "registry_csv",
-            "registry_lock_timeout_sec",
-            "registry_lock_stale_sec",
-        }
-        for k in passthrough:
-            if k in defaults:
-                mapped[k] = defaults[k]
-
-        parser.set_defaults(**mapped)
-
-    args = parser.parse_args(argv_list)
+    args = parse_cli_args(parser, argv_list)
+    record_settings(args)
     apply_main_dir_overrides(args, stage="dlc")
 
     if not args.input_dir:
         raise SystemExit(
-            "Missing --input_dir. Provide --input_dir explicitly, or use --config with a 'dlc:' section that sets input_dir."
+            "Missing --input_dir. Provide --input_dir explicitly, or use --main_dir for the standard project folders."
         )
 
-    if not getattr(args, "dlc_config", None):
+    if not args.dlc_config:
         args.dlc_config = DEFAULT_DLC_CONFIG_PATH
 
-    if not getattr(args, "dlc_config", None):
+    if not args.dlc_config:
         raise SystemExit(
-            "Missing --dlc_config. Provide --dlc_config explicitly, use --config with a 'dlc:' section, "
+            "Missing --dlc_config. Provide --dlc_config explicitly "
             "or include the packaged DLC resource config."
         )
 
@@ -422,7 +309,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if not dlc_config_path.exists():
         raise SystemExit(f"DLC config.yaml not found: {dlc_config_path}")
 
-    clobber = bool(getattr(args, "clobber", False))
+    clobber = bool(args.clobber)
 
     cfg = DLCInferencerConfig(
         input_dir=str(args.input_dir),
@@ -432,12 +319,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         recursive=bool(args.recursive),
         videotype=args.videotype,
         file_filter=str(args.file_filter) if args.file_filter else None,
+        file_list=args.file_list,
         shuffle=int(args.shuffle),
         max_retries=int(args.max_retries),
+        dlc_python=args.dlc_python,
         output_dir=args.output_dir,
+        scratch_dir=args.scratch_dir,
         clobber=clobber,
-        dlc_tag_to_remove=getattr(args, "dlc_tag_to_remove", None),
-        keep_dlc_tag=bool(getattr(args, "keep_dlc_tag", False)),
+        dlc_tag_to_remove=args.dlc_tag_to_remove,
+        keep_dlc_tag=bool(args.keep_dlc_tag),
         make_movie=bool(args.make_movie),
         skip_analysis=bool(args.skip_analysis),
         dotsize=int(args.dotsize),
@@ -451,10 +341,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         overwrite=bool(args.overwrite),
 
         # Project registry
-        registry_enabled=bool(getattr(args, "registry_enabled", False)),
-        registry_csv=str(getattr(args, "registry_csv", "")) if getattr(args, "registry_csv", None) else None,
-        registry_lock_timeout_sec=int(getattr(args, "registry_lock_timeout_sec", 120)),
-        registry_lock_stale_sec=int(getattr(args, "registry_lock_stale_sec", 60 * 60)),
+        registry_enabled=bool(args.registry_enabled),
+        registry_csv=str(args.registry_csv) if args.registry_csv else None,
+        registry_lock_timeout_sec=int(args.registry_lock_timeout_sec),
+        registry_lock_stale_sec=int(args.registry_lock_stale_sec),
     )
 
     raise SystemExit(run_dlc(cfg))

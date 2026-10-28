@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      QT_QPA_PLATFORM: offscreen
+      AUTOBEHAVER_TEST_QT: "1"
+      AUTOBEHAVER_TEST_SCIENCE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux Qt runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            environment/requirements-core.txt
+            environment/requirements-local-core.txt
+            pyproject.toml
+      - name: Install the locked CPU environment
+        run: |
+          python -m pip install --upgrade pip==26.2 setuptools==83.0.0 wheel==0.46.2
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.10.0
+          python -m pip install -r environment/requirements-local-core.txt
+          python -m pip install -e ".[dev,monitoring,desktop]"
+          python -m pip check
+      - name: Check headless Qt startup
+        run: |
+          python -c "from PySide6.QtWidgets import QApplication, QWidget; app = QApplication([]); widget = QWidget(); app.processEvents(); print('Qt platform:', app.platformName()); widget.close(); app.quit()"
+      - name: Compile and test with coverage
+        run: |
+          python -m compileall -q autobehaver tests
+          python -m pytest -q --cov=autobehaver --cov-report=term-missing --cov-report=xml --cov-fail-under=50 --durations=20 -o faulthandler_timeout=120
+      - name: Save coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  local-windows-integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            environment/requirements-core.txt
+            environment/requirements-local-core.txt
+            pyproject.toml
+      - name: Install the locked interactive environment
+        run: |
+          python -m pip install --upgrade pip==26.2 setuptools==83.0.0 wheel==0.46.2
+          python -m pip install -r environment/requirements-local-core.txt
+          python -m pip install -e ".[dev,monitoring,desktop]"
+          python -m pip check
+      - name: Check local imports and portable contracts
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          python environment/check_environment.py --skip-cli-help --require-monitoring
+          python -m pytest -q tests/test_atomic_publication.py tests/test_dependency_contract.py tests/test_shared_repair_contracts.py tests/test_environment_monitoring_requirement.py

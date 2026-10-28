@@ -1,4 +1,4 @@
-"""Package entry point for the posepred inference stage."""
+"""Run the PosePred command-line entry point."""
 
 from .cli import main
 

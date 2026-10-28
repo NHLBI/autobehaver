@@ -1,10 +1,5 @@
-"""Planning utilities for staged/sharded FeatureImp execution.
-
-This module implements the *plan* stage for FeatureImp sharding while keeping
-heavy ML dependencies out of the import path.  The planner freezes the exact
-training/all-groups row order, selected feature columns, fold definitions,
-feature-subset plan, and mixed real/permutation task assignments that later
-shard jobs will consume.
+"""Freeze FeatureImp row order, feature columns, folds, subsets, and real/permutation
+shard assignments.
 """
 
 from __future__ import annotations
@@ -12,6 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -20,10 +16,12 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
+from autobehaver.atomic_io import sha256_file
+
 from .config import RECOGNIZED_FEATURE_CATEGORY_PREFIXES
 from .hhit import generate_feature_subsets_for_hhit, make_hhit_folds, validate_stratified_cv_labels
 from .io_utils import write_analysis_log
-from .matrix import compute_feature_schema_sha256
+from .matrix import compute_feature_schema_sha256, validate_feature_matrix
 from .prep import (
     _filter_low_variance_features,
     _filter_sparse_features_by_group,
@@ -104,7 +102,7 @@ def _jsonl_dump(rows: Iterable[Dict[str, Any]], path: str) -> None:
 
 
 def _relpath(base_dir: str, path: str) -> str:
-    return os.path.relpath(os.path.abspath(path), os.path.abspath(base_dir))
+    return Path(os.path.relpath(os.path.abspath(path), os.path.abspath(base_dir))).as_posix()
 
 
 
@@ -161,6 +159,7 @@ def _compute_hhit_fold_plan(
     H_hits_per_feature: int,
     resolved_global_seed: int,
 ) -> List[Dict[str, Any]]:
+    """Create and record deterministic stratified folds for each coverage round."""
     fold_plan_records: List[Dict[str, Any]] = []
     for h_hit in range(1, int(H_hits_per_feature) + 1):
         split_seed = int(resolved_global_seed + h_hit * 1000)
@@ -187,6 +186,61 @@ def _compute_hhit_fold_plan(
     return fold_plan_records
 
 
+def validate_hhit_fold_plan(
+    records: Sequence[Dict[str, Any]],
+    *,
+    n_training_rows: int,
+    n_splits: int,
+    expected_h_hits: int,
+) -> None:
+    """Validate that every frozen CV round partitions every training row once."""
+
+    by_h_hit: Dict[int, Dict[str, Any]] = {}
+    for record in records:
+        h_hit = int(record.get("h_hit", 0) or 0)
+        if h_hit in by_h_hit:
+            raise ValueError(f"Duplicate fold-plan h_hit: {h_hit}")
+        by_h_hit[h_hit] = record
+    expected_rounds = set(range(1, int(expected_h_hits) + 1))
+    if set(by_h_hit) != expected_rounds:
+        raise ValueError(
+            "Fold-plan rounds do not match H_hits_per_feature: "
+            f"expected={sorted(expected_rounds)}, observed={sorted(by_h_hit)}"
+        )
+
+    universe = set(range(int(n_training_rows)))
+    for h_hit, record in sorted(by_h_hit.items()):
+        folds = list(record.get("folds") or [])
+        if len(folds) != int(n_splits):
+            raise ValueError(
+                f"Fold plan h_hit={h_hit} has {len(folds)} folds; expected {int(n_splits)}"
+            )
+        test_counts = np.zeros(int(n_training_rows), dtype=np.int64)
+        seen_fold_indices: set[int] = set()
+        for fold in folds:
+            fold_idx = int(fold.get("fold_idx", -1))
+            if fold_idx in seen_fold_indices:
+                raise ValueError(f"Duplicate fold_idx={fold_idx} in h_hit={h_hit}")
+            seen_fold_indices.add(fold_idx)
+            train = [int(value) for value in (fold.get("train_indices") or [])]
+            test = [int(value) for value in (fold.get("test_indices") or [])]
+            if len(train) != len(set(train)) or len(test) != len(set(test)):
+                raise ValueError(f"Duplicate row index within h_hit={h_hit}, fold={fold_idx}")
+            train_set, test_set = set(train), set(test)
+            if train_set & test_set:
+                raise ValueError(f"Train/test overlap in h_hit={h_hit}, fold={fold_idx}")
+            if train_set | test_set != universe:
+                raise ValueError(
+                    f"Train/test rows do not cover the training set in h_hit={h_hit}, fold={fold_idx}"
+                )
+            for index in test:
+                test_counts[index] += 1
+        if not np.array_equal(test_counts, np.ones(int(n_training_rows), dtype=np.int64)):
+            raise ValueError(
+                f"Test folds for h_hit={h_hit} do not cover every training row exactly once"
+            )
+
+
 
 def _compute_hhit_subset_plan(
     *,
@@ -195,6 +249,7 @@ def _compute_hhit_subset_plan(
     n_features_per_model: int,
     resolved_global_seed: int,
 ) -> List[Dict[str, Any]]:
+    """Record feature coverage and balanced padding across specialist rounds."""
     subset_plan_records: List[Dict[str, Any]] = []
     padding_extra_rep_count: Dict[str, int] = {str(feat): 0 for feat in all_feature_names}
     total_features = int(len(all_feature_names))
@@ -235,6 +290,7 @@ def _build_task_rows(
     run_permutation_test: bool,
     n_permutations: int,
 ) -> List[Dict[str, Any]]:
+    """Create real and permutation subset tasks from the frozen coverage plan."""
     task_rows: List[Dict[str, Any]] = []
     task_id = 0
     perm_count = int(n_permutations) if run_permutation_test else 0
@@ -279,6 +335,7 @@ def _build_task_rows(
 
 
 def _assign_tasks_to_shards(task_rows: Sequence[Dict[str, Any]], num_shards: int) -> tuple[List[Dict[str, Any]], int]:
+    """Assign tasks round-robin and cap the active shard count at the number of tasks."""
     requested_shards = int(num_shards)
     if requested_shards < 1:
         raise ValueError(f"num_shards must be >= 1, got {num_shards!r}")
@@ -300,6 +357,7 @@ def _assign_tasks_to_shards(task_rows: Sequence[Dict[str, Any]], num_shards: int
 
 
 def _write_task_manifest_csv(task_rows: Sequence[Dict[str, Any]], path: str) -> None:
+    """Write real and permutation subset assignments with their frozen identifiers."""
     fieldnames = [
         "task_id",
         "task_key",
@@ -327,6 +385,7 @@ def _write_per_shard_task_manifests(
     plan_folder: str,
     active_num_shards: int,
 ) -> None:
+    """Write each shard's assignments and their artifact identities."""
     shard_root = os.path.join(plan_folder, SHARD_PLAN_DIRNAME)
     os.makedirs(shard_root, exist_ok=True)
     width = max(3, len(str(active_num_shards - 1)))
@@ -365,6 +424,7 @@ def _build_permutation_seed_rows(
     n_splits: int,
     resolved_global_seed: int,
 ) -> List[Dict[str, Any]]:
+    """Record the deterministic label-permutation seed for every planned fold."""
     rows: List[Dict[str, Any]] = []
     if not run_permutation_test:
         return rows
@@ -410,7 +470,7 @@ def load_featureimp_plan_manifest(analysis_folder_path: str) -> Dict[str, Any]:
 
 
 
-def plan_featureimp_run(
+def _plan_featureimp_run_owned(
     normalized_matrix_path: str,
     results_dir: str,
     *,
@@ -448,6 +508,8 @@ def plan_featureimp_run(
 
     os.makedirs(analysis_folder_path, exist_ok=True)
     plan_folder = os.path.join(analysis_folder_path, PLAN_DIRNAME)
+    if os.path.exists(os.path.join(plan_folder, PLAN_MANIFEST_FILENAME)):
+        raise FileExistsError("FeatureImp plans are immutable; select a new analysis folder.")
     os.makedirs(plan_folder, exist_ok=True)
 
     pipeline_folder = os.path.join(analysis_folder_path, "SAVED_PIPELINE")
@@ -475,6 +537,24 @@ def plan_featureimp_run(
         raise ValueError("training_group_a and training_group_b are required for plan stage.")
 
     resolved_global_seed = _resolve_global_seed(GLOBAL_RANDOM_SEED)
+    from .core import build_settings_snapshot_payload, get_current_settings
+    from autobehaver.atomic_io import atomic_write_json
+    effective_settings = dict(get_current_settings())
+    effective_settings.update(
+        analysis_run_name=analysis_run_name, include_feature_categories=include_feature_categories,
+        control_group_tag=control_group_tag, training_group_a=training_group_a,
+        training_group_b=training_group_b, sex_filter=sex_filter_norm,
+        n_splits=n_splits, H_hits_per_feature=H_hits_per_feature,
+        n_features_per_model=n_features_per_model,
+        min_feature_completeness_per_group=min_feature_completeness_per_group,
+        MIN_VARIANCE_THRESHOLD=min_variance_threshold,
+        run_permutation_test=run_permutation_test, n_permutations=n_permutations,
+        GLOBAL_RANDOM_SEED=int(resolved_global_seed))
+    snapshot = build_settings_snapshot_payload(
+        analysis_folder_path=analysis_folder_path, settings_map=effective_settings)
+    snapshot["__requested_global_random_seed__"] = GLOBAL_RANDOM_SEED
+    settings_path = os.path.join(analysis_folder_path, "FEATUREIMP_RUN_SETTINGS.json")
+    atomic_write_json(snapshot, settings_path)
 
     print("\n" + "=" * 80)
     print("Creating staged FeatureImp plan")
@@ -484,7 +564,9 @@ def plan_featureimp_run(
     print(f"Requested num_shards: {num_shards}")
     print(f"Resolved GLOBAL_RANDOM_SEED: {resolved_global_seed}")
 
-    df_raw = pd.read_csv(normalized_matrix_path)
+    matrix_ok, matrix_error, df_raw = validate_feature_matrix(normalized_matrix_path)
+    if not matrix_ok or df_raw is None:
+        raise ValueError(f"Normalized feature matrix validation failed: {matrix_error}")
     raw_row_count = int(len(df_raw))
 
     if sex_filter_norm in {"male", "female"}:
@@ -538,7 +620,7 @@ def plan_featureimp_run(
             "No features remain after category filtering. Check include_feature_categories / recognized prefixes."
         )
 
-    all_kinematic_prefixes = ("Kinematic_", "KinematicBB_", "KinematicTW_")
+    all_kinematic_prefixes = ("Kinematic_", "KinematicBB_")
     bb_like_kinematic_prefixes = ("Kinematic_", "KinematicBB_")
     kinematic_features_before = len([col for col in all_feature_names if str(col).startswith(all_kinematic_prefixes)])
     all_feature_names = [
@@ -642,6 +724,7 @@ def plan_featureimp_run(
         min_variance_threshold=float(min_variance_threshold),
         sex_filter=sex_filter_norm,
         file_suffix="",
+        effective_settings=effective_settings,
     )
 
     fold_plan_records = _compute_hhit_fold_plan(
@@ -650,6 +733,12 @@ def plan_featureimp_run(
         n_splits=int(n_splits),
         H_hits_per_feature=int(H_hits_per_feature),
         resolved_global_seed=resolved_global_seed,
+    )
+    validate_hhit_fold_plan(
+        fold_plan_records,
+        n_training_rows=len(X_train_full),
+        n_splits=int(n_splits),
+        expected_h_hits=int(H_hits_per_feature),
     )
     subset_plan_records = _compute_hhit_subset_plan(
         all_feature_names=all_feature_names,
@@ -663,6 +752,11 @@ def plan_featureimp_run(
         run_permutation_test=bool(run_permutation_test),
         n_permutations=int(n_permutations),
     )
+    from autobehaver.shard_advice import recommend_shards
+    shard_advice = recommend_shards(len(task_rows))
+    print(f"Shard advice: {shard_advice['recommended_shards']} recommended; {shard_advice['hard_maximum']} is the nonempty maximum. {shard_advice['basis']}.")
+    if int(num_shards) > shard_advice['recommended_shards']:
+        print('Requested shards have little work each; consider fewer shards or multiple concurrent workers per allocation.')
     task_rows, active_num_shards = _assign_tasks_to_shards(task_rows, int(num_shards))
     permutation_seed_rows = _build_permutation_seed_rows(
         run_permutation_test=bool(run_permutation_test),
@@ -708,7 +802,9 @@ def plan_featureimp_run(
         "analysis_folder": analysis_folder_path,
         "analysis_folder_name": os.path.basename(os.path.abspath(analysis_folder_path)),
         "normalized_matrix_path": normalized_matrix_path,
+        "normalized_matrix_sha256": sha256_file(normalized_matrix_path),
         "resolved_global_random_seed": int(resolved_global_seed),
+        "shard_advice": shard_advice,
         "requested_num_shards": int(num_shards),
         "active_num_shards": int(active_num_shards),
         "training_groups": [str(training_group_a), str(training_group_b)],
@@ -740,6 +836,7 @@ def plan_featureimp_run(
         },
         "sex_group_counts": {str(k): int(v) for k, v in sex_group_counts.items()},
         "artifacts": {
+            "run_settings_json": _relpath(analysis_folder_path, settings_path),
             "selected_feature_columns_json": _relpath(analysis_folder_path, selected_features_path),
             "training_row_indices_json": _relpath(analysis_folder_path, training_rows_path),
             "all_groups_row_indices_json": _relpath(analysis_folder_path, all_groups_rows_path),
@@ -759,6 +856,27 @@ def plan_featureimp_run(
             ),
         },
     }
+    artifact_hashes: Dict[str, str] = {}
+    for artifact_key, relative_path in manifest["artifacts"].items():
+        artifact_path = os.path.abspath(os.path.join(analysis_folder_path, str(relative_path)))
+        if not os.path.isfile(artifact_path):
+            raise FileNotFoundError(
+                f"Required FeatureImp plan artifact was not written: {artifact_key} -> {artifact_path}"
+            )
+        artifact_hashes[str(artifact_key)] = sha256_file(artifact_path)
+    manifest["artifact_sha256"] = artifact_hashes
+
+    shard_artifact_hashes: Dict[str, str] = {}
+    shard_root = os.path.join(plan_folder, SHARD_PLAN_DIRNAME)
+    for root, _dirs, filenames in os.walk(shard_root):
+        for filename in sorted(filenames):
+            if filename not in {"SHARD_PLAN.json", "SHARD_TASKS.csv"}:
+                continue
+            artifact_path = os.path.join(root, filename)
+            shard_artifact_hashes[_relpath(analysis_folder_path, artifact_path)] = sha256_file(
+                artifact_path
+            )
+    manifest["shard_artifact_sha256"] = shard_artifact_hashes
     _json_dump(manifest, manifest_path)
     _json_dump(
         {
@@ -782,6 +900,25 @@ def plan_featureimp_run(
 
     return analysis_folder_path
 
+
+
+def _with_plan_ownership(func):
+    from functools import wraps
+    @wraps(func)
+    def owned(*args, **kwargs):
+        from autobehaver.file_locks import FileLock
+        analysis_folder = kwargs.get("analysis_folder_path")
+        if not analysis_folder:
+            raise ValueError("analysis_folder_path is required for plan_featureimp_run.")
+        os.makedirs(analysis_folder, exist_ok=True)
+        lock_path = os.path.join(analysis_folder, "_featureimp_plan.lock")
+        if os.path.isdir(lock_path):
+            raise RuntimeError(f"Legacy plan lock requires verified recovery: {lock_path}")
+        with FileLock(lock_path):
+            return func(*args, **kwargs)
+    return owned
+
+plan_featureimp_run = _with_plan_ownership(_plan_featureimp_run_owned)
 
 __all__ = [
     "FeatureImpPlanArtifacts",

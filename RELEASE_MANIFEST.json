@@ -1,0 +1,2369 @@
+{
+  "version": "1.1.5",
+  "scope": "Distributable source; trained models and normalization assets are external.",
+  "inventory_policy": "autobehaver/source_inventory.py",
+  "generated_files_excluded": [
+    "RELEASE_MANIFEST.json",
+    "SHA256SUMS"
+  ],
+  "file_count": 471,
+  "bytes": 6174533,
+  "python_modules_parsed": 426,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 129,
+      "sha256": "1579a29d9a312b8ee12ac9570d51c26d86ff5b525c670304e1e4d5a931568283"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "bytes": 2938,
+      "sha256": "2cddea0c343b539d7ea9b3ddd946e00526a186535849aad4da1c219e090c6967"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 634,
+      "sha256": "bbf163450de0ee4701159195fdff829556bbc7085ec0191dfb5f2e25e85b170c"
+    },
+    {
+      "path": "AGENTS.md",
+      "bytes": 2059,
+      "sha256": "418004c6805e79aaaaf8ea9e2bf8f83bbb37178a78cfdd7be5555cd13af1fcce"
+    },
+    {
+      "path": "ASSET_NOTICE.md",
+      "bytes": 630,
+      "sha256": "74855e2d1edfc1e4729883bf9b32fb850516a53dc396cb70b70a83a3397183f2"
+    },
+    {
+      "path": "ASSET_SHA256SUMS",
+      "bytes": 453,
+      "sha256": "5982c1820f0a9c2df43e4aade3d57bd3f797f56634a29a4ea33d56cdede1808d"
+    },
+    {
+      "path": "LICENSE.txt",
+      "bytes": 1366,
+      "sha256": "d3121134f9ebbde40b3d9f6345e4bd9c3d750b1dcfcfa15806ef1f53e392637b"
+    },
+    {
+      "path": "README.md",
+      "bytes": 12427,
+      "sha256": "ee0a15cf478d0b76b67b8e81d5cb2259ecd2dd774310604287bdb38f5b2751a1"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "bytes": 1169,
+      "sha256": "599ab1aa7a2f8478ffdf81bbc4889727ab8e5d7757b6d9d3a7baba6e44b6362f"
+    },
+    {
+      "path": "assets/autobehaver_banner_v1.png",
+      "bytes": 985470,
+      "sha256": "b8052da2946b73f207815c18a4241b9a41ee0214ef53ec699d3f2124cb4e7a86"
+    },
+    {
+      "path": "autobehaver/__init__.py",
+      "bytes": 139,
+      "sha256": "1f96c489b2410f449e0a9cb80a430d52b52229f5837f229cd2f2e8a674067679"
+    },
+    {
+      "path": "autobehaver/__main__.py",
+      "bytes": 3186,
+      "sha256": "fd469366ba9b3d3086c52faa14e5c5b6c94c5cfcbec6a4e2b55788926f1b6022"
+    },
+    {
+      "path": "autobehaver/_training_core.py",
+      "bytes": 83645,
+      "sha256": "d0b2db5217782e88630926a76469090b7237616113d002e72f527164c877b6a8"
+    },
+    {
+      "path": "autobehaver/_version.py",
+      "bytes": 80,
+      "sha256": "d45129ac877540666069b16363224a7258a5ea8999fdb20db45c74d2f32fb74c"
+    },
+    {
+      "path": "autobehaver/argparse_utils.py",
+      "bytes": 2824,
+      "sha256": "190f14b2bfd3bdecf6314a18e27cb5a9d921059ea3baf5adb493ec155beb43ce"
+    },
+    {
+      "path": "autobehaver/atomic_io.py",
+      "bytes": 2485,
+      "sha256": "2eaed632f764739bdeaa13fb9ad0da75a3eb82ce4765e5939ac6fa7d6dfdd4e1"
+    },
+    {
+      "path": "autobehaver/augmentation.py",
+      "bytes": 5553,
+      "sha256": "cfd578355388088d1f1f9ff5d6401c47c87cff3c2c3d522df0f3112a1b7bd685"
+    },
+    {
+      "path": "autobehaver/batch_inputs.py",
+      "bytes": 1624,
+      "sha256": "e4eae7c929ccd8aa6c3a2d5463551784f8c24fb12db9b08b0ed9aa2786b463cc"
+    },
+    {
+      "path": "autobehaver/checkpoint.py",
+      "bytes": 22769,
+      "sha256": "47c80bfbea9b64dfff23966fbea7027293bc48df16e2327e502a2aba500667fb"
+    },
+    {
+      "path": "autobehaver/cli.py",
+      "bytes": 27510,
+      "sha256": "1b1fabfc27511d18a337a29ec540caa672eac5960ae6b42060937ff8c1d4aa92"
+    },
+    {
+      "path": "autobehaver/cli_summary.py",
+      "bytes": 3494,
+      "sha256": "c08cf8be0b8c97301b95542392998b38841b1a516f387a78de32f4eb616023f1"
+    },
+    {
+      "path": "autobehaver/completion.py",
+      "bytes": 6775,
+      "sha256": "70edc26d6f0a17df21c1d9cdd387991ac097cac8c6ce20a8d8c6dfd034c6eacb"
+    },
+    {
+      "path": "autobehaver/constants.py",
+      "bytes": 387,
+      "sha256": "d87f7998ea4ab402d715c2cdc0c0b450dfe0456f09239dcfaef69e84c1abab0c"
+    },
+    {
+      "path": "autobehaver/datasets.py",
+      "bytes": 28466,
+      "sha256": "6f543162897412be6a5dc34b2f961a5c3d8abd135b41d6c1e213d7aaaf7870e4"
+    },
+    {
+      "path": "autobehaver/desktop.py",
+      "bytes": 73790,
+      "sha256": "116aa2454f621bb85c23eeefd3ee659ba66678f8c057ef88bba11a1209371f94"
+    },
+    {
+      "path": "autobehaver/desktop_advanced.py",
+      "bytes": 4871,
+      "sha256": "a8f2ec525ddf319d480d271176e8774bbb0fa59e3249607b1275062a66f438d2"
+    },
+    {
+      "path": "autobehaver/desktop_agent.py",
+      "bytes": 4410,
+      "sha256": "e5a04de7717539dc3f4102d93fdc894e31318b54b7323633ee2f0306e63e8661"
+    },
+    {
+      "path": "autobehaver/desktop_base_settings.py",
+      "bytes": 8058,
+      "sha256": "95e6a81f39c185fcdd8c13f3819c068594193f7713f2618b4a14151045da3a78"
+    },
+    {
+      "path": "autobehaver/desktop_drafts.py",
+      "bytes": 1410,
+      "sha256": "d075d7bc9205726f5a17d435e77c2c790adddd967a5ed452a133124e60e169e9"
+    },
+    {
+      "path": "autobehaver/desktop_featureimp.py",
+      "bytes": 9792,
+      "sha256": "e9f934d0f1e9609d12b170bd14fa89218443a0621e2958064fd81c85a67ef70d"
+    },
+    {
+      "path": "autobehaver/desktop_jobs.py",
+      "bytes": 23386,
+      "sha256": "6e196705c7e46479c7ecd700221e6dcf725902d9e718686eeb9e18faf53fbbe8"
+    },
+    {
+      "path": "autobehaver/desktop_monitor.py",
+      "bytes": 4606,
+      "sha256": "298e7234145afbe4a8e93d11fc5993b75bc57cb314acdf85d3262ad3c9c83024"
+    },
+    {
+      "path": "autobehaver/desktop_recovery.py",
+      "bytes": 7067,
+      "sha256": "4ea0365eb4a2b43cf32b02873aa87b3ec1465c820870de453ba39e6cfb95c3dd"
+    },
+    {
+      "path": "autobehaver/desktop_restore.py",
+      "bytes": 2374,
+      "sha256": "f7876324adc7fa5289cb3a0fd6caf29b029ec0d9b230ab552bca507f36b9e675"
+    },
+    {
+      "path": "autobehaver/desktop_selection.py",
+      "bytes": 3420,
+      "sha256": "91b8e0a93057d97183f901489892d5e341ef6f88c32f3873e0876c7056c34284"
+    },
+    {
+      "path": "autobehaver/desktop_settings.py",
+      "bytes": 13818,
+      "sha256": "35070241674658d56fcc190019e6b4482b7e7ee8a0a4f081656ddc22f63ff3cc"
+    },
+    {
+      "path": "autobehaver/desktop_ssh.py",
+      "bytes": 8406,
+      "sha256": "3a36035152cd428914d9859156053c5bd94b93c2b2641856168afb3e9ed9d51b"
+    },
+    {
+      "path": "autobehaver/desktop_training.py",
+      "bytes": 15603,
+      "sha256": "bb1474740adb7f3f59d245713e38c447a972318830b0f728f61464fa2c37631b"
+    },
+    {
+      "path": "autobehaver/feature_selection.py",
+      "bytes": 9857,
+      "sha256": "61e995219d947d559c10f7672d96108e7cfe9f46f3abeac3d317bb88f5b59969"
+    },
+    {
+      "path": "autobehaver/featureimp_local_plan.py",
+      "bytes": 2141,
+      "sha256": "eac40eda08054d9775f4b9822ae6ba0416e8dd58af0df2c19484833886b184ae"
+    },
+    {
+      "path": "autobehaver/ffmpeg_progress.py",
+      "bytes": 2143,
+      "sha256": "9341e624e4c4315dc81d87d088b1b4921a56e77803059c6a94647b0a874a1e2f"
+    },
+    {
+      "path": "autobehaver/file_locks.py",
+      "bytes": 3274,
+      "sha256": "ab5adc42f4a93f06ad82273975695e24a801e5be60fd049061a3b470315d022c"
+    },
+    {
+      "path": "autobehaver/inference.py",
+      "bytes": 89776,
+      "sha256": "b3846cbd7ffe7cc3669fcc21055ca5ab4142d57f3822e5200efdcd71ce3c477f"
+    },
+    {
+      "path": "autobehaver/inference_options.py",
+      "bytes": 634,
+      "sha256": "b51a09a0037ffb06de791f817bf1a3442f558a76c5a44a9015b3567c9b6e0319"
+    },
+    {
+      "path": "autobehaver/inference_runtime.py",
+      "bytes": 19554,
+      "sha256": "0f1575e013b241ec2d08a22f4af6e0489b4b03c7514dd19f881aa26b4c00d510"
+    },
+    {
+      "path": "autobehaver/io.py",
+      "bytes": 4952,
+      "sha256": "ba21fdb437075545d55fe96c8b6de50a124622b05d602b71f54aa1b333348e04"
+    },
+    {
+      "path": "autobehaver/job_batches.py",
+      "bytes": 14888,
+      "sha256": "c7973f57fa5ab471a991d027465f9695fd461d496d3e7d2341d090211736adce"
+    },
+    {
+      "path": "autobehaver/job_incremental.py",
+      "bytes": 3236,
+      "sha256": "214d67c55c74e4dc5ebdd2d71406f45c0cb129d0906034385331f9e8873fb929"
+    },
+    {
+      "path": "autobehaver/job_publication.py",
+      "bytes": 3629,
+      "sha256": "ad7ddaa2ffa249ca7e4f9f0e455461ce7c3098bf183d8bbb07dc47ee17a9dc6e"
+    },
+    {
+      "path": "autobehaver/label_gaps.py",
+      "bytes": 1043,
+      "sha256": "4201f49c324a269685a7f55da39b17c896f94ed0f7c850fd65830ecebda06141"
+    },
+    {
+      "path": "autobehaver/losses.py",
+      "bytes": 8804,
+      "sha256": "7f75fecc574acbe54da4b5350e724a826a2f15192d71a51187d96b5f2c9b610f"
+    },
+    {
+      "path": "autobehaver/lr_finder.py",
+      "bytes": 13191,
+      "sha256": "ae9104773b32e025c185610afba117c5ae02d6eede9e6f81c6929679e93eed46"
+    },
+    {
+      "path": "autobehaver/model.py",
+      "bytes": 11716,
+      "sha256": "48b745f72c19623beb1d0c9800485eaa2c94cdd1c1e9ae96cbd2b390c9a9a17e"
+    },
+    {
+      "path": "autobehaver/pipeline_layout.py",
+      "bytes": 3431,
+      "sha256": "44494d170726c69d0e8fdb4dd46a5c22e2e9dfbbc4aa0b5de97942b2b7a3ffd2"
+    },
+    {
+      "path": "autobehaver/portable_export.py",
+      "bytes": 3236,
+      "sha256": "488ff813190b75376ffac2423515a87adb1404575d33cb33ca07605a2d5487ac"
+    },
+    {
+      "path": "autobehaver/portable_paths.py",
+      "bytes": 11948,
+      "sha256": "d87d95880d3d2e1c2326cac197d5f365aa50db89e653ee5dbf054f8e89bccf2f"
+    },
+    {
+      "path": "autobehaver/postinf/__init__.py",
+      "bytes": 87,
+      "sha256": "d480a20fbd4d3a3dd7e40db18d25d1b6ff07d16c9038f9e9218ac68924fe4b8c"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/WEIGHTING_README.md",
+      "bytes": 4436,
+      "sha256": "63868a7fd41126a2e48274ca944641f1d6179645e9ec12ad2f520dc0e60c8822"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/__init__.py",
+      "bytes": 1559,
+      "sha256": "f5acaf50ea4f098e1fcb008cc951d75cf27b8ff07c2af34ed1eee56f38dbb05c"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/__main__.py",
+      "bytes": 138,
+      "sha256": "612388e54b7768b8981291b633699f14fd6477fd3c19e6d89c622b0d6886b3b3"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/archive_io.py",
+      "bytes": 8911,
+      "sha256": "93a2c0a6f4da28c48a48ebf2e5743b99c6187930d7bee73ba7f370f52729b352"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/baseline_common.py",
+      "bytes": 15002,
+      "sha256": "9e4ee098e8c5b59f4f713349b70e1d3ffe4899d8194cb315d88f7a4c8e9bbce0"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/baseline_outputs.py",
+      "bytes": 8014,
+      "sha256": "f8f56855416afc0322a3fa9fc3544a9be64bbc0480cf7c1c8314cb081d231e7e"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/bounded_pool.py",
+      "bytes": 8119,
+      "sha256": "6224c42e4268e54db9c18f463c807fd825ceb3291f66a7c3168297278e2cb9af"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/cli.py",
+      "bytes": 15544,
+      "sha256": "74667c5d50245f351cd06f8691adec2e84431e7e0b21888b25e8e2d81d0ea092"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/committee.py",
+      "bytes": 11570,
+      "sha256": "0fc0bd798f178d6f3c489666393634bbcdb1b1d1a25ccd5b48515d89b73f884e"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/committee_fast.py",
+      "bytes": 16551,
+      "sha256": "61daa098ecb2afd63e2328113e6d4f9f4e79f0e6a21879d9de1835c1ce2fea99"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/compat.py",
+      "bytes": 12044,
+      "sha256": "4e56f11c4106632c08d14c814fe135659e3f8709844c53d8f04bc557a0917596"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/config.py",
+      "bytes": 22134,
+      "sha256": "028e393360147d1a66d42556446d1875d069fbab07a687e499d0289e53cbd135"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/core.py",
+      "bytes": 23885,
+      "sha256": "dbb5e9c1f041968fd966d3c9e24b81a57681a650b47eb61b5ae58a7affeca413"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/execution.py",
+      "bytes": 2204,
+      "sha256": "4eb236e8467cfbc33b6e2617fda325079c55f49543c8f39d8fa42d2174431bc4"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/feature_groups.py",
+      "bytes": 4333,
+      "sha256": "2b5393abcd6087e56491a4f3f491b3d3b4d0d96d18614591f335419c3e2604e5"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/final_merge.py",
+      "bytes": 49578,
+      "sha256": "5e29a3cb6320f9c1d6671ce9f6873316176354dc996adc78a6abd491cbcde69c"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/finalize.py",
+      "bytes": 40131,
+      "sha256": "6ceb135a9867d732d6d5805ffa844bb6113a6a1755c2b50df3a4bc153ddd3d67"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/fsea.py",
+      "bytes": 32818,
+      "sha256": "14505836ac7c3cad88a7e3b2784faffbbf1c03bb5f2ca13b177c0181be7082da"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/fsea_cache.py",
+      "bytes": 4882,
+      "sha256": "b810d530e6e9a05db5ddc5508f827e86572685685aae5968656083032dadb580"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/fsea_runner.py",
+      "bytes": 59266,
+      "sha256": "482038f3ad0277f4b2630e12dca19b51719bc5d50a0166c353d928cd7a99a060"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/hhit.py",
+      "bytes": 8511,
+      "sha256": "4fd9859abb07ff2e34962c82b6d2c5d5a330284cdd02e4279645e8bb015a784d"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/integrity.py",
+      "bytes": 8667,
+      "sha256": "d6ca322fce8b99b48f36f387592150b88e4a86fcff3fb8bce0cee179dc37d072"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/io_utils.py",
+      "bytes": 21021,
+      "sha256": "b48882985c79ddbe4a8aa9ab52cb579811519a780ad6095c4b1c550a43df3af5"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/logit_ensemble.py",
+      "bytes": 23716,
+      "sha256": "4b451c8c1308ec6fdf72b277a3eb8d54a549d962fb7f4b513f1f5f398479cc8d"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/margin_tasks.py",
+      "bytes": 25950,
+      "sha256": "321651a29e13ae974014c9a7cd967ee887e10bcc84edb0ad769bf707f93874c4"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/matrix.py",
+      "bytes": 26223,
+      "sha256": "6b5e039e69a20fc8a57bb0c4e220b3d34ba95fad6906af8a19490260f4ee897d"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/matrix_input.py",
+      "bytes": 4480,
+      "sha256": "1331c74842642846852532b230308c3b82f9d54779b7bc40fb8be6e996ddae90"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/merge_shards.py",
+      "bytes": 3895,
+      "sha256": "63844c3b2c6069dc8170b86f1a9bf8728c1590cf0fe58bedf65560af0ae87852"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/mp_utils.py",
+      "bytes": 3767,
+      "sha256": "b34f31b5d0babf26331af759692059c131beaf1089b14cf8c1170ec30af18aac"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/pca_axis.py",
+      "bytes": 11112,
+      "sha256": "06069eec9b51851550eb89dc14d355970c0eb6878c98ec12ab3ecb7b2c8f9e85"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/pca_utils.py",
+      "bytes": 7866,
+      "sha256": "f9a04e57454fcbc47d2cb374a56a9231122133ca4be6f895207fdad8d54547da"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/permutation.py",
+      "bytes": 4970,
+      "sha256": "eb66a3e71c36e4309515be4e2565c5f270c87deaedb1151b161021e9b0d614f2"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/plain_xgboost_baseline.py",
+      "bytes": 52366,
+      "sha256": "bb5eec162c44ae92ca95df8619c9b5758c061b3fc120984a1f98565350afaf76"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/plain_xgboost_staged.py",
+      "bytes": 82056,
+      "sha256": "5c6d3d0f665036bca950e85e87113562ef2377f5aa3e70ab629304672c1e0652"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/plan.py",
+      "bytes": 39811,
+      "sha256": "196f22d64c2b32964db51ec9e80bdce52d63e9a8a34faec5238f3544966b16f2"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/postanalysis_logging.py",
+      "bytes": 6526,
+      "sha256": "5dab4e6148475f303a2238e5fb7c0ba48d45212c40fd57dc33108ffa0c17fdcd"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/postanalysis_runner.py",
+      "bytes": 16198,
+      "sha256": "fecc9118ef856b6e850d0c11c24dd68005e31786d0673e0c553d701f49803a0a"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/prediction_export_utils.py",
+      "bytes": 1182,
+      "sha256": "392512b0473c8a7a7296aefb1671697ad4e0917c47368f56df8400620e2510dd"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/prep.py",
+      "bytes": 8635,
+      "sha256": "2192a9f39ba37fa35efbbe924b1735395f7f80c0431c1f4bd008fbc16c54ee96"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/prereqs.py",
+      "bytes": 3255,
+      "sha256": "cb19eed23d81fec92a1df982d59333905cfdcb8781c0744909b890cd3e62047f"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/reference.py",
+      "bytes": 10182,
+      "sha256": "b96b33b2f0ca0a67987e929b7ade65db5fdf3b958778d1a9e6852e6e82c0cfd6"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/reporting.py",
+      "bytes": 44329,
+      "sha256": "e5287227e8cbbc1cb309273fadce11976a2ba9c5eb801db329c9e7dbfae8dfc8"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/runtime_settings.py",
+      "bytes": 6570,
+      "sha256": "3fd1ef0e07cfaf081c6d773dfc01523cbb1d8343ccf445a3f1e2e3062ca45e43"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/shap_compat.py",
+      "bytes": 4140,
+      "sha256": "44ac22aa1abe5629e00a3b78581576c6a670f5e25bcce6b73dc4fd835cfa63a2"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/shap_ensemble.py",
+      "bytes": 11393,
+      "sha256": "c2dbb55bb74a8b1de8ddbb806438a4006d6c9c4dfd8ea77ead129ded84938558"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/shap_tasks.py",
+      "bytes": 24468,
+      "sha256": "aef5f1738f25d93c320c1f399187fbe0b076e12e98ee14b131ef523dc8579c87"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/shard_runner.py",
+      "bytes": 69182,
+      "sha256": "e1b0e66500ef27ba8da2ab4aaa64d2e1cc4a029f626750e74da8728c105827da"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/staged_shared.py",
+      "bytes": 26277,
+      "sha256": "c665d95472ee54b788c10ca2abdcb4ab6278f6c11256c4003728299a122576b8"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/subset_weight_merge.py",
+      "bytes": 13872,
+      "sha256": "7bcff3020205d1f1eae2611a00a97e9cdba85131a5995b463590a321c0811937"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/subset_weighting.py",
+      "bytes": 9156,
+      "sha256": "701ccabbd2072e2ecda586db65d252f11efb658333e51f31d1ede3d99b4249bf"
+    },
+    {
+      "path": "autobehaver/postinf/featureimp/summaries.py",
+      "bytes": 64823,
+      "sha256": "8e6c32943cc4be12af82c7596f1ded2b31aaae71891c1fe35aa9dfd16337f4e6"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/__init__.py",
+      "bytes": 1013,
+      "sha256": "9384797bc614256f71fe9d566267f75e11c979004df84b99b448a0690cb3d17a"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/__main__.py",
+      "bytes": 110,
+      "sha256": "66744f46458b3f399366dfd3bbcd7552c29944beaf758c8420e51f73047b463c"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/cli.py",
+      "bytes": 8350,
+      "sha256": "da3d9ba4bdde376b9c2541a20c4900797619fb9c1c8972b20b5bc0f6cbbf0f11"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/config.py",
+      "bytes": 2934,
+      "sha256": "b63f07220e590b2347ad14cb2f9362b1725c3697fb0930116d6a493308d20cf7"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/core.py",
+      "bytes": 3533,
+      "sha256": "b7dea1d24f729e98586585d31672d5aec8168763751899c9a06977e3d42004e3"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/frame_map.py",
+      "bytes": 6374,
+      "sha256": "385dbe17ba53d300c45a14c25a188c2a0e69c316c8d8c2dd39deb11f393528e9"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/io.py",
+      "bytes": 3356,
+      "sha256": "bfa53a813727841d674eb7b23a3594b8ec8b7ced4657dd93420b7215514a5ad5"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/movies.py",
+      "bytes": 37321,
+      "sha256": "64d40e922f64673544d27fbe5598c4b375980a4601fbd38322661ef5dc878544"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/naming.py",
+      "bytes": 1359,
+      "sha256": "a406375aca580e75ecd1917acf5cb1098c06a350b63dcacfc903e7f3e26a2009"
+    },
+    {
+      "path": "autobehaver/postinf/infmovie/pipeline.py",
+      "bytes": 55155,
+      "sha256": "89c9570949a7a10cea3bfad912b7d019838424217c9b1cb2986dd158875a4688"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/__init__.py",
+      "bytes": 610,
+      "sha256": "f989b97ba7d78c7f5363a858ebcb114d8d48fbf36a9aa5bfcdd2c7935f96018a"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/__main__.py",
+      "bytes": 106,
+      "sha256": "5513efb4edbdfad7d2b70fdcdbf3c45bb85a7cff05a6f2035198a6510b7c667f"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/append_mode.py",
+      "bytes": 56042,
+      "sha256": "27716676e0e922dbbacb048d17a7cbdad495a9ab6d3a2340af13548bd507a5e0"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/batching.py",
+      "bytes": 2627,
+      "sha256": "1a7773908324321fd6d7f212d5ba6bf6f811b7e8ba39282ed47775942733bece"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/bouts.py",
+      "bytes": 9801,
+      "sha256": "05a761537b107ecf08135bb0d18e1f9a0e922d5c01011d4ba70c4202999a8486"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/categories.py",
+      "bytes": 5068,
+      "sha256": "2ce2f5ba4259b3c9c8eb1932841ed60925a505cd19875caf5a8322451a1e3ae5"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/cli.py",
+      "bytes": 17604,
+      "sha256": "e406f1fff4beea357f87d82a66613d38c810632e800914cdea95ba916b15e6f3"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/cohort.py",
+      "bytes": 5460,
+      "sha256": "a2386c6f918343890da928d4cb50cff4931be58a5f4c602dd02960bca39be5ad"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/core.py",
+      "bytes": 20759,
+      "sha256": "67686198cbceef06915614364a31f703dbb609a1f77c79846dd05817627d0463"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/discovery.py",
+      "bytes": 3586,
+      "sha256": "1e833d51b35ff538a47bc5bb6543580a9dca93842188714bf19dd6443bc56f60"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/feature_matrix.py",
+      "bytes": 73992,
+      "sha256": "15a08642b50dd684d521afa99abd0a1ea3142daff528e1c5f3d6e4d9ee0c186d"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/feature_schema.py",
+      "bytes": 3477,
+      "sha256": "677c69332d3a051d393c3938a7aa13a0b9dd7583226ce7b4d34039120bcc30fe"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/feature_schema_catalog.json",
+      "bytes": 705831,
+      "sha256": "f8ec529d3cc71c64ec4c15b201f5e9effbffca057b7bcb882e67fa97f2651dd8"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/finalize_compatibility.py",
+      "bytes": 2174,
+      "sha256": "bb55847b893ed51be077c930c2d9028003993dc98d3df4760be3bebb2952749f"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/finalize_execution.py",
+      "bytes": 11277,
+      "sha256": "ae9b4a0f4811f32fdbfe2736521d5578e32ac8094889fdebbc00c45a9b6cf317"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/grooming.py",
+      "bytes": 1553,
+      "sha256": "87e0699011aa736cd935140641e0c61f961440c4cf9dd8bddbd818d9239cac46"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/hdf_store.py",
+      "bytes": 38041,
+      "sha256": "c748bb50e83552b6eb9845dcdeddcd0d8c6a353ccf1fecc726f4a4a521a3db10"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/input_contract.py",
+      "bytes": 3579,
+      "sha256": "e344a7e24b037d4d23bf82d37e556b7340b27db3adf43cc686f2abf939056d3b"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/integrity.py",
+      "bytes": 17316,
+      "sha256": "e285082f52b062cedb7948dfb5ee43d0d77fa6899bf72337110e9f350c90f054"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/io.py",
+      "bytes": 2021,
+      "sha256": "07ea59fa89e1581115829e05645211849f1b8760b47054414a0fd88e31b28361"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/kinematics.py",
+      "bytes": 132223,
+      "sha256": "20b6697574b20c138899e52c0170e4f0b2c1e2491d130d3e22019da9210d9858"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/ledger.py",
+      "bytes": 18509,
+      "sha256": "0abd463b1e308678f25dae81cf76442ad60119b8c2a1bc863574d5d58d964843"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/locks.py",
+      "bytes": 5363,
+      "sha256": "cb158f22008a7663cfa2450ccc6bd7539a42b8bf2e023f23db2e9aff5e2fdfbb"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/mapping.py",
+      "bytes": 7353,
+      "sha256": "6726c8c4bbe6b13d7def356e2322142c747b5b96863d0456378ec51afef8fe58"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/matrix_parts.py",
+      "bytes": 27444,
+      "sha256": "b10b07759d7054b1790ecbc57ed166f177219b68341356c8873e603846111ece"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/measurements.py",
+      "bytes": 29718,
+      "sha256": "657212b22457626d79ffa34e50a6126a674d8a9f33de6d09c33b1c36e3e47882"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/naming.py",
+      "bytes": 2317,
+      "sha256": "67e4956d84e18b18bb3bbce10a83c4957574fd704d7ec100ef891ee7cbc5770f"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/occupancy.py",
+      "bytes": 45492,
+      "sha256": "5555478fed8d37210d475613ac83db068c5dc2354fc6e06bc52019e0ebfd2ce8"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/pipeline.py",
+      "bytes": 56261,
+      "sha256": "db1d5c600d14dca631c02b17e309f231b9ffa2589ac4bf160db4b3dc2a35196a"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/postural.py",
+      "bytes": 29119,
+      "sha256": "ee61892b9c6346f1fe3d2565601355cc69243d235e2f5cf89b6e3077a7296927"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/publication.py",
+      "bytes": 12987,
+      "sha256": "255e7d9d64f84e292d51c1baf7efa5aa606e943f7757d5a60e06bcf3e41de64c"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/recording_commits.py",
+      "bytes": 3769,
+      "sha256": "182cb0e98b4929d56686f56b768e68563dba48b24026dfc36e8eabfe51c7aa66"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/runtime.py",
+      "bytes": 3690,
+      "sha256": "4c59b72748a1fa289668fbd132e8b6cd8f27be4b4ef40aad34eb04c445576149"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/shard_merge.py",
+      "bytes": 17278,
+      "sha256": "3d43593ab28d38ef2ade82082b1db3ee7df74d8b170fc6b86c00e6d11c863602"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/sharding.py",
+      "bytes": 4473,
+      "sha256": "17b541449e25c5a984876c8dc687368f43cf77cd978d6dc3a774728fd89ae685"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/spatial_stream.py",
+      "bytes": 4037,
+      "sha256": "aab09b37654470873cc3da9a888b634c86034f62cc44aa1c7863f169b5490a7b"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/summary_pooling.py",
+      "bytes": 2960,
+      "sha256": "05f9d2f57ea01cde6dcdf8e5a690d9654238fdfe0e37cb339d9340057f5e4439"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/table_metadata.py",
+      "bytes": 1826,
+      "sha256": "2273a466359609352170073b62084148bb59b95634db0cbd2135fc04fd680906"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/time_budgets.py",
+      "bytes": 18842,
+      "sha256": "2fcb03ea802200a02ccf5ee4f2fea0d2415e8b443c7682466db34b5f5b599f0b"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/transitions.py",
+      "bytes": 27476,
+      "sha256": "5233c477772452868dc697e5bf2043421a5d55679221318b2bf3642a98511582"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/units.py",
+      "bytes": 2674,
+      "sha256": "02be01870c84c7ac35eafb966960fb1a488cd937fca5d88936c8f8f6e5be39f7"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker.py",
+      "bytes": 9573,
+      "sha256": "7509aa3b01889309491f7dac3529bb43d617e24d587a91019bdc108dfdd73b6f"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_bouts.py",
+      "bytes": 3739,
+      "sha256": "83d6563bc037ff2bde599a3754dd97bf8ca4afca1ede0c43d33493d81478e138"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_identity.py",
+      "bytes": 1310,
+      "sha256": "96744f4aad46403dbbe93dc48cc5df1627c670465e4fab17b0642d7fde319f17"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_io.py",
+      "bytes": 10498,
+      "sha256": "7050c0bf9b32922e592f73392c03fd2c42cffd429f73c61424d7e0f5baea072c"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_kinematics.py",
+      "bytes": 3519,
+      "sha256": "906c1a4922cd10cc4a4f20117e75cffcdd3f2227e7331810897f30267a89b427"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_measurements.py",
+      "bytes": 1096,
+      "sha256": "cd4493d34c53cf05aa70c3fbcfdb57cf61dc4181d347470ff1341885bb24f3ef"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_positional.py",
+      "bytes": 3034,
+      "sha256": "09a57cab794267698d2cfafdc9eb5e1863d6611d14dd9d4d4580cb915962c3b4"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_postural.py",
+      "bytes": 4436,
+      "sha256": "ef2037a77b6fc20de44ad93b67ab1deac0c073ce3a8de85673189392cd268a26"
+    },
+    {
+      "path": "autobehaver/postinf/mmgen/worker_summaries.py",
+      "bytes": 11842,
+      "sha256": "059c4c11f7dab05c8e8f60041fb8089876963e4089283f854ed36fec9c4973d1"
+    },
+    {
+      "path": "autobehaver/preinf/__init__.py",
+      "bytes": 73,
+      "sha256": "fa2d16ad40ed3a8f232ba3f98ad8c472727f283036e0767df0fd1a19b903be4c"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/__init__.py",
+      "bytes": 284,
+      "sha256": "9604cf914646af2243b11d462b105c27b934deeaad056fc96889c1299253bec0"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/__main__.py",
+      "bytes": 115,
+      "sha256": "7ea6894254b0d90bb34b030f89a424286a66a4e40960094d429b6f57f747e962"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/cli.py",
+      "bytes": 12396,
+      "sha256": "4536155e8263aee8578ce358819365b45e6d31841ac3e089e95649661991c856"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/config.py",
+      "bytes": 3764,
+      "sha256": "33f57f8718e59ddecb2b474a2add1b51f78a032fd8c9c9082cb8916a44ca7c6c"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/contract.py",
+      "bytes": 3352,
+      "sha256": "b50863713896c3ebf5cb980de5459eaa1806588e478e5e25767161a8e96d237e"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/core.py",
+      "bytes": 2189,
+      "sha256": "40da725d7542ac092fdc1315b7a880051a905579df4167c1d5c525d0d7ff11e7"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/cropping.py",
+      "bytes": 13552,
+      "sha256": "e4b0f0213c9e4feeec1601689e0af507bb01811d8a26f2c4d70fed37e2d4cd17"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/detection.py",
+      "bytes": 11004,
+      "sha256": "ac3ecf7435885b2b7833b9252389d88bfcafef3435c51f939514aa4a904f70d6"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/grid_fit.py",
+      "bytes": 6602,
+      "sha256": "3032caf5f5ff89d36c026463b0cc91cc8dfa25642058c9ed5ea1fd0404492cb5"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/io_utils.py",
+      "bytes": 10607,
+      "sha256": "eb399385fa0001d3a8af4bf188846e0e33b4a9b8bae6dfe7c6c316ea7e58eb58"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/pipeline.py",
+      "bytes": 52447,
+      "sha256": "e25a02c0f64d257d65370ab365f998a15b0b93acde24b68437fdcc8fc3199dda"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/recording_db.py",
+      "bytes": 19790,
+      "sha256": "de4d9efbd1c01b848274cb38cbf9cc05e6f66296a7b1f60c7da6e4680565e9cd"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/recovery_reuse.py",
+      "bytes": 1128,
+      "sha256": "2a5398f7fd6ccdc0461246bfc38ac8d48406d1b5ae7989f95a3cc479ecda4bd1"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/registry_update.py",
+      "bytes": 6654,
+      "sha256": "2654a9c86c512a90f18abeecdce9c14e28ef6f542fc334fd7f096ceb067cc7b3"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/selection.py",
+      "bytes": 4683,
+      "sha256": "012654b55c7b91dc0445ed7f0b33a8add2bcbd6df7c01bf0840a888bd13d8698"
+    },
+    {
+      "path": "autobehaver/preinf/autocropper/thread_limits.py",
+      "bytes": 2084,
+      "sha256": "94a4751dd8e17b5b1325c8943e78cafd25009c23a26685316e6cb099b4ca26f0"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/__init__.py",
+      "bytes": 335,
+      "sha256": "f3e6a43f5ad2837480fb458b7a3f78eb4d7b84d7b17c5f641a4306dade701df7"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/__main__.py",
+      "bytes": 114,
+      "sha256": "bd0f8ec8ad04e247083d7a77d62309055f9837d23da2e4ac83ab1a3acf6eaddd"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/_backend_worker.py",
+      "bytes": 4795,
+      "sha256": "b70bdfd0a7c624ef849a8118e9bdbc86664995a176b701fa0e9e59e84ee402e7"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/backend.py",
+      "bytes": 4470,
+      "sha256": "504a6d9bfd5160d485c57df96df5a745022606524d2cb7f25b5d24801127a8d5"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/cli.py",
+      "bytes": 10778,
+      "sha256": "8d06057b66c0570a3289e3ec949d197b92005f55a035ea57d9776c785c34aec8"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/config.py",
+      "bytes": 2910,
+      "sha256": "4e9cf59d7d7c64c30af5c2246d6ad80f3dc8791de8052336a0c2ec51ed9a67fb"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/contract.py",
+      "bytes": 2549,
+      "sha256": "0cbbd0937039de50952f39eb2e048298de0030bc65bcc38d3e0bcd0ab59a3f13"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/core.py",
+      "bytes": 55862,
+      "sha256": "d1d892cd8ccc9583f05e1669384f947e12286ce1e3b4e3ccb9cd4fb4a757d700"
+    },
+    {
+      "path": "autobehaver/preinf/dlc/registry_update.py",
+      "bytes": 3867,
+      "sha256": "444b9ddd8d63d0af38088427b649fc1652be2a9df429250f19eaa31bffe9defc"
+    },
+    {
+      "path": "autobehaver/preinf/execution.py",
+      "bytes": 9318,
+      "sha256": "61c62bfb5fdab56aefcf2753cad99da1310aaaed4151c4b399a120928cf12997"
+    },
+    {
+      "path": "autobehaver/preinf/frame_identity.py",
+      "bytes": 3515,
+      "sha256": "9fb228a682f48b8906b3b965e5aecfec621ba47bd5aab697cbed391de066ee20"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/__init__.py",
+      "bytes": 149,
+      "sha256": "f828d48b758f79c1b90e4697aa88b2d13c4aa5d7fdf2cae9ac4c923fe0bbbf20"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/__main__.py",
+      "bytes": 110,
+      "sha256": "809b2e27dc23dc8a9aa753a7dc9b73660b842ff74f7c2abc56dfca7fe5bf5db8"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/angular_kinematics.py",
+      "bytes": 5966,
+      "sha256": "7818d71c0a3487edf34d17e6a0940fcc88d432ef25ba040189e7950b773909ae"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/centroid_kinematics.py",
+      "bytes": 7994,
+      "sha256": "8460bcee80f592c950e58096f4379d97b714c9f386989e3ed7c19bd2cdab0465"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/cli.py",
+      "bytes": 6010,
+      "sha256": "8f8ee14aa762d581a5f11aa8dc65b3c5e97364515a965bb689f155199cbbb003"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/config.py",
+      "bytes": 1710,
+      "sha256": "d168731f2265788d63fcfcdf6dce855ee155910989b3dc55e908e0c30fc665fa"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/contract.py",
+      "bytes": 3418,
+      "sha256": "723fcf7e7f5c9a825513897cb5fb50083f1d077f619bac9850a5a846aba2f79a"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/core.py",
+      "bytes": 22750,
+      "sha256": "7dde9801018795648beb29ef09ace52f15c76588f8438a02c7a9ea5ab7ab4f3c"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/dlc_io.py",
+      "bytes": 3278,
+      "sha256": "f93e924ae93c021d4962fc186a91381c0de0b69fb39be04e3de0c828aa533424"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/egocentric.py",
+      "bytes": 3930,
+      "sha256": "7c9f7a8d2628ccb78f50fcfc60cbe1a71a3e94f1d61b446788c60423d7ec7478"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/export_keypoints.py",
+      "bytes": 2454,
+      "sha256": "9beb9a83daa617426e2fb008938ad69af5971cc26c7577da416ec6c4a7d47166"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/feature_schema.json",
+      "bytes": 31563,
+      "sha256": "a8f4d109a041ac514339ba1466fed2eb0f32a5e9a748f652bb021a6557533f31"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/geometry.py",
+      "bytes": 10777,
+      "sha256": "3d633fdf11aacead2a3f4ce266f3b060d3b01e554ea86242fc05e8419c0242a8"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/logging_utils.py",
+      "bytes": 847,
+      "sha256": "0f89358e4e97ea12694e1c35b0cba3504a1b31ef2d64d8794b6e7914608b3d48"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/manifest.py",
+      "bytes": 5621,
+      "sha256": "e55d1bc91b52ce464b733bf8aa9ce40821da99018c722d0cc8bca7a02608efd0"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/pairwise_angular.py",
+      "bytes": 8656,
+      "sha256": "c6585ceba71386d830a5435e4819a2a7837d635c3dd62c3024993298f1eea7b4"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/part_kinematics.py",
+      "bytes": 5597,
+      "sha256": "208c2b4333b41436196a0cacd7c1b1eddb2dad0847342241475a4a49103b91b5"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/pose.py",
+      "bytes": 4171,
+      "sha256": "872b430873a4f7c7b60466c6fe5da34e6d6dc186b87ad8be10722bfe5b5fd5bc"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/registry_update.py",
+      "bytes": 3302,
+      "sha256": "68793c1c9028a03203e1db8aff9a4e33b0c0cf0b77d0a9b85878c3d8270cab5e"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/settings.py",
+      "bytes": 468,
+      "sha256": "f407e3eec3e4a24bc553ffb8ced37a48043b28e54817b7f9171ab7422910d6ca"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/spec.py",
+      "bytes": 6091,
+      "sha256": "f21d897600dedeccc4baf561be81f42c26d3b6d4fd2d0ce0c52eb8c5d141e0ad"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/utils.py",
+      "bytes": 1335,
+      "sha256": "c393ffb700b2ac36abb647013d6940ff96b8613c5d787b69ca13e5039c27aff3"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/worker.py",
+      "bytes": 5684,
+      "sha256": "322248c4c3ac43708b417a2383acc79a442d2c53d4a5f37f008659e40d0b0c82"
+    },
+    {
+      "path": "autobehaver/preinf/keypre/writer.py",
+      "bytes": 5341,
+      "sha256": "8430c11d6a4b452f2ea0f9102783264a3510b0f73c3d8395fb013cf5591faf8e"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/__init__.py",
+      "bytes": 249,
+      "sha256": "4c7a4c36be488bd2232f9d3ee8082bc599e5a9061a2d573f149f1bd168323e77"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/__main__.py",
+      "bytes": 150,
+      "sha256": "3adbd2251ca6678e7a064c4bfdbdcf7b76c5b0f84dbb90a0612b5959a154f62e"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/cli.py",
+      "bytes": 7167,
+      "sha256": "c3dd388ee8ad49af3e8452e3623d644ecf1ebc079acdb3e393fd7bda1b480a42"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/config.py",
+      "bytes": 1981,
+      "sha256": "ee11468da18058841343e40cdd27df40b7855677a0a314601cf7676f92ff33fd"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/core.py",
+      "bytes": 39216,
+      "sha256": "b64a68caaaab3004d2c3c64dd750592236ac3fa05a6d27daded0135ac2d9e429"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/csv_chunks.py",
+      "bytes": 1775,
+      "sha256": "5d463cce4ca0c24c0e1c05ab94853f91c4bc252ece15dc23981ceaa8aa03b1b2"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/identity.py",
+      "bytes": 1549,
+      "sha256": "9813f1551ea62815350c71280426f5a1f41bdc6d98f491b2a378584b4e377314"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/inspect_outputs.py",
+      "bytes": 7835,
+      "sha256": "649eabe4e8d425d6fbddac70085b90f537da4f83f9efb8dbbd231f89885d84c8"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/labels.py",
+      "bytes": 982,
+      "sha256": "e7eeeb0211eade8c0b2b5b3f4825f712c011127536e2aa633e5262b55ea4945a"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/logging_utils.py",
+      "bytes": 3913,
+      "sha256": "309204451988179c701cb78ff8f24be9e25ed48c7375d6b046ac915120a4fa20"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/manifest.py",
+      "bytes": 3875,
+      "sha256": "86e11cacb1fdc2a3da7a14944cbc3865b0e2a89ae4e11a7d5a3ef924176dcbbf"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/normalize.py",
+      "bytes": 13470,
+      "sha256": "7d944917dc2114dae4b7c30eb09c82ae8431a64908515004a18ac84d7554377e"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/normparams.py",
+      "bytes": 6672,
+      "sha256": "0744335e3f309e2f1662c26670c322500fc06dc859ef83b23305d1daf9acaf72"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/registry_update.py",
+      "bytes": 3653,
+      "sha256": "9e5f6e3cd9f12b4bbf5bcf5272f542bd964e9e8566746e317de7b28d82b496a6"
+    },
+    {
+      "path": "autobehaver/preinf/keyprenorm/schema.py",
+      "bytes": 5397,
+      "sha256": "457e858578b319693f7d9a3f01665114d787f5d08f629dc8cf9469e5d0bf1056"
+    },
+    {
+      "path": "autobehaver/preinf/moviechecker/__init__.py",
+      "bytes": 160,
+      "sha256": "dd895eaab5d070bd5512c86ac5717c14454aa306585d8afb2486abe42d2e74ac"
+    },
+    {
+      "path": "autobehaver/preinf/moviechecker/__main__.py",
+      "bytes": 116,
+      "sha256": "7b5d5de4ebe3b4499b931c17c70964e777c517acf1ee62bf24ee5265bffd4d27"
+    },
+    {
+      "path": "autobehaver/preinf/moviechecker/cli.py",
+      "bytes": 4354,
+      "sha256": "ffb5cc080050ede20d766e49b67e2dd25c0477bd6ae96b98e99c70d75db7d2ad"
+    },
+    {
+      "path": "autobehaver/preinf/moviechecker/core.py",
+      "bytes": 20334,
+      "sha256": "9f66fc512da7cb021347be2a7c6103a8c2437e4014a9a61e684477d0885da549"
+    },
+    {
+      "path": "autobehaver/preinf/moviechecker/exclusions.py",
+      "bytes": 8234,
+      "sha256": "34f70449ec568d571282a1a74bd0893f535458dccb512ad3b910bd85afc401fe"
+    },
+    {
+      "path": "autobehaver/preinf/posepred_inference/__init__.py",
+      "bytes": 178,
+      "sha256": "26968bc8a742d50650901a42fbfe0267906d08607f3258e4438ebf3b0960f477"
+    },
+    {
+      "path": "autobehaver/preinf/posepred_inference/__main__.py",
+      "bytes": 112,
+      "sha256": "4e7d81a1618b95c0c2739bd51d81ac9eb0687640644f5dc1b357935d995c143f"
+    },
+    {
+      "path": "autobehaver/preinf/posepred_inference/cli.py",
+      "bytes": 7586,
+      "sha256": "d0995137066794657cdab30797e174b36ce4207721042102eee5ab768adbb4ae"
+    },
+    {
+      "path": "autobehaver/preinf/posepred_inference/config.py",
+      "bytes": 2136,
+      "sha256": "abb9d7f1d2498ca98b70a59a2fc25b18e5bd76ab1651e76a1551be8124a2ac0d"
+    },
+    {
+      "path": "autobehaver/preinf/posepred_inference/core.py",
+      "bytes": 19704,
+      "sha256": "4cdba262e8805dc51b98b2d3aaa811544cd8f70165792fe853830c2b548073db"
+    },
+    {
+      "path": "autobehaver/preinf/posepred_inference/registry_update.py",
+      "bytes": 5547,
+      "sha256": "9103a429d44ac8521dbb7eef4983d35c959b65dcf2871390926de88ff384eb7c"
+    },
+    {
+      "path": "autobehaver/preparation_io.py",
+      "bytes": 1847,
+      "sha256": "e3b45ff2ff2a3c03616b205ad6e8f08836de29dc62c98e16d01c595477a5f030"
+    },
+    {
+      "path": "autobehaver/pretraining.py",
+      "bytes": 35489,
+      "sha256": "17acb81ebe31cee74ec119033aef00a82d0a9a86b25b6caf424532e5e07092b0"
+    },
+    {
+      "path": "autobehaver/progress.py",
+      "bytes": 8274,
+      "sha256": "dffea00af7e3858db8e1f13c1967b2dc2f45039d09767c7ef81f31da23c60703"
+    },
+    {
+      "path": "autobehaver/recording_identity.py",
+      "bytes": 727,
+      "sha256": "06c94fca406abd47a489ec6b76839187de33ce4613364ca76168d2d84a72bb5c"
+    },
+    {
+      "path": "autobehaver/records.py",
+      "bytes": 14758,
+      "sha256": "0da9f15045c8c72416d0253cb6bcc6184bf0503c4bd4bbeb00cd5ce0d4613cd3"
+    },
+    {
+      "path": "autobehaver/registry.py",
+      "bytes": 21727,
+      "sha256": "2e611096f510f067497e76a2eeb132d8cf8057cc53287e2ae7746511ac36c04a"
+    },
+    {
+      "path": "autobehaver/resmooth.py",
+      "bytes": 9117,
+      "sha256": "f9bc9093c51a52404e19518471d21ec941adff4658603016321cbd7af3c2d371"
+    },
+    {
+      "path": "autobehaver/resource_monitor.py",
+      "bytes": 23473,
+      "sha256": "94b4712b58866d8b9165fadd53ff19e118bc63e653aa54addb76666f94117fe8"
+    },
+    {
+      "path": "autobehaver/schedulers.py",
+      "bytes": 8326,
+      "sha256": "50a4f3db9c7c95e98c67088cbd65e3d9883866b00fa9a3cafa9dd8fb8a68113f"
+    },
+    {
+      "path": "autobehaver/scratch.py",
+      "bytes": 3202,
+      "sha256": "9322cbaa81db3ac0ac1b9402160d9e87c8071088fb0ee2ec178e8898a3c26eb6"
+    },
+    {
+      "path": "autobehaver/shard_advice.py",
+      "bytes": 2874,
+      "sha256": "d112b299f7af57fffe14ce7258973483736a9eb89ba7895e3752c963f7a7506f"
+    },
+    {
+      "path": "autobehaver/source_inventory.py",
+      "bytes": 2818,
+      "sha256": "81be188444b478c17644d203f67c011c5e651484b15d0f92526e3a80f628c1b3"
+    },
+    {
+      "path": "autobehaver/training/__init__.py",
+      "bytes": 544,
+      "sha256": "eeeb56ca3f62e54c416a5d0ebb145973c1e6782fb616336a815ae26540212362"
+    },
+    {
+      "path": "autobehaver/training/__main__.py",
+      "bytes": 157,
+      "sha256": "b6a33f6779cda66eda4e7a81c2e0c1b05c81db2926e4cabe47de587c955fa84b"
+    },
+    {
+      "path": "autobehaver/training/posepred_training/__init__.py",
+      "bytes": 574,
+      "sha256": "51f4bdc0da9294b45540f48234ae7a4efccb37f5f74bed315da2756ff8826845"
+    },
+    {
+      "path": "autobehaver/training/posepred_training/__main__.py",
+      "bytes": 118,
+      "sha256": "39ab41ebd010c379895cf36ba466ac7ea2de53540203a68abe03970e2a694d1a"
+    },
+    {
+      "path": "autobehaver/training/posepred_training/cli.py",
+      "bytes": 142,
+      "sha256": "9a46979c376b2f2d1c724796534088dc290fac4cac0afd7ff3825e3fd209e25b"
+    },
+    {
+      "path": "autobehaver/training/posepred_training/core.py",
+      "bytes": 307,
+      "sha256": "0292b29b9b362b4f111ee6314d3d51257403221fcebe56fc015fd3b0d9db847d"
+    },
+    {
+      "path": "autobehaver/training_identity.py",
+      "bytes": 3685,
+      "sha256": "fb8bf7d0525c52e91ae557dd1f74e629f239c8919ce8da1ee99bdfd8e8cdadd3"
+    },
+    {
+      "path": "autobehaver/utils.py",
+      "bytes": 1667,
+      "sha256": "ebb4a195b2166c1605e5f2d13ddc3ed025743add6390284688c973ab0ced4e58"
+    },
+    {
+      "path": "autobehaver/validation.py",
+      "bytes": 8533,
+      "sha256": "7d8789ea477c3526ca2f74fb9e027d3bce8b8086c0a709fb49af633af82cce9d"
+    },
+    {
+      "path": "autobehaver/window_index.py",
+      "bytes": 6949,
+      "sha256": "a3c0aab3938f4024883bac02ecbba8676f811ad3389662e844f7ce843157adc2"
+    },
+    {
+      "path": "docs/AGENT_SETUP.md",
+      "bytes": 7355,
+      "sha256": "65dea1b18eefd8c3d3560faed2268d35805b64ec18d5b7a00d9d8f7c72dc86c2"
+    },
+    {
+      "path": "docs/DESKTOP.md",
+      "bytes": 16878,
+      "sha256": "51d34491a52ee6408029f05ea34a3d41a2f36c22555aed9a6644d6482a0eb70f"
+    },
+    {
+      "path": "docs/HPC.md",
+      "bytes": 14420,
+      "sha256": "2bd9ba27d0a25c21efdcc65bcca0cfead656b9d0b46973c45e45e3d8c17673e1"
+    },
+    {
+      "path": "docs/MODEL_DISTRIBUTION.md",
+      "bytes": 2326,
+      "sha256": "79d261ab088bdc92ee670cca586af7600e6ca871e664cef2db2948a004a879d4"
+    },
+    {
+      "path": "docs/POSEPRED_EXECUTION.md",
+      "bytes": 6022,
+      "sha256": "42d1a4141d9a6690a6b26ea7f43fab4f00f957a2206c6c9686505611a1fb241f"
+    },
+    {
+      "path": "docs/PREPROCESSING_MEMORY.md",
+      "bytes": 3902,
+      "sha256": "40d83cc50e53a5a3dae1ed651b3a17512eb03e572639ee730073c03b3995ac50"
+    },
+    {
+      "path": "docs/PROGRESS.md",
+      "bytes": 4234,
+      "sha256": "856656f586918cabad59850bff26304874806af0aa95d26f9f9bc78c3dc8023e"
+    },
+    {
+      "path": "docs/VALIDATION.md",
+      "bytes": 5480,
+      "sha256": "89f2d250457e48dc8d6986cdd0a4125aba738c471f5399007b1b14a8e1e4adff"
+    },
+    {
+      "path": "docs/featureimp-desktop.md",
+      "bytes": 4300,
+      "sha256": "4c7da7d8ea7277de0a7843ca411ed4e804246a04818e0e302a5bdf9ad2c181c6"
+    },
+    {
+      "path": "docs/mmgen_finalization.md",
+      "bytes": 2971,
+      "sha256": "b5fcb440e62a7f714d7c642a824f9dff2575e70a4fe5b821ec945cf044030bb6"
+    },
+    {
+      "path": "docs/resmoothing.md",
+      "bytes": 1867,
+      "sha256": "e193627fd65ab2905e70ec7551a0ab5523e31e7760d93d11411df3784e57c7b2"
+    },
+    {
+      "path": "docs/resource_monitoring.md",
+      "bytes": 6506,
+      "sha256": "8d3b192152b4f318bcaff56a00b53ac746fc3ddad0d8a7eb79e3691fdb1eafc6"
+    },
+    {
+      "path": "environment/check_environment.py",
+      "bytes": 8099,
+      "sha256": "231b3d4b8f2df2a44640978bcaec80225d430ff961eab285df0161053de61fd1"
+    },
+    {
+      "path": "environment/environment-dlc-tf.yml",
+      "bytes": 588,
+      "sha256": "d9450abdf2be7ab02052daccc11a551a5e761ae6ba2cab94d245a6affa42a66a"
+    },
+    {
+      "path": "environment/environment.yml",
+      "bytes": 314,
+      "sha256": "8bf7de7ef0fd6050738aa62ef481ca2e1d936edcb317be1189dc3aebe471be48"
+    },
+    {
+      "path": "environment/environment_README.md",
+      "bytes": 2765,
+      "sha256": "8c4c82b10b0727b5ad52a380766eaffb8e90f7844fa8a0c6bf07f32967575764"
+    },
+    {
+      "path": "environment/requirements-core.txt",
+      "bytes": 677,
+      "sha256": "3162aa0586deb1b4eec161a6cfaa68e78437aeed6e78d192a4e0f3d76633800d"
+    },
+    {
+      "path": "environment/requirements-dlc-tf.txt",
+      "bytes": 233,
+      "sha256": "700dc1b3d3b471764eacd07540482effe992d594cd07f20345558b2e64614c8b"
+    },
+    {
+      "path": "environment/requirements-local-core.txt",
+      "bytes": 145,
+      "sha256": "1dc3fb963b42c79e3a1ff17fdfb68e1f817811b5c77eae6fad860a1fd7969617"
+    },
+    {
+      "path": "examples/desktop-draft.json",
+      "bytes": 107,
+      "sha256": "2d9cea1ad2ba67912d40468b7c4b3ab759634a2eaf00aa04e71584a3bb762f5d"
+    },
+    {
+      "path": "examples/pipeline_commands.txt",
+      "bytes": 2069,
+      "sha256": "6796bac89f7cf35d005492a86727fcf481caf534ed40f741f97c06849a8a4a22"
+    },
+    {
+      "path": "pyproject.toml",
+      "bytes": 1717,
+      "sha256": "d62ee1f499e8cb49beffd756a0e22bb8d0ee22cc1ec2790477e3b67045ed8947"
+    },
+    {
+      "path": "scripts/compare_scientific_tables.py",
+      "bytes": 5099,
+      "sha256": "8af29aafb777b30b34549bd33223a2f0ecfe1b511d5b8de6e52fc9ea97beaf3b"
+    },
+    {
+      "path": "scripts/hpc/collect.sbatch",
+      "bytes": 994,
+      "sha256": "71507cb3c2d3a8220492955487956f6cb4c2b5c5254492a597c30f5695b6aa50"
+    },
+    {
+      "path": "scripts/hpc/crop.sbatch",
+      "bytes": 2097,
+      "sha256": "01278848922cb7886690a6e9fbbf2bed4be6948553e752396c7f39e4a2934ea2"
+    },
+    {
+      "path": "scripts/hpc/dlc.sbatch",
+      "bytes": 1379,
+      "sha256": "3a9ea73f238e4b058db0eb1a637b6c654fe914f51bde6441cd53f8a9de099863"
+    },
+    {
+      "path": "scripts/hpc/features.sbatch",
+      "bytes": 1333,
+      "sha256": "dc9ec915db7d88ed9c24836c3372daa7e3ee9b3d722352a560d04325823283a4"
+    },
+    {
+      "path": "scripts/hpc/mmgen.sbatch",
+      "bytes": 1889,
+      "sha256": "c4705946d41e28a3bc1acc43d8cca89833040a1bca2496ee3180953d7d03815f"
+    },
+    {
+      "path": "scripts/hpc/mmgen_finish.sbatch",
+      "bytes": 2224,
+      "sha256": "d1d56ebcbe6202f284525b117b1c03042e94c066b3e949753cf2670e37014672"
+    },
+    {
+      "path": "scripts/hpc/posepred.sbatch",
+      "bytes": 1188,
+      "sha256": "25bba8abd616597d1c024b4dd17260bfc6c719485040c4fa37fc5bebfb934e95"
+    },
+    {
+      "path": "scripts/hpc/prepare.py",
+      "bytes": 9491,
+      "sha256": "73877dffe402119a9726637924bd41b1f6221a3c034d95adf7f31877fe00e098"
+    },
+    {
+      "path": "scripts/hpc/runtime.sh",
+      "bytes": 935,
+      "sha256": "e62b694ac0471c52489bbb304cf27ad9d8514110a3828ece78d4f00dd33d88e1"
+    },
+    {
+      "path": "scripts/hpc/submit.sh",
+      "bytes": 11551,
+      "sha256": "1bf5b60c570a7db1294bc4de71efe39d7c403f89e239d20c60b2776d02fd81cf"
+    },
+    {
+      "path": "scripts/release_inventory.py",
+      "bytes": 3485,
+      "sha256": "28a31936b945a74886fb5e0501a672b1fb3de4313258f6851df796753aaee2ba"
+    },
+    {
+      "path": "scripts/run_autobehaver_desktop.cmd",
+      "bytes": 81,
+      "sha256": "1a0e380b4982dc8bd5bd0b59901a34b7955ef1210c5f944d6a2d2c3e80aba977"
+    },
+    {
+      "path": "tests/__init__.py",
+      "bytes": 1,
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "path": "tests/_frozen_smoothing_v1.py",
+      "bytes": 4763,
+      "sha256": "6c5ab1c580fdee28497aff8d96824dc4ec4393a188b714a85aadc2524a043066"
+    },
+    {
+      "path": "tests/_frozen_tta_v1.py",
+      "bytes": 2374,
+      "sha256": "30c17c1873faf3bdb19aec0751e739e88947b2da52568e57dbc15a48bce5f97a"
+    },
+    {
+      "path": "tests/data/smoothing_raw_triggers.json",
+      "bytes": 42770,
+      "sha256": "bacc77328579dfddfbe802a270a4584676451afd955254e2bd265f5a7ca82f34"
+    },
+    {
+      "path": "tests/test_atomic_publication.py",
+      "bytes": 4032,
+      "sha256": "ca173171226daed2ce86cfa78fcd9d8b66d52d781ef1c38fde705d92a88b66a3"
+    },
+    {
+      "path": "tests/test_atomic_replace_conflicts.py",
+      "bytes": 1962,
+      "sha256": "a1571a2b1552d2994b0ab6616e04ac3f7b17388a186bb7d26265e5fe27d9b42d"
+    },
+    {
+      "path": "tests/test_autocropper_detection_layout.py",
+      "bytes": 2457,
+      "sha256": "292be88885deac38db247f998cf82ae24db6878780326c61cd258881bdf53353"
+    },
+    {
+      "path": "tests/test_autocropper_final_frame.py",
+      "bytes": 2778,
+      "sha256": "f2d4ef1c03e371abe414306e8e3c4c3abc98547c14fa30d9909b475bdf5fc024"
+    },
+    {
+      "path": "tests/test_autocropper_grid_fit.py",
+      "bytes": 4075,
+      "sha256": "5b073907f4a43e7b35b977804c99f3892c8e92098bf10179257874c05b95428b"
+    },
+    {
+      "path": "tests/test_autocropper_plumbing.py",
+      "bytes": 9666,
+      "sha256": "6b029fdd9b7d57b5ffe73ac2dc9e467449fd08d375dd5ad59bc505f4df91aae9"
+    },
+    {
+      "path": "tests/test_autocropper_recording_metadata.py",
+      "bytes": 11048,
+      "sha256": "346a191f8fe33b9caf81160ccfa1ad7e2000303c6ae1648cbe96ab4f3e092b5f"
+    },
+    {
+      "path": "tests/test_autocropper_run_summary.py",
+      "bytes": 6991,
+      "sha256": "df00e2e7650f419163d451bbf18da940da05d7171f1bab74290519786dc48cdb"
+    },
+    {
+      "path": "tests/test_autocropper_timing.py",
+      "bytes": 2739,
+      "sha256": "668db73f844170db102f840eaac2656135b9c30f336df9b1bb45f21bc3ccce58"
+    },
+    {
+      "path": "tests/test_bouts.py",
+      "bytes": 2528,
+      "sha256": "aa38c59a6afd5364299edb877e9819485f74b97265b6face88be11dcf3a3aa1d"
+    },
+    {
+      "path": "tests/test_cli_summary.py",
+      "bytes": 4372,
+      "sha256": "7bd692f2558921f67454c4b68018955e755e8bbdf4b7db5f36c8115c432e493a"
+    },
+    {
+      "path": "tests/test_dependency_contract.py",
+      "bytes": 1135,
+      "sha256": "9be7c09838faa95f6fee106bb13d6e73734680b712195f41a1ee844682de9bbe"
+    },
+    {
+      "path": "tests/test_desktop_agent.py",
+      "bytes": 15027,
+      "sha256": "96d35801cb55912645aa4319c4d7c6bcbf3ed50dbc156064a19381155958eef1"
+    },
+    {
+      "path": "tests/test_desktop_drafts.py",
+      "bytes": 1910,
+      "sha256": "277c4e208d2dc510138c6a85e307b944477252c258d5467236d8c408c2949d2c"
+    },
+    {
+      "path": "tests/test_desktop_jobs.py",
+      "bytes": 12962,
+      "sha256": "e6a9eb7d5d669e0c297327f225b63e1b032fe7eff80e98c6341eddf2527b6bd6"
+    },
+    {
+      "path": "tests/test_desktop_monitor.py",
+      "bytes": 1916,
+      "sha256": "02a2beeb94eac5869eaef55964b16c55452c70e0158bd7dd257b9b01cbee2957"
+    },
+    {
+      "path": "tests/test_desktop_recovery.py",
+      "bytes": 5809,
+      "sha256": "26fc46ca1afc1cc2a12b8c0fd3bf38d7ad8407adec520819dc1899dec27770a2"
+    },
+    {
+      "path": "tests/test_desktop_restore.py",
+      "bytes": 4974,
+      "sha256": "4fcf085dcbfea6c8fa599351d6dd92829bf4852998218d2b8f88eb6c4c5aebf6"
+    },
+    {
+      "path": "tests/test_desktop_selection.py",
+      "bytes": 3460,
+      "sha256": "a8039ee59d8ccd50e3f0c9db89c7b1f58dd1bd7193c2a170323100a682f0fcbb"
+    },
+    {
+      "path": "tests/test_desktop_shared_project.py",
+      "bytes": 6472,
+      "sha256": "81b08c8f9b07ecff90beb0e5d10094d0038c0bc9fecde7e44b2e70b6970bacde"
+    },
+    {
+      "path": "tests/test_desktop_ssh.py",
+      "bytes": 7805,
+      "sha256": "c841c1d13e27b73cd500ceb30e4c8ea6422122d9aaa07fa25ce7d1a93258daa7"
+    },
+    {
+      "path": "tests/test_desktop_training.py",
+      "bytes": 10796,
+      "sha256": "d606376aeb8eaf035e7f656a2102da9993a0dcdc1ca5a16f21bcd9d7a1f6750e"
+    },
+    {
+      "path": "tests/test_desktop_workflows.py",
+      "bytes": 8851,
+      "sha256": "7235afcc82fe955777b0a28f9b7ee8df272bb9b77607bf44a72fc563fdbecb91"
+    },
+    {
+      "path": "tests/test_direct_cli_arguments.py",
+      "bytes": 2140,
+      "sha256": "8702f5ce0bb02d14e3a8750e0adeac65a57375a2855478145e52ed0246f9bc64"
+    },
+    {
+      "path": "tests/test_dlc_backend.py",
+      "bytes": 8877,
+      "sha256": "b09ee3477b0dce7008e431c3da5602d88cb833deac33806479553a687a63bf28"
+    },
+    {
+      "path": "tests/test_dlc_completion.py",
+      "bytes": 2993,
+      "sha256": "50d219e0abf4b5d0faf208a0c1d11b852d0d557143ba5dde2f1e2b641a97ebd0"
+    },
+    {
+      "path": "tests/test_dlc_labeled_publication.py",
+      "bytes": 6683,
+      "sha256": "d86e6eebf1e6840f7acc30de946878e58b26ce5314d860b004020377545f55b0"
+    },
+    {
+      "path": "tests/test_dlc_project_layout.py",
+      "bytes": 5775,
+      "sha256": "e9ea89197af23b34452f733a9ec648dcf8cb72e85f3153b21cf1fb91f9a40e3f"
+    },
+    {
+      "path": "tests/test_dlc_restart.py",
+      "bytes": 8365,
+      "sha256": "8c2fa8105da5a241bef75bdd9ad09e937368973f7a611273ff2340ed906979f2"
+    },
+    {
+      "path": "tests/test_environment_monitoring_requirement.py",
+      "bytes": 1257,
+      "sha256": "9ceb829cae98253ee3ff0f4cafb670eb8ab1f709db3ca0b949d91e78c846cf7a"
+    },
+    {
+      "path": "tests/test_epoch_cosine_schedule.py",
+      "bytes": 1689,
+      "sha256": "1498a7e3367ebe5a05b545f42c2b93e9c0f9bdd7264b6114c253236a4ad30b87"
+    },
+    {
+      "path": "tests/test_feature_matrix_constants.py",
+      "bytes": 1365,
+      "sha256": "37f678e01d8745f38e7e637739557bbd246d612d3ea29502d3a5e0fb2889d901"
+    },
+    {
+      "path": "tests/test_feature_selection.py",
+      "bytes": 3288,
+      "sha256": "b8d7cb945adc2723dbc0d124b5978a94489d93a77f739a732e430afa81f90057"
+    },
+    {
+      "path": "tests/test_featureimp_audit_repairs.py",
+      "bytes": 20086,
+      "sha256": "b0840fc865041d86f3f9c2efc54c61550f08e9780b72fca81a5835d4c4ca2f62"
+    },
+    {
+      "path": "tests/test_featureimp_baseline_reruns.py",
+      "bytes": 5667,
+      "sha256": "5c0dfdd341d0290f9287f4fdba8614c1742e8ff98adb223eb1f4f79d1a182109"
+    },
+    {
+      "path": "tests/test_featureimp_category_selection.py",
+      "bytes": 5787,
+      "sha256": "a468896369a7ab2535ac86c1c29b9d068a7ad202368c59849bba4d0975104ef2"
+    },
+    {
+      "path": "tests/test_featureimp_desktop_sharded.py",
+      "bytes": 5357,
+      "sha256": "159b4614a83ac5f35db7f8b95c79dcf7961b5891dcfc9c5829635c80e4c09f17"
+    },
+    {
+      "path": "tests/test_featureimp_efficiency.py",
+      "bytes": 10669,
+      "sha256": "7c5b2533e58c3b7b1ced71a6620cb0f6670cd37239faf1549e8438abba246dc6"
+    },
+    {
+      "path": "tests/test_featureimp_end_to_end_integration.py",
+      "bytes": 3070,
+      "sha256": "1fb61c64a7cbfe036e02ffceebfe717a04de827009be5b9613e2006b25e49719"
+    },
+    {
+      "path": "tests/test_featureimp_explicit_runtime_settings.py",
+      "bytes": 3600,
+      "sha256": "cae1d1b1bfa5c285b37debe9aef178220ae2987703f9d0bda7ce38daf231f510"
+    },
+    {
+      "path": "tests/test_featureimp_final_phase_fixes.py",
+      "bytes": 7479,
+      "sha256": "17f8e212f0f8b030f1f2cc55fb6da53ca85e17cef2a374d284143d755ae6a0c2"
+    },
+    {
+      "path": "tests/test_featureimp_fold_determinism.py",
+      "bytes": 1373,
+      "sha256": "4f8f32bd54cc1015b4911f29648a6d839197243b661db07a3c22216edeb73735"
+    },
+    {
+      "path": "tests/test_featureimp_fsea_groups.py",
+      "bytes": 7719,
+      "sha256": "d9a662003c6b9f9ec05ccbc9e821f1bf57eb35c7d24db6a25771a9291633a5f5"
+    },
+    {
+      "path": "tests/test_featureimp_fsea_ranking_file_mode.py",
+      "bytes": 5361,
+      "sha256": "bfbc6a9fbed9fa07a99307c48148b7637131bead7f043567dce263faaf938216"
+    },
+    {
+      "path": "tests/test_featureimp_imports.py",
+      "bytes": 686,
+      "sha256": "95e837629aee78c1dc935a3dd538a25e4fa0469a003d1c2ecdce58125025d1c7"
+    },
+    {
+      "path": "tests/test_featureimp_logit_permuted_rescore.py",
+      "bytes": 5687,
+      "sha256": "08d7e29915a6dfdb662db869e65a2cdaf8d3a9f010d3b6753558fb332fd3a81e"
+    },
+    {
+      "path": "tests/test_featureimp_margin_task_fastpath.py",
+      "bytes": 8264,
+      "sha256": "25f50e0d879d70b405b1da13b626297fdf7fe7a196b28350a8fbe0c7a7133bd3"
+    },
+    {
+      "path": "tests/test_featureimp_padding_balance.py",
+      "bytes": 3109,
+      "sha256": "92f23ecb8b51139c7d7cc569b9931af386bc3ad1ae59f8fef15f5137e06704ac"
+    },
+    {
+      "path": "tests/test_featureimp_parallel_backend.py",
+      "bytes": 4748,
+      "sha256": "9c9712083fe740ee61112e7368834cd44ca1dd6d34199b0dfa275805325d77fe"
+    },
+    {
+      "path": "tests/test_featureimp_pca_axis.py",
+      "bytes": 1697,
+      "sha256": "1e6e52a40ce925499c44a04cbeb90f7d18a2c9915c94480da4aa3b2ec5176165"
+    },
+    {
+      "path": "tests/test_featureimp_plain_xgboost_baseline.py",
+      "bytes": 14060,
+      "sha256": "2c7a416bcc65db78ce23699cf2148dd8709b77e1e4ab54b0c9f938ad3cd9394d"
+    },
+    {
+      "path": "tests/test_featureimp_plain_xgboost_staged.py",
+      "bytes": 9629,
+      "sha256": "de579a2ef2a58283aaf1169527164d422cce3b346a510dae5e93bf86492657c5"
+    },
+    {
+      "path": "tests/test_featureimp_plan_stage.py",
+      "bytes": 6539,
+      "sha256": "73373f0c77142358e3e20b91d5373ce41da9cad4a1847eaab27312b099a5c337"
+    },
+    {
+      "path": "tests/test_featureimp_postanalysis_stages.py",
+      "bytes": 10772,
+      "sha256": "48e336e8dba52c04ae7b61089cc8a50426b380a3b516da4e915528274c56c54e"
+    },
+    {
+      "path": "tests/test_featureimp_prediction_export_utils.py",
+      "bytes": 984,
+      "sha256": "502974daeec7e0b0e0fdf5c586c804617c8cca36bfd312df51c0a6b54ba2abac"
+    },
+    {
+      "path": "tests/test_featureimp_process_shard_stage.py",
+      "bytes": 9052,
+      "sha256": "657af6c379a3c67aa414693307fbda574e7a38c5a08fba2992ae8c8e18849035"
+    },
+    {
+      "path": "tests/test_featureimp_reference_bundle.py",
+      "bytes": 5777,
+      "sha256": "772bb9956684ccec0c7e8696f604b42ab88cb617c9b1bd4724985c27fc1ec509"
+    },
+    {
+      "path": "tests/test_featureimp_sex_filter.py",
+      "bytes": 3390,
+      "sha256": "051c12516c0d120eae53d8a5ab2080c96a2c808060f50f9275d7916ce76ea1e9"
+    },
+    {
+      "path": "tests/test_featureimp_shap_task_fastpath.py",
+      "bytes": 12373,
+      "sha256": "15b3436a277612f5413f08dbd3db983448ca26bd921fbd76184320e83bfca069"
+    },
+    {
+      "path": "tests/test_featureimp_shap_xgboost_compat.py",
+      "bytes": 2031,
+      "sha256": "f0b8df407b6977f471c6606438cf6ae9a4302ec82f9a333d553451fdc79714b7"
+    },
+    {
+      "path": "tests/test_featureimp_stage_all_serial.py",
+      "bytes": 6165,
+      "sha256": "a2dde3f1fd1e8f675da522b7011642b9a84e29ab19662008b2d0a6bce2fef900"
+    },
+    {
+      "path": "tests/test_featureimp_staged_merge.py",
+      "bytes": 9743,
+      "sha256": "fc439d2c92a65a8a840adefadabf9d6b96ea3ac3ff4e61d16fd1d5c622643298"
+    },
+    {
+      "path": "tests/test_featureimp_subset_worker_equivalence.py",
+      "bytes": 12600,
+      "sha256": "757d8c83b0e854f0e904cc764a2ce6b492729f6ed1a60a398e205e68de696f6a"
+    },
+    {
+      "path": "tests/test_featureimp_transition_filtering.py",
+      "bytes": 7329,
+      "sha256": "34ca193c0f9395ac5fcdeadb06bd827357fbd0c0a2d06cee02e60417620c3e42"
+    },
+    {
+      "path": "tests/test_featureimp_weighting_integration_integration.py",
+      "bytes": 13567,
+      "sha256": "f9c7fdf9a789644c052661c7706e133ef15dfbc2f7a98e7bc53679631caf1ec6"
+    },
+    {
+      "path": "tests/test_handoff_inference_repairs.py",
+      "bytes": 13542,
+      "sha256": "11b74ed8cae6846d20c1b7b233344b8f99cf6dcc3f0282eae64373ca8ab1577a"
+    },
+    {
+      "path": "tests/test_handoff_post_repairs.py",
+      "bytes": 12012,
+      "sha256": "3222e850da0fb562c7148f1be1b46a52489a312eae53082dfb552d8580073b41"
+    },
+    {
+      "path": "tests/test_handoff_registry_training.py",
+      "bytes": 6100,
+      "sha256": "d8e2f991c93334d48aa7d8bb9fa15862948f96b1d2df09cd68c17d1c45ac99e3"
+    },
+    {
+      "path": "tests/test_hpc_submission.py",
+      "bytes": 20035,
+      "sha256": "3d1ab5143d1655a43d498d87d212cf019dde80a39defd25cabb86c3550793a1c"
+    },
+    {
+      "path": "tests/test_imports.py",
+      "bytes": 1172,
+      "sha256": "5d86ff0cc51b44cc8314d9c9ce041ccef8f9bc4fe92d903a73cdb1b5891e72cf"
+    },
+    {
+      "path": "tests/test_inference_runtime.py",
+      "bytes": 10309,
+      "sha256": "fc80812a3f636870fd0a8b0990bc564c797609d16e46312224c783919b345ebf"
+    },
+    {
+      "path": "tests/test_infmovie_audit_repairs.py",
+      "bytes": 10595,
+      "sha256": "a3f06371167047bf1599847cfdb0e371b9303aae0141a97539e4d3b218ed16a9"
+    },
+    {
+      "path": "tests/test_infmovie_fps_cap.py",
+      "bytes": 2070,
+      "sha256": "f055c69e4ed9ab44f6c06572d53c8e60fa7ada8a85cf10e72e934d0a79cb3ebb"
+    },
+    {
+      "path": "tests/test_infmovie_matching.py",
+      "bytes": 2709,
+      "sha256": "66f523b59032ed97536a4b7876c071bf102cc90c5b3156214733cbfd70f253a3"
+    },
+    {
+      "path": "tests/test_job_batch_mmgen_equivalence.py",
+      "bytes": 4390,
+      "sha256": "b8284a2f13e77943dddc0850cd6746f9984aaff1c781bb12990cb3bcb801cddd"
+    },
+    {
+      "path": "tests/test_job_batching.py",
+      "bytes": 17068,
+      "sha256": "67b012567deb7a357f49d3c2749873328c2d20f145b102a20b797a497a0e63bd"
+    },
+    {
+      "path": "tests/test_keypre_raw_only.py",
+      "bytes": 2830,
+      "sha256": "1506335987b04c0b0ad31cc479fcdda7f3f1c1fe6397eebe30c7e9456500921f"
+    },
+    {
+      "path": "tests/test_keyprenorm_cli_config.py",
+      "bytes": 1438,
+      "sha256": "f7407a70cbfa7260545fe623154c43f7f7e73c499c4d7d76413fb13522a4ddbd"
+    },
+    {
+      "path": "tests/test_keyprenorm_logging.py",
+      "bytes": 2832,
+      "sha256": "fd210fc45445b55deab5057d4a4b78ae4104db4786e3391ff23463349216a266"
+    },
+    {
+      "path": "tests/test_keyprenorm_output_layout.py",
+      "bytes": 1413,
+      "sha256": "04a466b7a4cd43deb6141dda9ae961bb7b03cb74ceae35d191989866dc6f33da"
+    },
+    {
+      "path": "tests/test_keyprenorm_synthetic.py",
+      "bytes": 6454,
+      "sha256": "cdea464dff7deba1cbf8363ef5ef8687cc3f66932a903f5c298f935a2b284679"
+    },
+    {
+      "path": "tests/test_kinematics.py",
+      "bytes": 6666,
+      "sha256": "1395cbf7f436fd418e06988f2fdab95ff23003095c0cba704938f66e98b34ba4"
+    },
+    {
+      "path": "tests/test_main_dir_layout.py",
+      "bytes": 7970,
+      "sha256": "a8ecdac3b750cdc4399ac104ee04c512410f9b33cb83dda2e256ee4956d94491"
+    },
+    {
+      "path": "tests/test_measurements_integration.py",
+      "bytes": 2084,
+      "sha256": "f5321901dcdc8512690c2995fa5615708340316fc16ce3ef8cf00ba3d484e195"
+    },
+    {
+      "path": "tests/test_mmgen_append_mode.py",
+      "bytes": 20835,
+      "sha256": "164df5099d67a31572aa1d2be213b8432f67ea9605294012d3f605a68d9323f2"
+    },
+    {
+      "path": "tests/test_mmgen_bout_count_filtering.py",
+      "bytes": 1241,
+      "sha256": "ab9bc04e4d5296a913a14a0720b6a7b58f6adf0cc75b9005703b8cc4136761f6"
+    },
+    {
+      "path": "tests/test_mmgen_calibration_plumbing.py",
+      "bytes": 3801,
+      "sha256": "4ae52aa498ff5de522e167311a2ac3ee26776ab90926a8ae9c7b8350471f6afb"
+    },
+    {
+      "path": "tests/test_mmgen_crash_safe_locks.py",
+      "bytes": 3938,
+      "sha256": "e73f3a8ce2081d2df4eeca05e3c6beec9c74831b7009d90b0ef60d4f9a3beec4"
+    },
+    {
+      "path": "tests/test_mmgen_empty_workbook.py",
+      "bytes": 1960,
+      "sha256": "56d2e02d4593849fb283f22690c695f02e68491192fea8af9c16b1c25166004f"
+    },
+    {
+      "path": "tests/test_mmgen_feature_matrix_sources.py",
+      "bytes": 10872,
+      "sha256": "e0e43065b2870e907dc1e3f3a75e79a92eecb2133e985da0db2413b9c7130fdc"
+    },
+    {
+      "path": "tests/test_mmgen_finalize_parallelism.py",
+      "bytes": 4849,
+      "sha256": "953c50ba6b70fbc79498ed8b3c2fff1ac00201fce6c6b810e38c26da340a13bb"
+    },
+    {
+      "path": "tests/test_mmgen_keypre_contract_fix.py",
+      "bytes": 10501,
+      "sha256": "609401806f0a476b4f4fa0f8bba935b71051478aac352b6fd7ebbe37a91e21dc"
+    },
+    {
+      "path": "tests/test_mmgen_ledger.py",
+      "bytes": 7529,
+      "sha256": "db0410388ea03b9e71e591c348659b8774a58102fb606b404b2435fb815c8cad"
+    },
+    {
+      "path": "tests/test_mmgen_matrix_first_shards.py",
+      "bytes": 5920,
+      "sha256": "a7e6a5ba917beb2eef5ccf5e1c23c3f04e70052e55402dd234f8caad9ee45956"
+    },
+    {
+      "path": "tests/test_mmgen_memory_bounds.py",
+      "bytes": 6112,
+      "sha256": "3e21d7a83ab09a8da372b58ac9fe225fdf157449607b4a1fd137503192a7ddda"
+    },
+    {
+      "path": "tests/test_mmgen_output_modes.py",
+      "bytes": 10306,
+      "sha256": "0a524878ccf19a9f4a4d76c73288d4c94deb708fc95ca6a1759070a1ff4030a4"
+    },
+    {
+      "path": "tests/test_mmgen_paper_catalog.py",
+      "bytes": 1833,
+      "sha256": "00d6198757b8d4470d33c8080ad26eb8e3615986de428c9f13b59e08bc6fee0a"
+    },
+    {
+      "path": "tests/test_mmgen_per_fly_observations.py",
+      "bytes": 16107,
+      "sha256": "1bbcc0724bbb025cbecf7ee1b668a807ea3f28b369ec5c4945fc5af588e25d03"
+    },
+    {
+      "path": "tests/test_mmgen_postural_orientation_schema.py",
+      "bytes": 3895,
+      "sha256": "abc123347610b805213403d64b0cf01aa47120f7b6cfe90f8d0d6eb3f96945fb"
+    },
+    {
+      "path": "tests/test_mmgen_recording_commits.py",
+      "bytes": 7831,
+      "sha256": "f3e641d450043a0a4486488964d219003c8c840b5757e60e63175f2f639e1c84"
+    },
+    {
+      "path": "tests/test_mmgen_repair_contracts.py",
+      "bytes": 7339,
+      "sha256": "b2592fe1f3bccc6a0b963a69ecf70df9e7f72cde3c5828c99c3df4cdfa2ad1d4"
+    },
+    {
+      "path": "tests/test_mmgen_repair_publication.py",
+      "bytes": 11735,
+      "sha256": "130abe1a5f84a37675082abd8092d7d495312539b1460ad3bcda3b9d065f3986"
+    },
+    {
+      "path": "tests/test_mmgen_repair_reports.py",
+      "bytes": 6649,
+      "sha256": "a68341178f205644d2ff49330dbe23b78292a957e55751ed444a633440ec8aeb"
+    },
+    {
+      "path": "tests/test_mmgen_repair_science.py",
+      "bytes": 9780,
+      "sha256": "3cdf6217d6cf241e744b0b211d9bd15db28318e4b7f81b3f55c471839ee500f7"
+    },
+    {
+      "path": "tests/test_mmgen_repair_workflows.py",
+      "bytes": 11548,
+      "sha256": "00d5182d19d77abd64c8d719d87e72d814e8d21c7581537c4a07168112b51462"
+    },
+    {
+      "path": "tests/test_mmgen_report_workers.py",
+      "bytes": 2926,
+      "sha256": "39f2fb0c5a571a43d52e598590fc273c712bcf7b0ea024b5f996f0c83f590b09"
+    },
+    {
+      "path": "tests/test_mmgen_runtime_settings_contract.py",
+      "bytes": 3434,
+      "sha256": "27524707b842460c5d0671c33f0e3bb24e6dc84665392a7fb1db38feb07318d1"
+    },
+    {
+      "path": "tests/test_mmgen_sharded_guards.py",
+      "bytes": 5792,
+      "sha256": "3bcb5ce1089d178a20382bc1c78d4acb2dae42bf054e904e4f8c3f9fd1a97b4d"
+    },
+    {
+      "path": "tests/test_mmgen_source_frame_offset.py",
+      "bytes": 2589,
+      "sha256": "c2ffc027a1210a4bae52ffb55fb63bb31d15aabd391321a5ba007889948a5d46"
+    },
+    {
+      "path": "tests/test_mmgen_string_widths.py",
+      "bytes": 7113,
+      "sha256": "93d3e0fb97f4bdecb257831d27984257bf0452af8a888415c62941e2999507ed"
+    },
+    {
+      "path": "tests/test_mmgen_verification_chunks.py",
+      "bytes": 3371,
+      "sha256": "7aa52c165f58c7b420b1020d75b3cb2e1296b4a36b017c373102dfe980616986"
+    },
+    {
+      "path": "tests/test_moviechecker_exclusions_store.py",
+      "bytes": 2384,
+      "sha256": "70a7ecca870d5bee91f412c03325c0052aa404ff474b7b758eef51c0a933f89a"
+    },
+    {
+      "path": "tests/test_moviechecker_recording_occupancy.py",
+      "bytes": 8887,
+      "sha256": "e488c9f7b8edb20f292776f70b2c98098a9f67ee4cebf1b8901f9111505e673e"
+    },
+    {
+      "path": "tests/test_name_map_publication.py",
+      "bytes": 7640,
+      "sha256": "c1048c4f8353ae7657224423d0d853bf8279a103b5dc4e4c746650fc168cf41d"
+    },
+    {
+      "path": "tests/test_naming.py",
+      "bytes": 935,
+      "sha256": "316a63f00e0a53418124a5eeb4e575536064d1a241c2d984ace9723dbf089159"
+    },
+    {
+      "path": "tests/test_phase6_weighting.py",
+      "bytes": 11262,
+      "sha256": "1a91d7f857efa8a3035653d9ec3a8d4f1cc0d16e3d52fe4aa7e6dc04dbdff0ce"
+    },
+    {
+      "path": "tests/test_pipeline_commands.py",
+      "bytes": 1646,
+      "sha256": "1a4cca826271288f27ea52f5166b114603fd693e0eb88c57a62e61c83df9b991"
+    },
+    {
+      "path": "tests/test_portable_registry_handoff.py",
+      "bytes": 4026,
+      "sha256": "81fcaf32e7d8892cc82188e399b29ef1df109ad3d3d95f910106946256b5f821"
+    },
+    {
+      "path": "tests/test_posepred_ablation_artifacts.py",
+      "bytes": 1316,
+      "sha256": "1273f278f32cd85926c98b0b2476ce8ebac4cd3a37ded5f4bcc3a2705f70188f"
+    },
+    {
+      "path": "tests/test_posepred_audit_repairs.py",
+      "bytes": 20377,
+      "sha256": "ae1aa569d00a055d30a0ee25a4dfc803bafea8bd3d82aca51c5a82601cffe3ad"
+    },
+    {
+      "path": "tests/test_posepred_checkpoint_inference_compat.py",
+      "bytes": 8019,
+      "sha256": "33692b57cfbe6e2fd2fb007b352014aa5c29b923184e71c6dedaa2d2fad4f7dd"
+    },
+    {
+      "path": "tests/test_posepred_inference_audit.py",
+      "bytes": 7489,
+      "sha256": "828e7a0e12cc704d492918bdc2de6144eea6e96f24225b44545935a9ee8b8f53"
+    },
+    {
+      "path": "tests/test_posepred_inference_layout_behaviors.py",
+      "bytes": 3025,
+      "sha256": "19eda31c5298f6832c16b3071770ae5135fa5cca6c24398a4f85e4b80fb3af57"
+    },
+    {
+      "path": "tests/test_posepred_lr_finder_preparation.py",
+      "bytes": 2588,
+      "sha256": "66a29a95e3ec5a935c2b6a062dbb75c682cd8ce9ecc74782d17ecf1beee5873b"
+    },
+    {
+      "path": "tests/test_posepred_pretraining_resume.py",
+      "bytes": 8836,
+      "sha256": "e2d88cd28eaf48b9434a1f579d6aab4c13ab7c056d1b1a8da20204fa3c56eb2d"
+    },
+    {
+      "path": "tests/test_posepred_swa_mode.py",
+      "bytes": 6110,
+      "sha256": "1d0bc8985572979051ef2d5ac30b8097d13641e85a91ca5367bb402d127ef680"
+    },
+    {
+      "path": "tests/test_posepred_training_audit.py",
+      "bytes": 7046,
+      "sha256": "3b6f0f8fd08bbca76a12f3b2874dd6a1cd5110dc0003a95783b27aa6ffbc8afa"
+    },
+    {
+      "path": "tests/test_posepred_training_config_flow.py",
+      "bytes": 1953,
+      "sha256": "d1e18572ca9510e0cb703d6a5c625717932adbd0455d34c701cc78bc03e0d978"
+    },
+    {
+      "path": "tests/test_posepred_training_scheduler_and_namespace.py",
+      "bytes": 3035,
+      "sha256": "3d7007329d3a6a30deb39fd2a255f19fd9c44903a22892bdde7a3b45d1f08e78"
+    },
+    {
+      "path": "tests/test_posepred_tta_smoothing.py",
+      "bytes": 4772,
+      "sha256": "ae6228e31f9b6271ce749c816e6c8689f985ac02646eba6cad38a55a565ba280"
+    },
+    {
+      "path": "tests/test_posepred_weight_init_policy.py",
+      "bytes": 3268,
+      "sha256": "0dc8e6b0ab59ee11550f65c3043e06e062096ba5ec54f5b65dab2fc0fb664e0f"
+    },
+    {
+      "path": "tests/test_postinf_direct_options.py",
+      "bytes": 15536,
+      "sha256": "6ae2c9c4338d2525bed0341f8907848f04ab84b91984536d27f8d6411d36d1f3"
+    },
+    {
+      "path": "tests/test_preinf_audit_repairs.py",
+      "bytes": 11624,
+      "sha256": "347711e4c8c20f96a98b5f558ae9cd3dc76509204e3fafc0d540189a9089686b"
+    },
+    {
+      "path": "tests/test_preinf_direct_cli.py",
+      "bytes": 5010,
+      "sha256": "636d2dceb79feb57a613814d3bcaa890751f0f747b628bb867c8ee892aa02b4d"
+    },
+    {
+      "path": "tests/test_preinf_handoff_repairs.py",
+      "bytes": 13667,
+      "sha256": "1df49105c0838708743921f9aa6dc23159403fd7c88ad10d930a265d4a1f8e3c"
+    },
+    {
+      "path": "tests/test_preparation_io.py",
+      "bytes": 1501,
+      "sha256": "bad1bb32d1be8b273a20ff7c2b04bac4ef9f066aa7c592489ff33002459f84ac"
+    },
+    {
+      "path": "tests/test_preprocessing_efficiency.py",
+      "bytes": 11635,
+      "sha256": "33d63d4533080f6dafe4b3adb7797eb4c20593325d564485ceae031aca5c7844"
+    },
+    {
+      "path": "tests/test_preprocessing_memory.py",
+      "bytes": 12281,
+      "sha256": "c226bcbe790f1d0a3a14ee211ffdbcecc69dea647e385c2613b27e96738ae586"
+    },
+    {
+      "path": "tests/test_progress.py",
+      "bytes": 5118,
+      "sha256": "994a9a5a0a49ef841a2fa6d8e0e2c606e766d698ce60cea35c5b1e7702962439"
+    },
+    {
+      "path": "tests/test_release_correctness.py",
+      "bytes": 7773,
+      "sha256": "74b07f4be95b24228a3784dcd39a73ba65db025a7eaed55a35ac6f6e027f2935"
+    },
+    {
+      "path": "tests/test_release_inventory.py",
+      "bytes": 1504,
+      "sha256": "63aca84e6b81f107d8648c2dc7fef64d210c39a19946468ad295245456bec971"
+    },
+    {
+      "path": "tests/test_resource_monitor.py",
+      "bytes": 17849,
+      "sha256": "7e2e22ccedae190b042a668081a4aa182b44f5c0d40c186dae004a0e7e824da3"
+    },
+    {
+      "path": "tests/test_root_efficiency.py",
+      "bytes": 11507,
+      "sha256": "fb242fd32adf1c1972861b4d81c4ad045d2babae28ca10f344a7153c77255dd4"
+    },
+    {
+      "path": "tests/test_scientific_default_alignment.py",
+      "bytes": 3280,
+      "sha256": "4f71ba4e9e34cf88d5a945f19ac6293f0d827aa6525952c131da394d388a893b"
+    },
+    {
+      "path": "tests/test_scientific_featureimp_repairs.py",
+      "bytes": 17227,
+      "sha256": "f2af8b76b47e2af420440dfd14b79e11f09a96a6bd4f7506a490ad2a68603257"
+    },
+    {
+      "path": "tests/test_scientific_infmovie_repairs.py",
+      "bytes": 5388,
+      "sha256": "3fa43c83b7a481504c42095ce3046df5da851f9108c999342dc6f4e82d4d711f"
+    },
+    {
+      "path": "tests/test_scientific_keypre_mmgen_repairs.py",
+      "bytes": 21411,
+      "sha256": "a1b4579972ea77b5cb61c425f5dffa7c0cde124d773b1642e772fb30215594f9"
+    },
+    {
+      "path": "tests/test_scientific_matrix_finalization.py",
+      "bytes": 6651,
+      "sha256": "0a2fef9a1913b19fb14e028815391b94e4f473a09a4ce7a242c828af528e9fb9"
+    },
+    {
+      "path": "tests/test_scientific_mmgen_append_repairs.py",
+      "bytes": 14989,
+      "sha256": "e7649de986525eb7b2a6cc7b90771595572d37339522d2c969d1af91a4d9c4c9"
+    },
+    {
+      "path": "tests/test_scientific_mmgen_integrity.py",
+      "bytes": 13106,
+      "sha256": "08c47488f75d955e34192d2fd9bc21390d6c903a69642efcc90940471cd7434c"
+    },
+    {
+      "path": "tests/test_scientific_occupancy_publication.py",
+      "bytes": 2493,
+      "sha256": "9efc1a289adea118d254b2adb0dd9b9328bc9283d1acb7ad052333896171b8bb"
+    },
+    {
+      "path": "tests/test_scientific_posepred_repairs.py",
+      "bytes": 8703,
+      "sha256": "8c6ee07ab95b8cd2bdad12380db755bf2b64fd13d2a6ca4ede6709390629ca2f"
+    },
+    {
+      "path": "tests/test_scientific_postural_source_metadata.py",
+      "bytes": 1282,
+      "sha256": "6a39f855537ccf90e0dbef0dcadc7f7e1a3578e7ede6a94adc90ca5ab5cd1b52"
+    },
+    {
+      "path": "tests/test_scientific_transition_shard_equivalence.py",
+      "bytes": 2444,
+      "sha256": "6f599a7937c90f079cd9b03570cebc1e78223b4873f605a21a4196b624556de6"
+    },
+    {
+      "path": "tests/test_shared_repair_contracts.py",
+      "bytes": 6790,
+      "sha256": "03000b40be04b90204b469a76228499f15e47bdd909ddccb1b2b0c6018b07233"
+    },
+    {
+      "path": "tests/test_source_distribution.py",
+      "bytes": 1919,
+      "sha256": "690b46eaabea04f419ef5f9bb2532fa616f1239f7f2d7d05da8405624c614899"
+    },
+    {
+      "path": "tests/test_stage_validation.py",
+      "bytes": 1736,
+      "sha256": "bde67a12b39149e8deeaae8164eddd32290361d920107c3a39bbcd76c74dffaa"
+    },
+    {
+      "path": "tests/test_submission_continuation.py",
+      "bytes": 7275,
+      "sha256": "0ef1ef3778c631d1a8ea8a7310267384a0d32bff5fabd9f2aa66b1c88bef4695"
+    },
+    {
+      "path": "tests/test_submission_recovery_contracts.py",
+      "bytes": 3065,
+      "sha256": "68000e92ef2a6d8b4c77f665d78182af57f63ff80865f38e216b94e8c9fab693"
+    },
+    {
+      "path": "tests/test_subset_weighting_multi_perm_pooling.py",
+      "bytes": 851,
+      "sha256": "8da9384d7ab5e8425b6e488a3e44ae5691d271fc30bcb439cbaa178cb3eed524"
+    },
+    {
+      "path": "tests/test_units.py",
+      "bytes": 1692,
+      "sha256": "0e1a97cfd898a68321771ef7b7a0f2ef3996b7eafa0c4d11e57b733891399eaa"
+    },
+    {
+      "path": "tests/test_validation_hardening.py",
+      "bytes": 10259,
+      "sha256": "db7b5b68a876827b8d01940bea2c0c9a195366853242e21d731663668a647d99"
+    },
+    {
+      "path": "tests/test_variable_length_and_recorded_occupancy.py",
+      "bytes": 4184,
+      "sha256": "3370c60c3f18e5e887a36706ebf9b02a49342afe9858fd2bdd2364b11956f795"
+    },
+    {
+      "path": "tests/test_video_efficiency.py",
+      "bytes": 11598,
+      "sha256": "fd3824b8c724878ec1c3d23f27b92404cedc2cb410ad164931f824687cabfe8e"
+    }
+  ]
+}

@@ -1,4 +1,6 @@
-"""Worker helpers for postural feature extraction."""
+"""Align inference labels and probabilities for recording-level MMGen postural
+extraction.
+"""
 
 from __future__ import annotations
 
@@ -71,9 +73,8 @@ def compute_postural_features_df(
     video_path: str,
     mm_per_px: float,
 ) -> Optional[pd.DataFrame]:
-    """Compute postural_features_df for one recording.
-
-    The helper keeps postural feature alignment logic isolated from the main worker.
+    """Align recording labels and orientation probabilities and extract enabled posture
+    features.
     """
 
     if not config.get("calculate_postural_features"):
@@ -82,7 +83,7 @@ def compute_postural_features_df(
     # Create a copy of poscalc_df to add orient probs to
     poscalc_df_with_orient_probs = poscalc_df.copy()
 
-    # --- 1. Copy Orientation Probability Columns ---
+    # 1. Copy Orientation Probability Columns
     orient_prob_cols = [
         col for col in df_inference.columns if col.startswith("Orient-") and col.endswith("-Prob")
     ]
@@ -104,7 +105,7 @@ def compute_postural_features_df(
                 edge_skip,
             )
 
-    # --- 2. Align masked_poses and masked_orients to the positional-calcs timeline ---
+    # 2. Align masked_poses and masked_orients to the positional-calcs timeline
     full_length_poses = _align_values_to_poscalc_length(
         masked_poses,
         len(poscalc_df_with_orient_probs),
@@ -121,7 +122,7 @@ def compute_postural_features_df(
     else:
         full_length_orients = np.full(len(poscalc_df_with_orient_probs), None, dtype=object)
 
-    # --- 3. Call the feature function with fully aligned data ---
+    # 3. Call the feature function with fully aligned data
     return _calculate_postural_features(
         poscalc_df=poscalc_df_with_orient_probs,
         masked_poses=full_length_poses,

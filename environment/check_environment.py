@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""Check the active Autobehaver Python environment.
+"""Check dependency imports and public command help in the active environment.
 
-Run from the repository root:
-    python environment/check_environment.py
-
-For the optional DeepLabCut/TensorFlow environment:
-    python environment/check_environment.py --dlc-only --require-dlc
-"""
+Use --dlc-only --require-dlc for the separate DeepLabCut environment."""
 
 from __future__ import annotations
 
@@ -125,7 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-cli-help",
         action="store_true",
-        help="Skip module --help smoke checks.",
+        help="Skip command-line help checks and check imports only.",
+    )
+    parser.add_argument(
+        "--require-monitoring", action="store_true",
+        help="Require psutil for process CPU/RAM benchmarks; GPU telemetry stays optional.",
     )
     return parser
 
@@ -138,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Repo root: {REPO_ROOT}")
 
     overall_ok = True
+    print("\nMonitoring imports:")
+    monitoring_ok, _ = check_import("psutil", "psutil", optional=not args.require_monitoring)
+    check_import("GPU telemetry", "pynvml", optional=True)
+    overall_ok = overall_ok and monitoring_ok
 
     if args.dlc_only:
         print("\nDLC wrapper imports:")

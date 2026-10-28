@@ -1,25 +1,14 @@
-"""autobehaver.postinf.featureimp.core
+"""Public FeatureImp settings and workflow entry points with lazy stage imports.
 
-Lightweight public facade for FeatureImp.
-
-This module intentionally keeps import-time dependencies small while exposing
-the FeatureImp workflow:
-
-- :func:`plan_feature_importance_analysis`
-- :func:`process_featureimp_shard`
-- :func:`merge_featureimp_shards`
-- :func:`run_feature_importance_analysis`
-
-`run_feature_importance_analysis()` is the single-job serial wrapper around the
-staged engine: plan -> process_shard(0) -> merge_shards. The merge tail computes
-subset weights internally, finalizes core FeatureImp outputs, and runs the
-post-analyses (FSEA and PCA reference-axis scoring) when enabled.
+Single-job execution uses the same plan, process, and merge engine as sharded execution;
+optional FSEA and PCA run after merging.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from autobehaver.portable_paths import generated_path
 import warnings
 from datetime import datetime
 from typing import Any, Dict, Iterable, Mapping, Optional, Set
@@ -125,6 +114,20 @@ def filter_saved_settings_snapshot(payload: Optional[Mapping[str, Any]]) -> Dict
     return filtered
 
 
+
+def allocate_analysis_folder(results_dir: str, name: str) -> str:
+    """Exclusively reserve a portable run folder without overwriting another run."""
+    os.makedirs(results_dir, exist_ok=True)
+    for attempt in range(10000):
+        candidate_name = name if attempt == 0 else f"{name}_{attempt:03d}"
+        candidate = str(generated_path(results_dir, candidate_name, reserve=100))
+        try:
+            os.mkdir(candidate)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError("Could not allocate a unique FeatureImp analysis folder")
+
 def build_settings_snapshot_payload(*, analysis_folder_path: str = "", analysis_folder_name: str = "", timestamp_tag: str = "", settings_map: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Build the persisted FEATUREIMP_RUN_SETTINGS.json payload.
 
@@ -186,9 +189,7 @@ def _normalize_include_feature_categories(val: Any) -> Any:
     return tokens
 
 
-# -----------------------------------------------------------------------------
 # Settings
-# -----------------------------------------------------------------------------
 
 
 def apply_settings(settings_dict: Dict[str, Any], *, propagate: bool = True, explicit_keys: Optional[Iterable[str]] = None) -> None:
@@ -200,17 +201,28 @@ def apply_settings(settings_dict: Dict[str, Any], *, propagate: bool = True, exp
     # receive a complete config.
     merged: Dict[str, Any] = dict(DEFAULT_SETTINGS)
     merged.update(settings_dict)
+    from .integrity import strict_bool
+    for key, default in DEFAULT_SETTINGS.items():
+        if isinstance(default, bool):
+            merged[key] = strict_bool(merged[key])
+    import math
+    for key in ('min_feature_completeness_per_group', 'MIN_VARIANCE_THRESHOLD', 'subset_weight_gamma', 'subset_weight_tau_quantile', 'fsea_fdr_threshold'):
+        if merged.get(key) is not None and not math.isfinite(float(merged[key])):
+            raise ValueError(f"{key} must be finite")
+    for key in ('min_feature_completeness_per_group', 'fsea_fdr_threshold'):
+        if not 0 <= float(merged[key]) <= 1:
+            raise ValueError(f"{key} must be in [0,1]")
+    if float(merged['MIN_VARIANCE_THRESHOLD']) < 0 or float(merged['subset_weight_gamma']) <= 0 or not 0 < float(merged['subset_weight_tau_quantile']) < 1:
+        raise ValueError("Invalid variance/weighting settings")
 
 
     # Normalize include_feature_categories tokens like NONE/ALL/* into None so
-    # users can request the default recognized feature-category surface from YAML or CLI.
+    # callers can request all recognized feature categories from the API or CLI.
     merged["include_feature_categories"] = _normalize_include_feature_categories(
         merged.get("include_feature_categories")
     )
 
-    # ------------------------------------------------------------------
     # Path semantics (FeatureImp)
-    # ------------------------------------------------------------------
     #   - matrix_dir  : where MASTER_FEATURE_MATRIX.csv lives (MMGen output folder)
     #   - results_dir : where FeatureImp run folders are written
     matrix_dir = str(merged.get("matrix_dir") or "").strip()
@@ -241,7 +253,7 @@ def apply_settings(settings_dict: Dict[str, Any], *, propagate: bool = True, exp
     _LAST_EXPLICIT_SETTING_KEYS = explicit_key_set
     _LAST_EXPLICIT_SETTINGS = {k: merged.get(k) for k in explicit_key_set if k in merged}
 
-    # 1) Update *this* module globals for every known default setting
+    # Apply each resolved runtime default to the public settings facade.
     for key in DEFAULT_SETTINGS.keys():
         globals()[key] = merged.get(key)
 
@@ -251,7 +263,7 @@ def apply_settings(settings_dict: Dict[str, Any], *, propagate: bool = True, exp
 
 # Initialize defaults immediately (module-level globals)
 #
-# Important: do *not* import heavy ML dependencies at import time.
+# Keep optional model dependencies out of package initialization.
 # We only initialize this module's globals here; propagation to heavy
 # submodules happens when the CLI (or caller) explicitly applies settings.
 apply_settings(DEFAULT_SETTINGS, propagate=False, explicit_keys=())
@@ -275,9 +287,7 @@ def get_explicit_setting_keys() -> Set[str]:
     return set(_LAST_EXPLICIT_SETTING_KEYS)
 
 
-# -----------------------------------------------------------------------------
 # Warnings / logging helpers
-# -----------------------------------------------------------------------------
 
 
 def apply_warning_filters() -> None:
@@ -292,7 +302,7 @@ def apply_warning_filters() -> None:
     if globals().get("SUPPRESS_FUTURE_WARNINGS", True):
         warnings.filterwarnings("ignore", category=FutureWarning)
 
-    # Matplotlib "tight_layout" spam is common in HPC logs.
+    # Suppress configured layout warnings in batch logs.
     if globals().get("SUPPRESS_TIGHT_LAYOUT_WARNINGS", True):
         warnings.filterwarnings(
             "ignore",
@@ -301,9 +311,7 @@ def apply_warning_filters() -> None:
         )
 
 
-# -----------------------------------------------------------------------------
 # Small public helpers
-# -----------------------------------------------------------------------------
 
 
 def get_analysis_folder_name(analysis_run_name: str, sex_stratum: str | None = None) -> str:
@@ -353,64 +361,7 @@ def normalize_feature_matrix(
     )
 
 
-def _write_minimal_settings_snapshot_if_missing(analysis_folder_path: str) -> None:
-    """Persist a lightweight FEATUREIMP_RUN_SETTINGS.json when absent.
-
-    The CLI already writes a richer run-settings snapshot before planning. This
-    helper exists for programmatic callers that directly use ``core`` staged
-    helpers in tests or notebooks.
-    """
-
-    if not analysis_folder_path:
-        return
-    settings_path = os.path.join(str(analysis_folder_path), "FEATUREIMP_RUN_SETTINGS.json")
-    if os.path.exists(settings_path):
-        return
-
-    payload = build_settings_snapshot_payload(
-        analysis_folder_path=str(analysis_folder_path),
-        analysis_folder_name=os.path.basename(str(analysis_folder_path).rstrip(os.sep)),
-        settings_map=_LAST_SETTINGS,
-    )
-
-    try:
-        with open(settings_path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
-    except Exception:
-        pass
-
-
-def _write_settings_snapshot(analysis_folder_path: str, *, overwrite: bool = False) -> None:
-    """Persist a FEATUREIMP_RUN_SETTINGS.json snapshot for staged execution.
-
-    Unlike :func:`_write_minimal_settings_snapshot_if_missing`, this helper can
-    overwrite an existing file so a serial ``stage=all`` wrapper run always
-    leaves behind the exact settings that were used to generate its staged
-    artifacts.
-    """
-
-    if not analysis_folder_path:
-        return
-    settings_path = os.path.join(str(analysis_folder_path), "FEATUREIMP_RUN_SETTINGS.json")
-    if (not overwrite) and os.path.exists(settings_path):
-        return
-
-    payload = build_settings_snapshot_payload(
-        analysis_folder_path=str(analysis_folder_path),
-        analysis_folder_name=os.path.basename(str(analysis_folder_path).rstrip(os.sep)),
-        settings_map=_LAST_SETTINGS,
-    )
-
-    try:
-        with open(settings_path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
-    except Exception:
-        pass
-
-
-# -----------------------------------------------------------------------------
 # Staged execution helpers
-# -----------------------------------------------------------------------------
 
 
 def plan_feature_importance_analysis(*args: Any, **kwargs: Any):
@@ -422,6 +373,10 @@ def plan_feature_importance_analysis(*args: Any, **kwargs: Any):
 
     from . import plan as _plan
 
+    for key in ("analysis_run_name", "include_feature_categories", "control_group_tag",
+                "training_group_a", "training_group_b", "n_splits",
+                "H_hits_per_feature", "n_features_per_model"):
+        kwargs.setdefault(key, _LAST_SETTINGS.get(key, DEFAULT_SETTINGS.get(key)))
     kwargs.setdefault("sex_filter", _LAST_SETTINGS.get("sex_filter", "all"))
     kwargs.setdefault(
         "min_feature_completeness_per_group",
@@ -448,13 +403,7 @@ def plan_feature_importance_analysis(*args: Any, **kwargs: Any):
         _LAST_SETTINGS.get("GLOBAL_RANDOM_SEED", DEFAULT_SETTINGS.get("GLOBAL_RANDOM_SEED")),
     )
 
-    out = _plan.plan_featureimp_run(*args, **kwargs)
-    analysis_folder_path = kwargs.get("analysis_folder_path") or out
-    try:
-        _write_minimal_settings_snapshot_if_missing(str(analysis_folder_path))
-    except Exception:
-        pass
-    return out
+    return _plan.plan_featureimp_run(*args, **kwargs)
 
 
 
@@ -472,7 +421,7 @@ def process_featureimp_shard(*args: Any, **kwargs: Any):
 
 
 def merge_featureimp_shards(*args: Any, **kwargs: Any):
-    """Final merge tail for completed training shards plus FSEA/PCA postanalysis."""
+    """Merge completed training shards and run enabled FSEA and PCA postanalyses."""
 
     from . import merge_shards as _merge_shards
 
@@ -481,18 +430,21 @@ def merge_featureimp_shards(*args: Any, **kwargs: Any):
 
 
 def plan_plain_xgboost_baseline_shards(*args: Any, **kwargs: Any):
+    """Create a frozen shard plan for the full-feature XGBoost comparison."""
     from . import plain_xgboost_staged as _plain_xgboost_staged
 
     return _plain_xgboost_staged.plan_plain_xgboost_baseline_shards(*args, **kwargs)
 
 
 def process_plain_xgboost_baseline_shard(*args: Any, **kwargs: Any):
+    """Process one planned full-feature XGBoost comparison shard."""
     from . import plain_xgboost_staged as _plain_xgboost_staged
 
     return _plain_xgboost_staged.process_plain_xgboost_baseline_shard(*args, **kwargs)
 
 
 def merge_plain_xgboost_baseline_shards(*args: Any, **kwargs: Any):
+    """Merge completed full-feature XGBoost comparison shards."""
     from . import plain_xgboost_staged as _plain_xgboost_staged
 
     return _plain_xgboost_staged.merge_plain_xgboost_baseline_shards(*args, **kwargs)
@@ -532,21 +484,13 @@ def run_featureimp_global_fsea_from_file(
     )
 
 
-# -----------------------------------------------------------------------------
 # Main API
-# -----------------------------------------------------------------------------
 
 
 def run_feature_importance_analysis(*args: Any, **kwargs: Any):
-    """Run FeatureImp as a single-job serial wrapper over the staged engine.
+    """Run FeatureImp through the serial plan, process, and merge workflow.
 
-    The one-shot execution route now uses the exact same machinery as the
-    explicit staged workflow:
-
-        plan -> process_shard(shard_index=0) -> merge_shards
-
-    This keeps ``stage=all`` aligned with the explicit staged HPC workflow while
-    preserving the same behavior used by the explicit sharded workflow.
+    Use one shard while preserving the caller's settings for later stages.
     """
 
     if args:
@@ -569,7 +513,13 @@ def run_feature_importance_analysis(*args: Any, **kwargs: Any):
         raise ValueError("results_dir is required")
 
     analysis_folder_path = kwargs.pop("analysis_folder_path", None)
-    analysis_run_name = str(kwargs.get("analysis_run_name", "") or "")
+    unexpected = sorted(k for k in kwargs.keys() if k not in DEFAULT_SETTINGS)
+    if unexpected:
+        raise TypeError(
+            "run_feature_importance_analysis() got unexpected keyword argument(s): "
+            + ", ".join(unexpected)
+        )
+    analysis_run_name = str(kwargs.get("analysis_run_name", _LAST_SETTINGS.get("analysis_run_name", "")) or "")
     sex_filter = str(kwargs.get("sex_filter", _LAST_SETTINGS.get("sex_filter", "all")) or "all")
 
     if analysis_folder_path:
@@ -580,8 +530,7 @@ def run_feature_importance_analysis(*args: Any, **kwargs: Any):
         sex_stratum = sex_filter_norm if sex_filter_norm in {"male", "female"} else None
         analysis_folder_name = get_analysis_folder_name(analysis_run_name, sex_stratum=sex_stratum)
         timestamp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        resolved_analysis_folder = os.path.join(str(results_dir), f"{analysis_folder_name}_{timestamp_tag}")
-        os.makedirs(resolved_analysis_folder, exist_ok=True)
+        resolved_analysis_folder = allocate_analysis_folder(results_dir, f"{analysis_folder_name}_{timestamp_tag}")
 
     requested_num_shards = kwargs.pop("num_shards", _LAST_SETTINGS.get("num_shards", 1))
     try:
@@ -632,7 +581,6 @@ def run_feature_importance_analysis(*args: Any, **kwargs: Any):
         propagate=False,
         explicit_keys=explicit_programmatic_keys,
     )
-    _write_settings_snapshot(str(resolved_analysis_folder), overwrite=True)
 
     plan_allowed = {
         "analysis_run_name",
@@ -650,12 +598,6 @@ def run_feature_importance_analysis(*args: Any, **kwargs: Any):
         "n_permutations",
         "GLOBAL_RANDOM_SEED",
     }
-    unexpected = sorted(k for k in kwargs.keys() if k not in DEFAULT_SETTINGS)
-    if unexpected:
-        raise TypeError(
-            "run_feature_importance_analysis() got unexpected keyword argument(s): "
-            + ", ".join(unexpected)
-        )
 
     plan_kwargs = {k: v for k, v in kwargs.items() if k in plan_allowed}
     plan_kwargs.update(

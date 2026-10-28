@@ -1,8 +1,7 @@
-"""Master matrix generation (mmgen).
+"""MMGen master-matrix entry points.
 
-Converts Autobehaver inference outputs + positional_calcs into a master feature
-matrix and supporting summary artifacts. Imports are lazy so ``--help`` does not
-load the full feature-generation stack.
+Combine inference and positional features into an animal-level matrix; analysis imports
+load lazily for command-line help.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ __all__ = ["MMGenConfig", "run_mmgen"]
 
 
 def __getattr__(name: str) -> Any:
+    """Resolve MMGen entry points without eager analysis imports."""
     if name in {"MMGenConfig", "run_mmgen"}:
         from . import core
         return getattr(core, name)

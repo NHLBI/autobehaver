@@ -1,14 +1,13 @@
-"""Convenience serial tail stage for staged FeatureImp.
+"""Merge completed FeatureImp shards, compute subset weights, and finalize reports.
 
-This stage is the public merge/finalization step for sharded FeatureImp runs.
-It computes subset weights, performs the lightweight weighted reduction inside
-the final merge, writes the core FeatureImp outputs, then launches the retained
-reference post-analyses (FSEA and PCA) when enabled.
+Run reference FSEA and PCA analyses when enabled.
 """
 
 from __future__ import annotations
+from autobehaver.completion import verified_run
 
 import os
+from .integrity import strict_bool
 
 from .subset_weight_merge import calculate_subset_weights_run
 from .final_merge import finalize_featureimp_outputs_run
@@ -43,11 +42,11 @@ def _run_default_reference_postanalysis(analysis_folder_path: str) -> None:
             continue
         settings[key_str] = value
 
-    strict = bool(settings.get("postanalysis_strict", False))
-    debug = bool(settings.get("postanalysis_debug", False))
+    strict = strict_bool(settings.get("postanalysis_strict", False))
+    debug = strict_bool(settings.get("postanalysis_debug", False))
     stages = [
-        ("fsea", bool(settings.get("run_fsea_analysis", True))),
-        ("pca", bool(settings.get("run_pca_analysis", True))),
+        ("fsea", strict_bool(settings.get("run_fsea_analysis", True))),
+        ("pca", strict_bool(settings.get("run_pca_analysis", True))),
     ]
     for stage_name, enabled in stages:
         if not enabled:
@@ -62,12 +61,14 @@ def _run_default_reference_postanalysis(analysis_folder_path: str) -> None:
         except Exception as e:
             if debug:
                 traceback.print_exc()
-            if strict:
-                raise
-            print(f"WARNING: automatic {stage_name.upper()} postanalysis failed; continuing because postanalysis_strict=False: {e}")
+            raise RuntimeError(f'Requested automatic {stage_name.upper()} postanalysis failed') from e
 
 
+@verified_run
 def merge_featureimp_shards_run(analysis_folder_path: str) -> str:
+    """Calculate subset weights, finalize completed shards, and run enabled reference
+    postanalyses.
+    """
     analysis_folder_path = os.path.abspath(str(analysis_folder_path))
     if not os.path.isdir(analysis_folder_path):
         raise FileNotFoundError(f"FeatureImp analysis folder not found: {analysis_folder_path}")

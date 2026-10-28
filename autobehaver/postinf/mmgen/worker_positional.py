@@ -1,4 +1,4 @@
-"""Worker helpers for building the per-frame positional substrate."""
+"""Build the per-frame positional table used by MMGen spatial analyses."""
 
 from __future__ import annotations
 
@@ -24,9 +24,8 @@ def build_positional_df(
     individual_id: str,
     source_file: str,
 ) -> Optional[pd.DataFrame]:
-    """Build the positional_df used by occupancy and other spatial analyses.
-
-    The helper assembles the per-frame positional substrate used by occupancy and downstream spatial analyses.
+    """Build spatial-analysis rows with labels, image positions, bearings, and
+    calibrated motion.
     """
 
     if not config.get("calculate_occupancy"):
@@ -78,7 +77,7 @@ def build_positional_df(
     else:
         data_dict["speed_mm_s"] = np.nan
 
-    # Angle features for wing/leg spread (present in your sample_positional_calcs)
+    # Retain available wing/leg spread angles for spatial summaries.
     angle_cols = [
         "anglefeature_Wings_L_R",
         "anglefeature_Legs_FL_FR",

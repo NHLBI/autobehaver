@@ -1,31 +1,26 @@
-"""Lightweight provenance artifacts for mmgen.
+"""Write MMGen source ledgers, animal-row summaries, and run manifests for incremental
+updates.
 
-This module writes small, durable metadata files that make later incremental
-updates possible without requiring users to keep large temp_store.h5 files
-forever.
-
-Artifacts written here are intentionally lightweight:
-- MMGEN_SOURCE_LEDGER.csv: one row per committed inference CSV/source file
-- MMGEN_ROW_IDENTITY_SUMMARY.csv: one row per master-matrix row identity
-- MMGEN_BATCH_MANIFEST.json: compact run/config/schema manifest
-
-The canonical row identity for mmgen is the final master-matrix ``individual``
-value, which corresponds to the collapsed per-animal ID (movie removed).
+Animal identities retain trial information and combine recordings after removing movie
+numbers.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
-import json
 import os
+from autobehaver.portable_paths import original_name
+from .io import find_matching_poscalc_file
 import re
+import json
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from autobehaver import __version__ as AUTOBEHAVER_VERSION
+from autobehaver.atomic_io import atomic_write_dataframe_csv, atomic_write_json, sha256_file
 
 from .naming import collapse_individual_id, parse_group_and_individual
 
@@ -46,11 +41,13 @@ _LEDGER_COLUMNS = [
     "source_exists",
     "source_file_size_bytes",
     "source_file_mtime_utc",
+    "source_file_sha256",
     "poscalc_file",
     "poscalc_path",
     "poscalc_exists",
     "poscalc_file_size_bytes",
     "poscalc_file_mtime_utc",
+    "poscalc_file_sha256",
     "n_frames",
     "group",
     "sex",
@@ -68,17 +65,25 @@ def _utc_now_iso() -> str:
 
 
 def _safe_file_stats(path: str | None) -> dict[str, Any]:
+    """Record a file's size, modification time, and content hash, requiring stable bytes
+    during hashing.
+    """
     if not path:
-        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA}
+        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA, "sha256": pd.NA}
     p = Path(path)
     if not p.exists():
-        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA}
+        return {"exists": False, "size_bytes": pd.NA, "mtime_utc": pd.NA, "sha256": pd.NA}
     try:
         stat = p.stat()
         mtime_utc = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds")
-        return {"exists": True, "size_bytes": int(stat.st_size), "mtime_utc": mtime_utc}
-    except Exception:
-        return {"exists": True, "size_bytes": pd.NA, "mtime_utc": pd.NA}
+        return {
+            "exists": True,
+            "size_bytes": int(stat.st_size),
+            "mtime_utc": mtime_utc,
+            "sha256": sha256_file(p),
+        }
+    except Exception as exc:
+        raise RuntimeError(f'Cannot certify source contents: {p}') from exc
 
 
 def _derive_poscalc_filename(source_file: str, inf_tag: str) -> str:
@@ -117,11 +122,12 @@ def build_source_ledger_df(
     animal_mapping: dict[str, Any] | None,
     file_to_animal: dict[str, str] | None,
     inf_tag: str,
+    source_frame_offset: int = 0,
 ) -> pd.DataFrame:
     """Build a lightweight ledger of committed source files.
 
-    The authoritative input is ``video_lengths_tmp`` (represented here as
-    ``lengths_df``). That table tells us which inference CSVs were actually
+    The authoritative input is the recording completion records (represented
+    here as ``lengths_df``). These identify which inference CSVs were actually
     committed into the finalized dataset.
     """
     animal_mapping = animal_mapping or {}
@@ -130,7 +136,9 @@ def build_source_ledger_df(
     if lengths_df is None or lengths_df.empty or "source_file" not in lengths_df.columns:
         return pd.DataFrame(columns=_LEDGER_COLUMNS)
 
-    df = lengths_df.copy().drop_duplicates(subset=["source_file"], keep="last").reset_index(drop=True)
+    if lengths_df['source_file'].astype(str).duplicated().any():
+        raise ValueError('Duplicate committed sources cannot be collapsed into a verified source ledger.')
+    df = lengths_df.copy().reset_index(drop=True)
     rows: list[dict[str, Any]] = []
 
     for _, row in df.iterrows():
@@ -142,8 +150,19 @@ def build_source_ledger_df(
         source_stats = _safe_file_stats(source_path)
 
         poscalc_file = _derive_poscalc_filename(source_file, inf_tag)
-        poscalc_path = os.path.join(poscalc_dir, poscalc_file)
+        poscalc_path = find_matching_poscalc_file(source_path, poscalc_dir, inf_tag)
+        if poscalc_path is not None:
+            poscalc_file = Path(poscalc_path).name
         poscalc_stats = _safe_file_stats(poscalc_path)
+        if not source_stats['exists'] or not poscalc_stats['exists']:
+            raise FileNotFoundError(f'Both committed inputs must remain available: {source_path}; {poscalc_path}')
+        if 'input_sha256' in row and pd.notna(row['input_sha256']):
+            from .integrity import content_hash, source_identities
+            actual = source_identities([source_file], inference_csv_dir=inference_csv_dir,
+                poscalc_dir=poscalc_dir, inf_tag=inf_tag,
+                source_frame_offset=source_frame_offset)[source_file]
+            if str(row['input_sha256']) != content_hash(actual):
+                raise RuntimeError(f'Committed source contents changed before ledger publication: {source_file}')
 
         group = row.get("group", pd.NA)
         individual_id = row.get("individual", pd.NA)
@@ -151,7 +170,7 @@ def build_source_ledger_df(
 
         if pd.isna(group) or pd.isna(individual_id) or pd.isna(sex):
             try:
-                parsed_group, parsed_individual_id, parsed_sex = parse_group_and_individual(source_file)
+                parsed_group, parsed_individual_id, parsed_sex = parse_group_and_individual(source_path)
                 if pd.isna(group):
                     group = parsed_group
                 if pd.isna(individual_id):
@@ -186,11 +205,13 @@ def build_source_ledger_df(
                 "source_exists": bool(source_stats["exists"]),
                 "source_file_size_bytes": source_stats["size_bytes"],
                 "source_file_mtime_utc": source_stats["mtime_utc"],
+                "source_file_sha256": source_stats["sha256"],
                 "poscalc_file": poscalc_file,
                 "poscalc_path": poscalc_path,
                 "poscalc_exists": bool(poscalc_stats["exists"]),
                 "poscalc_file_size_bytes": poscalc_stats["size_bytes"],
                 "poscalc_file_mtime_utc": poscalc_stats["mtime_utc"],
+                "poscalc_file_sha256": poscalc_stats["sha256"],
                 "n_frames": n_frames,
                 "group": group,
                 "sex": sex,
@@ -216,6 +237,13 @@ def build_row_identity_summary_df(
 ) -> pd.DataFrame:
     """Summarize committed source files by stable mmgen row identity."""
     ledger_df = source_ledger_df.copy() if source_ledger_df is not None else pd.DataFrame(columns=_LEDGER_COLUMNS)
+    if not ledger_df.empty:
+        if ledger_df['source_file'].astype(str).duplicated().any():
+            raise ValueError('Source ledger contains duplicate source files.')
+        for identity, group_rows in ledger_df.groupby('row_identity', observed=True):
+            for column in ('group','sex'):
+                if group_rows[column].dropna().astype(str).nunique() != 1:
+                    raise ValueError(f'Conflicting {column} for row identity {identity}')
     matrix_df = master_matrix_df.copy() if master_matrix_df is not None else None
 
     if matrix_df is not None and not matrix_df.empty:
@@ -323,14 +351,16 @@ def _schema_sha256_from_columns(columns: list[str]) -> str:
 
 
 def write_source_ledger_csv(output_dir: str, ledger_df: pd.DataFrame) -> str:
+    """Publish the finalized source ledger and return its path."""
     path = os.path.join(output_dir, SOURCE_LEDGER_FILENAME)
-    ledger_df.to_csv(path, index=False)
+    atomic_write_dataframe_csv(ledger_df, path, index=False)
     return path
 
 
 def write_row_identity_summary_csv(output_dir: str, row_identity_df: pd.DataFrame) -> str:
+    """Publish the per-animal recording summary and return its path."""
     path = os.path.join(output_dir, ROW_IDENTITY_SUMMARY_FILENAME)
-    row_identity_df.to_csv(path, index=False)
+    atomic_write_dataframe_csv(row_identity_df, path, index=False)
     return path
 
 
@@ -357,8 +387,10 @@ def write_batch_manifest_json(
     master_matrix_df: pd.DataFrame | None,
     animal_mapping: dict[str, Any] | None,
     append_new_data: bool = False,
+    source_frame_offset: int = 0,
 ) -> str:
-    """Write a lightweight run/config/schema manifest for mmgen finalization."""
+    """Write a lightweight run/config/schema manifest for MMGen finalization."""
+    from .feature_schema import schema_metadata
     matrix_df = master_matrix_df.copy() if master_matrix_df is not None else None
     ledger_df = source_ledger_df if source_ledger_df is not None else pd.DataFrame(columns=_LEDGER_COLUMNS)
     row_df = row_identity_df if row_identity_df is not None else pd.DataFrame()
@@ -366,7 +398,7 @@ def write_batch_manifest_json(
     animal_mapping = animal_mapping or {}
 
     manifest: dict[str, Any] = {
-        "manifest_version": 2,
+        "manifest_version": 3,
         "written_at_utc": _utc_now_iso(),
         "autobehaver_version": AUTOBEHAVER_VERSION,
         "row_identity": {
@@ -376,15 +408,20 @@ def write_batch_manifest_json(
         },
         "source_ledger": {
             "file": SOURCE_LEDGER_FILENAME,
+            "sha256": sha256_file(os.path.join(output_dir, SOURCE_LEDGER_FILENAME)),
             "n_rows": int(len(ledger_df)),
             "n_unique_row_identities": int(ledger_df["row_identity"].nunique()) if not ledger_df.empty and "row_identity" in ledger_df.columns else 0,
         },
         "master_matrix": {
+            "declared_feature_schema": schema_metadata(),
             "enabled": bool(emit_master_matrix),
             "path": "MASTER_FEATURE_MATRIX.csv" if bool(emit_master_matrix) else None,
             "n_rows": int(len(matrix_df)) if matrix_df is not None and not matrix_df.empty else 0,
             "n_columns": int(len(matrix_df.columns)) if matrix_df is not None and not matrix_df.empty else 0,
             "schema_sha256": _schema_sha256_from_columns(list(matrix_df.columns)) if matrix_df is not None and not matrix_df.empty else None,
+            "sha256": sha256_file(os.path.join(output_dir, "MASTER_FEATURE_MATRIX.csv"))
+            if bool(emit_master_matrix) and os.path.isfile(os.path.join(output_dir, "MASTER_FEATURE_MATRIX.csv"))
+            else None,
         },
         "input_folders": {
             "inference_csv_dir": str(inference_csv_dir),
@@ -394,6 +431,7 @@ def write_batch_manifest_json(
             "inf_tag": str(inf_tag),
             "min_bout": int(min_bout),
             "edge_skip": int(edge_skip),
+            "source_frame_offset": int(source_frame_offset),
             "resume": bool(resume),
             "finalize_only": bool(finalize_only),
             "process_only": bool(process_only),
@@ -411,8 +449,13 @@ def write_batch_manifest_json(
             "animal_mapping_count": int(len(animal_mapping)),
         },
     }
+    from .integrity import read_store_identity, STORE_IDENTITY_FILENAME, IDENTITY_FILENAME
+    work_dir = Path(output_dir) / '_mmgen_work'
+    if any((work_dir / name).is_file() for name in (STORE_IDENTITY_FILENAME, IDENTITY_FILENAME)):
+        identity = read_store_identity(work_dir)
+        manifest['scientific_identity'] = {'calculation_sha256':identity['calculation_sha256'],
+                                          'sources_sha256':identity['sources_sha256']}
 
     path = os.path.join(output_dir, BATCH_MANIFEST_FILENAME)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
+    atomic_write_json(manifest, path)
     return path

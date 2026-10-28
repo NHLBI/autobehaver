@@ -1,16 +1,16 @@
-"""Master feature matrix assembly for mmgen.
+"""Assemble the declared animal-level MMGen feature matrix from finalized source tables.
 
-This module contains the final feature-matrix construction and related
-helpers (bout-count filtering, units manifest, and Excel formatting utilities).
-It is intentionally focused on assembling the canonical master matrix from the
-post-aggregation source tables emitted by mmgen.
+Apply count-based censoring and write unit metadata and formatted summaries.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from multiprocessing import Pool
+from .batching import ordered_worker_results
 
+import csv
 import os
 import gc
 import re
@@ -22,11 +22,13 @@ from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.styles.borders import Border, Side
 
-from .naming import collapse_individual_id
+from autobehaver.atomic_io import atomic_write_dataframe_csv
 
-# ---------------------------------------------------------------------------
+from .naming import collapse_individual_id
+from .io import read_metadata_csv
+from .feature_schema import complete_master_schema, write_schema_metadata
+
 # Default runtime values
-# ---------------------------------------------------------------------------
 DEFAULT_FILTER_FEATURES_BY_BOUT_COUNT: bool = True
 DEFAULT_MIN_BOUT_COUNT_FOR_FEATURES: int = 6
 DEFAULT_MIN_BOUT_COUNT_FOR_TRANSITIONS: int = 6
@@ -52,12 +54,70 @@ GROOM_EPISODE_MAX_NON_GROOM_GAP_S: float = 1.0
 DEFAULT_GROOM_EPISODE_MAX_GAP_FRAMES: int = int(round(GROOM_EPISODE_MAX_NON_GROOM_GAP_S * DEFAULT_VIDEO_FPS))
 GROOM_EPISODE_MAX_GAP_FRAMES: int = DEFAULT_GROOM_EPISODE_MAX_GAP_FRAMES
 
+
+def validate_master_matrix_dataframe(master_matrix: pd.DataFrame) -> None:
+    """Validate the published matrix without changing its scientific values."""
+
+    required = ["individual", "group", "sex"]
+    missing = [column for column in required if column not in master_matrix.columns]
+    if missing:
+        raise ValueError(f"MASTER_FEATURE_MATRIX is missing required columns: {missing}")
+    if master_matrix.empty:
+        raise ValueError("MASTER_FEATURE_MATRIX contains no rows")
+    if master_matrix.columns.duplicated().any():
+        duplicates = master_matrix.columns[master_matrix.columns.duplicated()].tolist()
+        raise ValueError(f"MASTER_FEATURE_MATRIX contains duplicate columns: {duplicates[:20]}")
+    if any(not str(column).strip() for column in master_matrix.columns):
+        raise ValueError("MASTER_FEATURE_MATRIX contains a blank column name")
+    for column in required:
+        blank = master_matrix[column].isna() | master_matrix[column].astype(str).str.strip().eq("")
+        if bool(blank.any()):
+            raise ValueError(f"MASTER_FEATURE_MATRIX column {column!r} contains blank values")
+    identifiers = master_matrix["individual"].astype(str).str.strip()
+    if identifiers.duplicated().any():
+        duplicates = sorted(set(identifiers[identifiers.duplicated(keep=False)].tolist()))
+        raise ValueError(
+            "Duplicate master-matrix row identities detected in 'individual': "
+            + ", ".join(duplicates[:10])
+            + (" ..." if len(duplicates) > 10 else "")
+        )
+
+    non_feature_columns = {"individual", "group", "sex", "source_files"}
+    feature_columns = [
+        column for column in master_matrix.columns if column not in non_feature_columns
+    ]
+    if not feature_columns:
+        raise ValueError("MASTER_FEATURE_MATRIX contains no numeric feature columns")
+    try:
+        numeric_features = master_matrix[feature_columns].apply(pd.to_numeric, errors='raise')
+    except (ValueError, TypeError) as exc:
+        raise ValueError('MASTER_FEATURE_MATRIX contains nonnumeric scientific feature values') from exc
+    if any(pd.api.types.is_complex_dtype(dtype) for dtype in numeric_features.dtypes):
+        raise ValueError('MASTER_FEATURE_MATRIX contains complex scientific feature values')
+    numeric_columns = numeric_features.columns
+    values = numeric_features.to_numpy(dtype=np.float64, copy=False)
+    if np.isinf(values).any():
+        raise ValueError("MASTER_FEATURE_MATRIX contains infinite feature values")
+
+    probability_columns = [
+        column
+        for column in numeric_columns
+        if "TimeBudget" in str(column)
+        or (str(column).startswith("Transition_") and "_to_" in str(column))
+    ]
+    for column in probability_columns:
+        populated = pd.to_numeric(master_matrix[column], errors="coerce").dropna()
+        if bool(((populated < -1e-9) | (populated > 1.0 + 1e-9)).any()):
+            raise ValueError(f"Probability-like feature {column!r} falls outside [0, 1]")
+
+    if "total_frames_analyzed" in master_matrix.columns:
+        total_frames = pd.to_numeric(master_matrix["total_frames_analyzed"], errors="coerce")
+        if bool(total_frames.isna().any() or (total_frames <= 0).any()):
+            raise ValueError("total_frames_analyzed must be finite and positive for every individual")
+
 def _filter_features_by_bout_count(master_matrix, min_bout_count, min_transition_count, bout_count_df=None):
     """
-    Filter BB-style bout-derived features (BoutSummary, Kinematic, and Transition).
-
-    ``KinematicTW_*`` features are intentionally excluded because their stability
-    is governed by pooled context-frame sufficiency, not by the number of bouts.
+    Filter complete-bout features (BoutSummary and Kinematic).
 
     For each eligible feature, find its corresponding bout_count column and set
     the feature value to NaN for any animal where the bout count is below the
@@ -66,18 +126,18 @@ def _filter_features_by_bout_count(master_matrix, min_bout_count, min_transition
     Args:
         master_matrix: DataFrame with all features (one row per animal)
         min_bout_count: Minimum number of bouts required to keep BoutSummary/Kinematic features
-        min_transition_count: Minimum number of "from" bouts required to keep Transition features
+        min_transition_count: Compatibility argument; transition rows are filtered before pivoting.
         bout_count_df: Optional separate DataFrame containing bout_count columns (if None, searches in master_matrix)
 
     Returns:
         DataFrame: The filtered master_matrix with NaN values for low-count features
     """
-    print(f"  Filtering features with bout count < {min_bout_count} (or transition count < {min_transition_count})...")
+    print(f"  Filtering complete-bout features with bout count < {min_bout_count}...")
 
     # We map BoutSummary_* and BB KinematicBB_* features to their corresponding
     # bout_count column purely by tokens: {Prefix}_{Category}_{Behavior}_...
     # Count col: BoutSummary_{Category}_{Behavior}_bout_count
-    # Transition_* uses the "from_behavior" state's bout count.
+    # Transition probabilities use their own observed departure counts before pivoting.
 
     # Determine where to look for bout_count columns
     if bout_count_df is not None:
@@ -90,33 +150,10 @@ def _filter_features_by_bout_count(master_matrix, min_bout_count, min_transition
     all_columns = master_matrix.columns.tolist()
 
     for col in all_columns:
-        if not (col.startswith('BoutSummary_') or col.startswith('KinematicBB_') or col.startswith('Kinematic_') or col.startswith('Transition_')):
+        if not (col.startswith('BoutSummary_') or col.startswith('KinematicBB_') or col.startswith('Kinematic_')):
             continue
 
-        # --- Transition features (keep existing parsing pattern; it matches your naming) ---
-        if col.startswith('Transition_'):
-            remaining = col.replace('Transition_', '')
-            if '_to_' not in remaining:
-                continue
-
-            from_part = remaining.split('_to_', 1)[0]  # e.g., "Pose_Walking" or "PoseOrient_Walking+Floor"
-            from_parts = from_part.split('_', 1)
-            if len(from_parts) < 2:
-                continue
-
-            subcategory = from_parts[0]       # Pose or PoseOrient
-            from_behavior = from_parts[1]     # Walking or Walking+Floor
-
-            if subcategory == 'PoseOrient':
-                subcategory = 'Pose+Orient'
-
-            count_col_name = f"BoutSummary_{subcategory}_{from_behavior}_bout_count"
-            if count_col_name in count_source_columns:
-                feature_to_count_map[col] = count_col_name
-                feature_threshold_map[col] = min_transition_count
-            continue
-
-        # --- BoutSummary / Kinematic: token-based mapping ---
+        # BoutSummary / Kinematic: token-based mapping
         parts = col.split('_')
         # Expect at least: Prefix_Category_Behavior_...
         if len(parts) < 3:
@@ -213,7 +250,6 @@ def _master_matrix_family_sort_key(column_name: str) -> tuple[int, str]:
         "Postural_",
         "KinematicBB_",
         "Kinematic_",
-        "KinematicTW_",
         "Transition_",
         "SleepFeat_",
         "Spatial_",
@@ -234,9 +270,7 @@ def reorder_master_matrix_columns(master_matrix: pd.DataFrame) -> pd.DataFrame:
 
 
 
-# ============================================================================
 # FEATURE UNITS MANIFEST
-# ============================================================================
 
 def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
     """
@@ -248,10 +282,8 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
     if feature_name in {"individual", "group", "sex"}:
         return ("ID", "identifier column")
 
-    # ------------------------------------------------------------------------
     # Bout summary
     # BoutSummary_{Category}_{Behavior}_{metric}
-    # ------------------------------------------------------------------------
     if feature_name.startswith("BoutSummary_"):
         # Grooming episode metrics (treated as BoutSummary family for downstream grouping)
         if feature_name.startswith("BoutSummary_GroomEpisode_"):
@@ -277,15 +309,11 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
             return ("unitless", "probability in [0,1]")
         return ("unknown", "unrecognized BoutSummary metric suffix")
 
-    # ------------------------------------------------------------------------
     # Time budgets
-    # ------------------------------------------------------------------------
     if feature_name.startswith("TimeBudget_"):
         return ("unitless", "fraction/time budget in [0,1]")
 
-    # ------------------------------------------------------------------------
     # Transition probabilities
-    # ------------------------------------------------------------------------
     if feature_name.startswith("Transition_"):
         # Repertoire structure metrics are grouped under Transition_ for downstream convenience
         if feature_name.startswith("Transition_Repertoire_"):
@@ -297,21 +325,15 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
 
         return ("unitless", "transition probability in [0,1]")
 
-    # ------------------------------------------------------------------------
     # Spatial center/periphery fractions
-    # ------------------------------------------------------------------------
     if feature_name.startswith("SpatialFrac_"):
         return ("unitless", "fraction of frames in zone (center/periphery)")
 
-    # ------------------------------------------------------------------------
     # Global movement summary
-    # ------------------------------------------------------------------------
     if feature_name == "Global_MeanSpeed_mm_s":
         return ("mm/s", "mean centroid speed across all frames")
 
-    # ------------------------------------------------------------------------
     # Repertoire structure
-    # ------------------------------------------------------------------------
     if feature_name.startswith("Repertoire_"):
         if "SwitchRate_per_min" in feature_name:
             return ("1/min", "switches per minute")
@@ -319,9 +341,7 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
             return ("unitless", "normalized entropy in [0,1]")
         return ("unitless", "repertoire metric")
 
-    # ------------------------------------------------------------------------
     # Grooming episode metrics
-    # ------------------------------------------------------------------------
     if feature_name.startswith("GroomEpisode_"):
         if feature_name.endswith("_EpisodesPerMin"):
             return ("episodes/min", "episodes per minute")
@@ -331,16 +351,12 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
             return ("unitless", "normalized entropy in [0,1]")
         return ("unitless", "groom episode metric")
 
-    # ------------------------------------------------------------------------
     # Wing/leg spread angles
-    # ------------------------------------------------------------------------
     if feature_name.startswith("WingSpread_") or feature_name.startswith("LegSpread_"):
         return ("deg", "degrees")
 
-    # ------------------------------------------------------------------------
     # Sleep features
     # SleepFeat_{bout_type}_{metric}
-    # ------------------------------------------------------------------------
     if feature_name.startswith("SleepFeat_"):
         if feature_name.endswith("_n_sleep_bouts"):
             return ("count", "number of sleep bouts")
@@ -352,9 +368,7 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
             return ("unitless", "fraction/time budget in [0,1]")
         return ("unknown", "unrecognized SleepFeat metric suffix")
 
-    # ------------------------------------------------------------------------
     # Spatial features (currently r_norm + relative angle summaries)
-    # ------------------------------------------------------------------------
     if feature_name.startswith("Spatial_"):
         # Center/periphery fractions (merged into Spatial_ family)
         if feature_name.startswith("Spatial_Frac_"):
@@ -366,10 +380,8 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
             return ("deg", "absolute relative angle in degrees")
         return ("unknown", "unrecognized Spatial feature")
 
-    # ------------------------------------------------------------------------
     # Standardized measurements
     # StdMeasure_{measurement}_{stat}...
-    # ------------------------------------------------------------------------
     if feature_name.startswith("StdMeasure_"):
         # Normalized/ratio versions are dimensionless
         if "_norm" in feature_name or "_ratio" in feature_name:
@@ -382,12 +394,10 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
         # Everything else in StdMeasure is a length scale
         return ("mm", "linear measurement")
 
-    # ------------------------------------------------------------------------
     # Postural
     # Postural_{Orient}_{feature}_{stat}
-    # ------------------------------------------------------------------------
     if feature_name.startswith("Postural_"):
-        # Wing/leg spread angles (added as Postural_* family features)
+        # Wing/leg spread angles in the Postural feature family.
         if "WingSpread" in feature_name or "LegSpread" in feature_name:
             return ("deg", "degrees")
 
@@ -401,18 +411,12 @@ def _infer_unit_for_feature_name(feature_name: str) -> tuple[str, str]:
             return ("mm", "linear distance")
         return ("unknown", "unrecognized Postural feature")
 
-    # ------------------------------------------------------------------------
     # Kinematics
-    # KinematicBB_{Category}_{Behavior}_{metric} / KinematicTW_{Category}_{Behavior}_{metric}
-    # ------------------------------------------------------------------------
-    if feature_name.startswith(("KinematicBB_", "Kinematic_", "KinematicTW_")):
+    # KinematicBB_{Category}_{Behavior}_{metric}
+    if feature_name.startswith(("KinematicBB_", "Kinematic_")):
         # Distribution shape measures
-        if "_skewness_" in feature_name or feature_name.endswith("_skewness_mean") or feature_name.endswith("_skewness_std"):
+        if "_skewness_" in feature_name or feature_name.endswith("_skewness") or feature_name.endswith("_skewness_mean") or feature_name.endswith("_skewness_std"):
             return ("unitless", "skewness is dimensionless")
-
-        # Asymmetry indices are dimensionless ratios
-        if "_asym" in feature_name:
-            return ("unitless", "left-right asymmetry index")
 
         # Curvature is angle / distance
         if "curvature" in feature_name:
@@ -444,10 +448,7 @@ def write_feature_units_manifest(master_matrix: pd.DataFrame,
                                 readme_name: str = "MASTER_FEATURE_MATRIX_UNITS_README.txt",
                                 mm_per_px: float = DEFAULT_MM_PER_PX,
                                 fps: float = 40.0) -> None:
-    """
-    Writes a manifest mapping every column in MASTER_FEATURE_MATRIX to its unit.
-    Designed to be called right before/after saving MASTER_FEATURE_MATRIX.csv.
-    """
+    """Write feature units and calibration conventions alongside the master matrix."""
     records = []
     for col in master_matrix.columns:
         unit, notes = _infer_unit_for_feature_name(col)
@@ -500,7 +501,7 @@ class MMGenFinalizationSources:
     """Canonical source tables used to assemble the mmgen master feature matrix.
 
     These sources may come directly from temp-store-derived in-memory tables during
-    pipeline finalization, or from previously emitted mmgen output files
+    pipeline finalization, or from previously emitted MMGen output files
     when using the wrapper ``create_feature_matrix``.
     """
 
@@ -509,7 +510,6 @@ class MMGenFinalizationSources:
     measurements_df: pd.DataFrame | None = None
     postural_summary_df: pd.DataFrame | None = None
     kinematic_sheets: dict[str, pd.DataFrame] | None = None
-    tw_kinematic_sheets: dict[str, pd.DataFrame] | None = None
     transition_pose_tidy_df: pd.DataFrame | None = None
     transition_pose_orient_tidy_df: pd.DataFrame | None = None
     sleep_summary_df: pd.DataFrame | None = None
@@ -526,9 +526,41 @@ def _ordered_chunks_for_workers(items: list[str], n_chunks: int) -> list[list[st
 
 
 def _merge_feature_frame(base_df: pd.DataFrame, feat_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Merge a finalized feature family on unique animal keys without admitting unknown
+    rows.
+    """
     if feat_df is None or feat_df.empty:
         return base_df
-    return pd.merge(base_df, feat_df, on='individual', how='left')
+    _validate_finalized_keys(feat_df, ['individual'], family='feature summary')
+    if not set(feat_df['individual'].astype(str)).issubset(set(base_df['individual'].astype(str))):
+        raise ValueError('Finalized feature summary contains animals outside the bout-summary cohort')
+    overlap = (set(base_df.columns) & set(feat_df.columns)) - {'individual'}
+    if overlap:
+        raise ValueError(f'Finalized feature summary repeats existing feature columns: {sorted(overlap)}')
+    return pd.merge(base_df, feat_df, on='individual', how='left', validate='one_to_one')
+
+
+def _validate_finalized_keys(frame: pd.DataFrame, keys: list[str], *, family: str) -> None:
+    """Finalized summaries already aggregate movies; repeats must not be reaveraged."""
+    if frame.columns.duplicated().any():
+        raise ValueError(f'{family} contains duplicate source columns')
+    missing = set(keys) - set(frame.columns)
+    if missing:
+        raise ValueError(f'{family} is missing finalized identity keys: {sorted(missing)}')
+    for key in keys:
+        if (frame[key].isna() | frame[key].astype(str).str.strip().eq('')).any():
+            raise ValueError(f'{family} contains blank finalized identity key {key}')
+    if frame.duplicated(keys, keep=False).any():
+        raise ValueError(f'{family} contains duplicate finalized keys: {keys}')
+
+
+def _clean_finalized_summary(frame: pd.DataFrame, *, family: str) -> pd.DataFrame:
+    """Remove only intentional display averages and fully blank separator rows."""
+    if 'individual' not in frame:
+        raise ValueError(f'{family} is missing finalized identity key individual')
+    frame = frame.loc[~frame['individual'].astype(str).str.contains('--- AVERAGE ---', na=False)].copy()
+    separators = frame.apply(lambda col: col.isna() | col.astype(str).str.strip().eq('')).all(axis=1)
+    return frame.loc[~separators].copy()
 
 
 def _compute_spatial_feature_summary_core(
@@ -540,6 +572,9 @@ def _compute_spatial_feature_summary_core(
     min_context_frames: int,
     groom_episode_max_gap_frames: int,
 ) -> pd.DataFrame:
+    """Calculate animal-level spatial, repertoire, and grooming-episode features from
+    finalized substrates.
+    """
     summary_df = master_matrix[['individual']].drop_duplicates().reset_index(drop=True).copy()
     if spatial_df is None or spatial_df.empty:
         return summary_df
@@ -614,6 +649,7 @@ def _compute_spatial_feature_summary_core(
         summary_df = _merge_feature_frame(summary_df, global_speed)
 
     def _spatial_frac_df(context_name, mask):
+        """Summarize center and periphery occupancy fractions for each animal context."""
         sub = spatial_df.loc[mask, ['individual', 'r_norm']].dropna(subset=['r_norm'])
         if sub.empty:
             return pd.DataFrame(columns=['individual', f'Spatial_Frac_{context_name}_Center', f'Spatial_Frac_{context_name}_Periphery'])
@@ -654,6 +690,7 @@ def _compute_spatial_feature_summary_core(
         summary_df = _merge_feature_frame(summary_df, _spatial_frac_df(ctx, m))
 
     def _angle_stats(context_name, mask, col, prefix):
+        """Calculate absolute relative-angle means and deviations from available values."""
         sub = spatial_df.loc[mask, ['individual', col]].dropna(subset=[col])
         if sub.empty:
             return pd.DataFrame(columns=['individual', f'{prefix}_{context_name}_Mean_deg', f'{prefix}_{context_name}_P95_deg'])
@@ -713,62 +750,32 @@ def _compute_spatial_feature_summary_core(
             g = g.sort_values('frame_idx')
             pose_seq = g[pose_col].astype(object).reset_index(drop=True)
             orient_seq = g[orient_col].astype(object).reset_index(drop=True)
-            is_groom = pose_seq.astype(str).str.startswith('Groom-')
-            in_ep = False
-            ep_start = None
-            last_groom = None
-            gap = 0
-            for i_frame, flag in enumerate(is_groom.values):
-                if flag:
-                    if not in_ep:
-                        in_ep = True
-                        ep_start = i_frame
-                    last_groom = i_frame
-                    gap = 0
-                else:
-                    if in_ep:
-                        gap += 1
-                        if gap > groom_episode_max_gap_frames:
-                            if ep_start is not None and last_groom is not None:
-                                s = ep_start
-                                e = last_groom
-                                dur_s = (e - s + 1) / video_fps
-                                o_slice = orient_seq.iloc[s:e+1].dropna().astype(str).map(_collapse_wall)
-                                dom_orient = o_slice.mode().iloc[0] if not o_slice.empty else 'Unknown'
-                                p_slice = pose_seq.iloc[s:e+1].dropna().astype(str)
-                                p_slice = p_slice[p_slice.isin(groom_pose_types)]
-                                if p_slice.empty or K <= 1:
-                                    ent_norm = np.nan
-                                else:
-                                    counts = p_slice.value_counts().values.astype(float)
-                                    probs = counts / counts.sum()
-                                    ent = -np.sum([p * np.log(p) for p in probs if p > 0])
-                                    ent_norm = ent / np.log(K)
-                                episode_rows.append({'individual': ind, 'dominant_orient': dom_orient, 'duration_s': dur_s, 'subtype_entropy_norm': ent_norm})
-                            in_ep = False
-                            ep_start = None
-                            last_groom = None
-                            gap = 0
-            if in_ep and ep_start is not None and last_groom is not None:
-                s = ep_start
-                e = last_groom
-                dur_s = (e - s + 1) / video_fps
-                o_slice = orient_seq.iloc[s:e+1].dropna().astype(str).map(_collapse_wall)
-                dom_orient = o_slice.mode().iloc[0] if not o_slice.empty else 'Unknown'
-                p_slice = pose_seq.iloc[s:e+1].dropna().astype(str)
-                p_slice = p_slice[p_slice.isin(groom_pose_types)]
-                if p_slice.empty or K <= 1:
-                    ent_norm = np.nan
-                else:
-                    counts = p_slice.value_counts().values.astype(float)
-                    probs = counts / counts.sum()
-                    ent = -np.sum([p * np.log(p) for p in probs if p > 0])
-                    ent_norm = ent / np.log(K)
-                episode_rows.append({'individual': ind, 'dominant_orient': dom_orient, 'duration_s': dur_s, 'subtype_entropy_norm': ent_norm})
+            episode_labels = pose_seq.copy()
+            if 'masked_pose' in g:
+                raw_pose = g['masked_pose'].reset_index(drop=True)
+                known = raw_pose.notna() & raw_pose.ne('')
+                # Rejected short known blips are observed gaps, not missing data.
+                episode_labels.loc[known & episode_labels.isna()] = 'Nongrooming'
+                episode_labels.loc[~known] = np.nan
+            from .grooming import complete_grooming_episodes
+            for start, end in complete_grooming_episodes(episode_labels, g['frame_idx'], groom_episode_max_gap_frames):
+                duration_s = (end - start + 1) / video_fps
+                orientations = orient_seq.iloc[start:end + 1].dropna().astype(str).map(_collapse_wall)
+                dominant = orientations.mode().iloc[0] if not orientations.empty else 'Unknown'
+                poses = pose_seq.iloc[start:end + 1]
+                counts = poses[poses.isin(groom_pose_types)].value_counts().to_numpy(dtype=float)
+                probabilities = counts / counts.sum()
+                entropy = float(-(probabilities * np.log(probabilities)).sum() / np.log(K))
+                episode_rows.append(dict(individual=ind, dominant_orient=dominant,
+                                         duration_s=duration_s, subtype_entropy_norm=entropy))
 
         episodes_df = pd.DataFrame(episode_rows)
+        exposure_pose = spatial_df['masked_pose'] if 'masked_pose' in spatial_df else spatial_df[pose_col]
+        known_pose = exposure_pose.notna() & exposure_pose.ne('')
+        episode_minutes = known_pose.groupby(spatial_df['individual']).sum() / video_fps / 60.0
 
         def _agg_episode(ctx_name, orient_value=None):
+            """Pool complete within-recording episodes and their subtype composition."""
             if episodes_df.empty:
                 return pd.DataFrame(columns=['individual', f'BoutSummary_GroomEpisode_{ctx_name}_EpisodesPerMin', f'BoutSummary_GroomEpisode_{ctx_name}_MeanDuration_s', f'BoutSummary_GroomEpisode_{ctx_name}_SubtypeEntropyNorm'])
             dfc = episodes_df
@@ -779,7 +786,7 @@ def _compute_spatial_feature_summary_core(
             n_ep = dfc.groupby('individual').size()
             sum_dur = dfc.groupby('individual')['duration_s'].sum()
             mean_dur = dfc.groupby('individual')['duration_s'].mean()
-            ep_per_min = n_ep / total_minutes.reindex(n_ep.index)
+            ep_per_min = n_ep / episode_minutes.reindex(n_ep.index).replace(0, np.nan)
             w_num = (dfc['subtype_entropy_norm'] * dfc['duration_s']).groupby(dfc['individual']).sum()
             ent_w = w_num / sum_dur
             out = pd.DataFrame({
@@ -797,48 +804,23 @@ def _compute_spatial_feature_summary_core(
             summary_df = _merge_feature_frame(summary_df, _agg_episode(ctx_name, orient_value))
 
     if bout_summary_df is not None and not bout_summary_df.empty:
-        try:
-            rep = bout_summary_df.groupby(['individual', 'category'])['n_bouts'].sum().unstack('category')
+        if 'n_switches' not in bout_summary_df:
+            raise ValueError('Bout summary lacks verified per-recording n_switches; regenerate with the current mmgen.')
+        else:
+            rep = bout_summary_df.groupby(['individual', 'category'])['n_switches'].sum(min_count=1).unstack('category')
+            exposure = (bout_summary_df.groupby(['individual', 'category'])['observed_seconds'].max().unstack('category') / 60.0
+                        if 'observed_seconds' in bout_summary_df else None)
             def _switch_rate(colname, outname):
                 if colname not in rep.columns:
                     return None
-                transitions = (rep[colname] - 1).clip(lower=0)
-                rate = transitions / total_minutes.reindex(transitions.index)
+                transitions = rep[colname]
+                minutes = exposure[colname] if exposure is not None else total_minutes
+                rate = transitions / minutes.reindex(transitions.index).replace(0, np.nan)
                 tmp = rate.reset_index()
                 tmp.columns = ['individual', outname]
                 return tmp
             for colname, outname in [('Pose', 'Transition_Repertoire_Pose_SwitchRate_per_min'), ('Orient', 'Transition_Repertoire_Orient_SwitchRate_per_min'), ('Pose+Orient', 'Transition_Repertoire_PoseOrient_SwitchRate_per_min')]:
                 summary_df = _merge_feature_frame(summary_df, _switch_rate(colname, outname))
-        except Exception:
-            pass
-
-    def _entropy_from_timebudgets(prefix):
-        cols = [c for c in master_matrix.columns if c.startswith(prefix)]
-        if not cols:
-            return None
-        mat = master_matrix[cols].to_numpy(dtype=float)
-        mat = np.where(np.isfinite(mat) & (mat > 0), mat, 0.0)
-        row_sums = mat.sum(axis=1, keepdims=True)
-        k = mat.shape[1]
-        if k <= 1:
-            return np.full((mat.shape[0],), np.nan)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            p = np.where(row_sums > 0, mat / row_sums, np.nan)
-            logp = np.where(p > 0, np.log(p), 0.0)
-            H = -np.nansum(np.where(p > 0, p * logp, 0.0), axis=1)
-            Hn = H / np.log(k)
-            Hn = np.where(row_sums.flatten() > 0, Hn, np.nan)
-        return Hn
-
-    ent_pose = _entropy_from_timebudgets('TimeBudget_Pose_')
-    if ent_pose is not None:
-        summary_df['Transition_Repertoire_Pose_EntropyNorm'] = ent_pose
-    ent_or = _entropy_from_timebudgets('TimeBudget_Orient_')
-    if ent_or is not None:
-        summary_df['Transition_Repertoire_Orient_EntropyNorm'] = ent_or
-    ent_po = _entropy_from_timebudgets('TimeBudget_PoseOrient_')
-    if ent_po is not None:
-        summary_df['Transition_Repertoire_PoseOrient_EntropyNorm'] = ent_po
 
     return summary_df
 
@@ -863,6 +845,9 @@ def compute_spatial_feature_summary_df(
     video_fps: float = DEFAULT_VIDEO_FPS,
     num_workers: int = 1,
 ) -> pd.DataFrame | None:
+    """Calculate spatial feature families in ordered animal chunks and align them to
+    master rows.
+    """
     if spatial_df is None or spatial_df.empty:
         return None
 
@@ -896,23 +881,26 @@ def compute_spatial_feature_summary_df(
 
     n_chunks = max(worker_count * 2, worker_count)
     chunks = _ordered_chunks_for_workers(individuals, n_chunks)
-    tasks = []
-    for chunk in chunks:
-        chunk_set = set(chunk)
-        spatial_chunk = spatial_df[spatial_df['individual'].astype(str).isin(chunk_set)].copy()
-        if spatial_chunk.empty:
-            continue
-        bout_chunk = None
-        if bout_summary_df is not None and not bout_summary_df.empty:
-            bout_chunk = bout_summary_df[bout_summary_df['individual'].astype(str).isin(chunk_set)].copy()
-        master_chunk = master_matrix[master_matrix['individual'].astype(str).isin(chunk_set)].copy()
-        tasks.append((spatial_chunk, bout_chunk, master_chunk, float(video_fps), int(min_context_frames), int(groom_gap_frames)))
+    spatial_groups = spatial_df.groupby(spatial_df['individual'].astype(str), sort=False).indices
+    master_groups = master_matrix.groupby(master_matrix['individual'].astype(str), sort=False).indices
+    bout_groups = (bout_summary_df.groupby(bout_summary_df['individual'].astype(str), sort=False).indices
+                   if bout_summary_df is not None and not bout_summary_df.empty else {})
 
-    if not tasks:
-        return None
+    def select_rows(frame, groups, chunk):
+        parts = [groups[ind] for ind in chunk if ind in groups]
+        indices = np.sort(np.concatenate(parts)) if parts else np.empty(0, dtype=np.int64)
+        return frame.iloc[indices].copy()
 
-    with Pool(processes=worker_count) as pool:
-        results = pool.map(_compute_spatial_feature_summary_worker, tasks, chunksize=1)
+    def tasks():
+        for chunk in chunks:
+            spatial_chunk = select_rows(spatial_df, spatial_groups, chunk)
+            bout_chunk = (select_rows(bout_summary_df, bout_groups, chunk) if bout_groups else None)
+            master_chunk = select_rows(master_matrix, master_groups, chunk)
+            yield (spatial_chunk, bout_chunk, master_chunk, float(video_fps),
+                   int(min_context_frames), int(groom_gap_frames))
+
+    results = list(ordered_worker_results(_compute_spatial_feature_summary_worker,
+                                         tasks(), num_workers=worker_count))
 
     union_columns = ['individual']
     for df in results:
@@ -936,13 +924,15 @@ def _read_excel_sheets(path: str) -> dict[str, pd.DataFrame] | None:
 
 
 def load_finalization_sources_from_output_folder(output_dir: str) -> MMGenFinalizationSources:
-    """Load previously emitted mmgen output files into an ``MMGenFinalizationSources`` bundle."""
+    """Load previously emitted MMGen output files into an ``MMGenFinalizationSources``
+    bundle.
+    """
 
     def _read_csv_optional(filename: str) -> pd.DataFrame | None:
         path = os.path.join(output_dir, filename)
         if not os.path.exists(path):
             return None
-        return pd.read_csv(path)
+        return read_metadata_csv(path)
 
     bout_summary_df = _read_csv_optional('1_Individual_Bout_Summary.csv')
     measurements_df = None
@@ -950,8 +940,8 @@ def load_finalization_sources_from_output_folder(output_dir: str) -> MMGenFinali
     if os.path.exists(measurements_path):
         try:
             measurements_df = pd.read_excel(measurements_path, sheet_name='Combined Measurements')
-        except Exception:
-            measurements_df = None
+        except Exception as exc:
+            raise RuntimeError(f'Cannot read present measurement source {measurements_path}') from exc
 
     spatial_data_path = os.path.join(output_dir, 'temp_transformed_positional_data.csv')
     if not os.path.exists(spatial_data_path):
@@ -963,7 +953,6 @@ def load_finalization_sources_from_output_folder(output_dir: str) -> MMGenFinali
         measurements_df=measurements_df,
         postural_summary_df=_read_csv_optional('4_Postural_Features.csv'),
         kinematic_sheets=_read_excel_sheets(os.path.join(output_dir, '5_Kinematic_Features.xlsx')),
-        tw_kinematic_sheets=_read_excel_sheets(os.path.join(output_dir, '5b_KinematicTW_Features.xlsx')),
         transition_pose_tidy_df=_read_csv_optional('6_Pose_All_Transitions_Tidy.csv'),
         transition_pose_orient_tidy_df=_read_csv_optional('7_Pose+Orient_All_Transitions_Tidy.csv'),
         sleep_summary_df=_read_csv_optional('12_Sleep_Features.csv'),
@@ -985,13 +974,16 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
         print("Error: no bout summary source data found. Cannot create feature matrix.")
         return None
 
-    # --- Step 1 & 2: Establish Base Table from Bout Summary ---
+    _validate_finalized_keys(bout_summary_df, ['individual', 'category', 'bout_type'], family='bout summary')
+
+    # Step 1 & 2: Establish Base Table from Bout Summary
     base_df = bout_summary_df[['individual', 'group', 'sex']].drop_duplicates().reset_index(drop=True)
+    _validate_finalized_keys(base_df, ['individual'], family='bout-summary animal metadata')
     print(f"Base table created with {len(base_df)} unique individuals.")
 
-    # --- Step 3: Process and Pivot Bout Summary Features ---
+    # Step 3: Process and Pivot Bout Summary Features
     id_vars = ['individual', 'group', 'sex', 'category', 'bout_type']
-    exclude_vars = ['n_bouts', 'total_length_frames']
+    exclude_vars = ['n_bouts', 'total_length_frames', 'n_switches', 'source_file', 'animal_id', 'observed_seconds']
     value_vars = [col for col in bout_summary_df.columns if col not in id_vars + exclude_vars]
 
     pivoted_bout_summary = bout_summary_df.pivot_table(
@@ -1019,14 +1011,14 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
         if src in bout_count_pivot.columns and dst not in bout_count_pivot.columns:
             bout_count_pivot[dst] = bout_count_pivot[src]
 
-    # --- Step 4: Process and Merge Time Budget Features ---
+    # Step 4: Process and Merge Time Budget Features
     time_budget_sheets = sources.time_budget_sheets or {}
     if time_budget_sheets:
         print("Processing time budget features...")
 
         def _process_sheet(df, sheet_name, prefix):
-            df = df[~df['individual'].astype(str).str.contains('--- AVERAGE ---', na=False)]
-            df = df.dropna(subset=['individual'])
+            df = _clean_finalized_summary(df, family=f'time-budget sheet {sheet_name}')
+            _validate_finalized_keys(df, ['individual'], family=f'time-budget sheet {sheet_name}')
             id_cols = ['individual', 'group']
             feature_cols = [col for col in df.columns if col not in id_cols and str(col).strip() != '' and '---' not in str(col)]
             rename_dict = {col: f"{prefix}_{str(col).replace(' | ', '_')}" for col in feature_cols}
@@ -1046,14 +1038,14 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
             if sheet_name in time_budget_sheets:
                 try:
                     processed_df = _process_sheet(time_budget_sheets[sheet_name].copy(), sheet_name, prefix)
-                    master_matrix = pd.merge(master_matrix, processed_df, on='individual', how='left')
+                    master_matrix = _merge_feature_frame(master_matrix, processed_df)
                     print(f"  - Merged features from '{sheet_name}' sheet.")
                 except Exception as e:
-                    print(f"  - Error processing sheet '{sheet_name}': {e}")
+                    raise RuntimeError(f"Cannot assemble present time-budget sheet '{sheet_name}'") from e
     else:
         print("Warning: time budget source sheets not found. Skipping time budget features.")
 
-    # --- Step 5: Process and Merge Standardized Measurement Features ---
+    # Step 5: Process and Merge Standardized Measurement Features
     measurements_source_df = sources.measurements_df
     if measurements_source_df is not None and not measurements_source_df.empty:
         print("Processing standardized measurement features...")
@@ -1075,26 +1067,27 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
                 combined_df.rename(columns={'individual_id': 'individual', 'group_label': 'group'}, inplace=True)
                 measurements_df = format_summary_df(combined_df, desired_order)
 
-            measurements_df = measurements_df[~measurements_df['individual'].astype(str).str.contains('--- AVERAGE ---', na=False)]
-            measurements_df = measurements_df.dropna(subset=['individual'])
+            measurements_df = _clean_finalized_summary(measurements_df, family='standardized measurements')
+            _validate_finalized_keys(measurements_df, ['individual'], family='standardized measurements')
             id_cols = ['individual', 'group']
-            feature_cols = [col for col in measurements_df.columns if col not in id_cols and not str(col).endswith('_n_samples') and str(col).strip() != '' and '---' not in str(col)]
+            feature_cols = [col for col in measurements_df.columns if col not in id_cols and not str(col).endswith(('_n_samples', '_mean_samples_per_recording')) and str(col).strip() != '' and '---' not in str(col)]
             rename_dict = {col: f"StdMeasure_{col}" for col in feature_cols}
             measurements_df.rename(columns=rename_dict, inplace=True)
             cols_to_merge = ['individual'] + list(rename_dict.values())
-            master_matrix = pd.merge(master_matrix, measurements_df[cols_to_merge], on='individual', how='left')
+            master_matrix = _merge_feature_frame(master_matrix, measurements_df[cols_to_merge])
             print("  - Merged measurement features.")
         except Exception as e:
-            print(f"  - Error processing standardized measurements: {e}")
+            raise RuntimeError('Cannot assemble present standardized measurements') from e
     else:
         print("Warning: measurement source data not found. Skipping standardized measurement features.")
 
-    # --- Step 6: Process and Merge Postural Features ---
+    # Step 6: Process and Merge Postural Features
     postural_df = sources.postural_summary_df
     if postural_df is not None and not postural_df.empty:
         print("Processing postural features...")
         try:
             postural_df = postural_df.copy()
+            _validate_finalized_keys(postural_df, ['individual'], family='postural features')
             id_cols = ['individual', 'group']
             feature_cols = [col for col in postural_df.columns if col not in id_cols]
             feature_cols = [col for col in feature_cols if col != 'group']
@@ -1103,14 +1096,14 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
                 raise ValueError("ERROR: 'group' column is being treated as a feature! This should not happen.")
             postural_df.rename(columns=rename_dict, inplace=True)
             cols_to_merge = ['individual'] + list(rename_dict.values())
-            master_matrix = pd.merge(master_matrix, postural_df[cols_to_merge], on='individual', how='left')
+            master_matrix = _merge_feature_frame(master_matrix, postural_df[cols_to_merge])
             print("  - Merged postural features.")
         except Exception as e:
-            print(f"  - Error processing postural features: {e}")
+            raise RuntimeError('Cannot assemble present postural features') from e
     else:
         print("Warning: postural source data not found. Skipping postural features.")
 
-    # --- Step 7: Process and Merge Kinematic Features ---
+    # Step 7: Process and Merge Kinematic Features
     kinematic_sheets = sources.kinematic_sheets or {}
     if kinematic_sheets:
         print("Processing kinematic features...")
@@ -1121,62 +1114,21 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
             category = match.group(1).replace(' + ', '+')
             try:
                 kin_df = kin_df.copy()
-                kin_df = kin_df[~kin_df['individual'].astype(str).str.contains('--- AVERAGE ---', na=False)]
-                kin_df = kin_df.dropna(subset=['individual'])
+                kin_df = _clean_finalized_summary(kin_df, family=f'BB kinematic sheet {sheet_name}')
+                _validate_finalized_keys(kin_df, ['individual'], family=f'BB kinematic sheet {sheet_name}')
                 id_cols = ['individual', 'group']
                 feature_cols = [col for col in kin_df.columns if col not in id_cols and '---' not in str(col) and str(col).strip() != '']
                 rename_dict = {col: f"KinematicBB_{category}_{str(col).replace(' ', '')}" for col in feature_cols}
                 kin_df.rename(columns=rename_dict, inplace=True)
                 cols_to_merge = ['individual'] + list(rename_dict.values())
-                master_matrix = pd.merge(master_matrix, kin_df[cols_to_merge], on='individual', how='left')
+                master_matrix = _merge_feature_frame(master_matrix, kin_df[cols_to_merge])
                 print(f"  - Merged features from '{sheet_name}' sheet.")
             except Exception as e:
-                print(f"  - Error processing sheet '{sheet_name}': {e}")
+                raise RuntimeError(f"Cannot assemble present BB kinematic sheet '{sheet_name}'") from e
     else:
         print("Warning: kinematic source sheets not found. Skipping kinematic features.")
 
-    # --- Step 7b: Process and Merge TW Kinematic Features ---
-    tw_kinematic_sheets = sources.tw_kinematic_sheets or {}
-    if tw_kinematic_sheets:
-        print("Processing TW kinematic features...")
-        for sheet_name, kin_df in tw_kinematic_sheets.items():
-            match = re.search(r'(Pose|Pose \+ Orient) \((inst)\)', sheet_name)
-            if not match:
-                continue
-            category = match.group(1).replace(' + ', '+')
-            try:
-                kin_df = kin_df.copy()
-                if 'individual' in kin_df.columns:
-                    kin_df = kin_df[~kin_df['individual'].astype(str).str.contains('--- AVERAGE ---', na=False)]
-                    kin_df = kin_df.dropna(subset=['individual'])
-                    raw_ids = kin_df['individual'].astype(str)
-                    collapsed_ids = raw_ids.map(collapse_individual_id)
-                    if (raw_ids != collapsed_ids).any():
-                        raise ValueError(
-                            "TW kinematic sheets must already be aggregated at the collapsed animal-level "
-                            "individual ID before master-matrix assembly."
-                        )
-                    if collapsed_ids.duplicated().any():
-                        dupes = collapsed_ids[collapsed_ids.duplicated()].unique().tolist()[:5]
-                        raise ValueError(
-                            "TW kinematic sheets contain duplicate collapsed individual IDs; "
-                            f"example duplicates: {dupes}"
-                        )
-                id_cols = ['individual', 'group']
-                feature_cols = [col for col in kin_df.columns if col not in id_cols and '---' not in str(col) and str(col).strip() != '']
-                rename_dict = {col: f"KinematicTW_{category}_{str(col).replace(' ', '')}" for col in feature_cols}
-                kin_df.rename(columns=rename_dict, inplace=True)
-                cols_to_merge = ['individual'] + list(rename_dict.values())
-                master_matrix = pd.merge(master_matrix, kin_df[cols_to_merge], on='individual', how='left')
-                print(f"  - Merged TW features from '{sheet_name}' sheet.")
-            except ValueError:
-                raise
-            except Exception as e:
-                print(f"  - Error processing TW sheet '{sheet_name}': {e}")
-    else:
-        print("Warning: TW kinematic source sheets not found. Skipping TW kinematic features.")
-
-    # --- Step 8: Process and Merge Transition Features ---
+    # Step 8: Process and Merge Transition Features
     transition_sources = {
         'Transition_Pose': sources.transition_pose_tidy_df,
         'Transition_PoseOrient': sources.transition_pose_orient_tidy_df,
@@ -1187,6 +1139,14 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
         print(f"Processing transition features from '{prefix}'...")
         try:
             trans_df = trans_df.copy()
+            _validate_finalized_keys(trans_df, ['individual', 'from_behavior', 'to_behavior'], family=prefix)
+            if filter_features_by_bout_count:
+                if 'departure_count' not in trans_df:
+                    raise ValueError('Transition filtering requires observed departure counts; regenerate transition summaries.')
+                counts = pd.to_numeric(trans_df['departure_count'], errors='raise')
+                if not np.isfinite(counts).all() or (counts < 0).any():
+                    raise ValueError('Transition departure counts must be finite and nonnegative.')
+                trans_df.loc[counts < min_bout_count_for_transitions, 'probability'] = np.nan
             trans_df['transition'] = trans_df['from_behavior'] + "_to_" + trans_df['to_behavior']
             pivoted_trans = trans_df.pivot_table(
                 index='individual',
@@ -1196,19 +1156,19 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
             )
             pivoted_trans.columns = [f"{prefix}_{col.replace(' ', '')}" for col in pivoted_trans.columns]
             pivoted_trans.reset_index(inplace=True)
-            master_matrix = pd.merge(master_matrix, pivoted_trans, on='individual', how='left')
+            master_matrix = _merge_feature_frame(master_matrix, pivoted_trans)
             print(f"  - Merged features from '{prefix}'.")
         except Exception as e:
-            print(f"  - Error processing transition features from '{prefix}': {e}")
+            raise RuntimeError(f"Cannot assemble present transition features '{prefix}'") from e
 
-    # --- Step 8.5: Process and Merge Sleep Features ---
+    # Step 8.5: Process and Merge Sleep Features
     sleep_df = sources.sleep_summary_df
     if sleep_df is not None and not sleep_df.empty:
         print("Processing sleep features...")
         try:
             sleep_df = sleep_df.copy()
-            sleep_df = sleep_df[~sleep_df['individual'].astype(str).str.contains('--- AVERAGE ---', na=False)]
-            sleep_df = sleep_df.dropna(subset=['individual'])
+            sleep_df = _clean_finalized_summary(sleep_df, family='sleep features')
+            _validate_finalized_keys(sleep_df, ['individual', 'bout_type'], family='sleep features')
             id_cols = ['individual', 'group', 'sex', 'bout_type']
             feature_cols = [col for col in sleep_df.columns if col not in id_cols and '---' not in str(col) and str(col).strip() != '']
             if feature_cols:
@@ -1220,56 +1180,70 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
                 )
                 sleep_pivot.columns = [f"SleepFeat_{bout.replace(' ', '')}_{val}" for val, bout in sleep_pivot.columns]
                 sleep_pivot.reset_index(inplace=True)
-                master_matrix = pd.merge(master_matrix, sleep_pivot, on='individual', how='left')
+                master_matrix = _merge_feature_frame(master_matrix, sleep_pivot)
                 print("  - Merged sleep features.")
             else:
-                print("  - Warning: No sleep feature columns found in source data.")
+                raise ValueError('Present sleep summary has no scientific feature columns')
         except Exception as e:
-            print(f"  - Error processing sleep features: {e}")
+            raise RuntimeError('Cannot assemble present sleep features') from e
     else:
         print("Warning: sleep feature source data not found. Skipping sleep features.")
 
-    # --- Step 9: Process and Merge Spatial / Occupancy-Derived Features ---
+    # Step 9: Process and Merge Spatial / Occupancy-Derived Features
     spatial_data_path = sources.spatial_data_path
     spatial_df = sources.spatial_df.copy() if sources.spatial_df is not None else None
     if spatial_df is not None and spatial_df.empty:
         spatial_df = None
+    if spatial_df is None and spatial_data_path and not os.path.isfile(spatial_data_path):
+        raise FileNotFoundError(f'Present spatial source path is missing: {spatial_data_path}')
     if spatial_df is not None or (spatial_data_path and os.path.exists(spatial_data_path)):
         spatial_source_label = 'in-memory transformed spatial data' if spatial_df is not None else spatial_data_path
         print("Processing spatial-derived features...")
         try:
             if spatial_df is None:
-                cols_to_load = [
-                    'individual', 'source_file', 'frame_idx', 'r_norm', 'relative_angle', 'speed_mm_s',
-                    'masked_pose', 'masked_orient', 'masked_pose_orient',
-                    'masked_pose_valid', 'masked_orient_valid', 'masked_pose_orient_valid',
-                    'anglefeature_Wings_L_R', 'anglefeature_Legs_FL_FR', 'anglefeature_Legs_ML_MR', 'anglefeature_Legs_BL_BR',
-                ]
-                spatial_df = pd.read_csv(spatial_data_path, usecols=lambda c: c in cols_to_load)
-
-            spatial_summary_df = compute_spatial_feature_summary_df(
-                spatial_df,
-                bout_summary_df=bout_summary_df,
-                master_matrix=master_matrix,
-                video_fps=video_fps,
-                num_workers=int(spatial_num_workers),
-            )
+                from .spatial_stream import compute_spatial_feature_summary_csv
+                spatial_summary_df = compute_spatial_feature_summary_csv(
+                    spatial_data_path, bout_summary_df, master_matrix,
+                    video_fps=video_fps, num_workers=int(spatial_num_workers),
+                    work_dir=os.path.join(output_dir, '_mmgen_work'))
+            else:
+                spatial_summary_df = compute_spatial_feature_summary_df(
+                    spatial_df,
+                    bout_summary_df=bout_summary_df,
+                    master_matrix=master_matrix,
+                    video_fps=video_fps,
+                    num_workers=int(spatial_num_workers),
+                )
             if spatial_summary_df is not None and not spatial_summary_df.empty:
                 spatial_feature_cols = [c for c in spatial_summary_df.columns if c != 'individual']
-                master_matrix = pd.merge(master_matrix, spatial_summary_df, on='individual', how='left')
+                master_matrix = _merge_feature_frame(master_matrix, spatial_summary_df)
                 print(f"  - Merged {len(spatial_feature_cols)} spatial-derived features.")
             else:
                 print("  - No spatial-derived features were computed.")
         except Exception as e:
-            print(f"Error processing spatial-derived features from {spatial_source_label}: {e}")
-            print("Skipping spatial-derived features.")
+            raise RuntimeError(f'Cannot assemble present spatial features from {spatial_source_label}') from e
     else:
         print("Warning: spatial source data not found. Skipping spatial-derived features.")
 
 
 
 
-    # --- Step 10: Filter Features by Bout Count (if enabled) ---
+    # Repertoire entropy depends only on the complete time-budget cohort.
+    # It must not depend on spatial coverage or worker partition membership.
+    from .categories import SUMMARY_LABELS, normalized_budget_entropy
+    for category, budget_prefix, output_prefix in [
+        ('Pose', 'TimeBudget_Pose_', 'Pose'),
+        ('Orient', 'TimeBudget_Orient_', 'Orient'),
+        ('Pose+Orient', 'TimeBudget_PoseOrient_', 'PoseOrient'),
+    ]:
+        try:
+            entropy = normalized_budget_entropy(master_matrix, budget_prefix, SUMMARY_LABELS[category])
+        except (TypeError, ValueError) as exc:
+            raise ValueError('MASTER_FEATURE_MATRIX contains nonnumeric scientific feature values in time budgets') from exc
+        if entropy is not None:
+            master_matrix[f'Transition_Repertoire_{output_prefix}_EntropyNorm'] = entropy
+
+    # Step 10: Filter Features by Bout Count (if enabled)
     if filter_features_by_bout_count:
         print(f"\nFiltering features with minimum bout count of {min_bout_count_for_features} (transitions: {min_bout_count_for_transitions})...")
         # Pass the separate bout_count_pivot DataFrame (created in Step 3) for filtering
@@ -1281,18 +1255,14 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
             bout_count_df=bout_count_pivot
         )
 
-    # --- Final Cleanup: Remove empty and redundant columns ---
+    # Align the declared feature contract and optional exclusions.
     print("\nCleaning final master matrix before saving...")
 
-    # 1. Optionally drop any columns that are fully empty
-    if bool(drop_all_na_columns):
-        cols_before_nan_drop = len(master_matrix.columns)
-        master_matrix.dropna(axis=1, how='all', inplace=True)
-        cols_after_nan_drop = len(master_matrix.columns)
-        if cols_before_nan_drop != cols_after_nan_drop:
-            print(f"  -> Dropped {cols_before_nan_drop - cols_after_nan_drop} fully empty columns.")
+    # Retain the complete declared universe in every master. The legacy keyword
+    # remains accepted by callers, but censoring no longer changes master width.
+    master_matrix = complete_master_schema(master_matrix)
 
-    # 2. Define and drop your list of redundant features (optional)
+    # Optional explicit redundant-feature exclusions.
     redundant_features_to_drop = [
         # Add any feature names here if needed later
     ]
@@ -1303,88 +1273,59 @@ def create_feature_matrix_from_sources(output_dir: str, sources: MMGenFinalizati
         if cols_before_manual_drop != cols_after_manual_drop:
             print(f"  -> Dropped {cols_before_manual_drop - cols_after_manual_drop} predefined redundant features.")
 
-    # Validate stable row identity before saving.
-    if 'individual' not in master_matrix.columns:
-        raise ValueError("MASTER_FEATURE_MATRIX is missing required row identity column 'individual'.")
-    dup_mask = master_matrix['individual'].astype(str).duplicated(keep=False)
-    if dup_mask.any():
-        dupes = sorted(master_matrix.loc[dup_mask, 'individual'].astype(str).unique().tolist())
-        raise ValueError(
-            "Duplicate master-matrix row identities detected in 'individual': "
-            + ", ".join(dupes[:10])
-            + (" ..." if len(dupes) > 10 else "")
-        )
-
     # Impose canonical family-grouped column ordering before saving.
     master_matrix = reorder_master_matrix_columns(master_matrix)
+    validate_master_matrix_dataframe(master_matrix)
 
-    # Save the final master matrix
     output_path_final = os.path.join(output_dir, 'MASTER_FEATURE_MATRIX.csv')
-    master_matrix.to_csv(output_path_final, index=False)
+    atomic_write_dataframe_csv(master_matrix, output_path_final, index=False)
+    write_schema_metadata(output_dir)
     print(f"\nMaster feature matrix is complete and saved to {output_path_final}")
 
-    # Save feature units manifest alongside the matrix
-    try:
-        write_feature_units_manifest(
-            master_matrix=master_matrix,
-            output_dir=output_dir,
-            mm_per_px=mm_per_px,
-            fps=video_fps
-        )
-    except Exception as e:
-        print(f"WARNING: Failed to write MASTER_FEATURE_MATRIX unit manifest: {e}")
+    write_feature_units_manifest(
+        master_matrix=master_matrix,
+        output_dir=output_dir,
+        mm_per_px=mm_per_px,
+        fps=video_fps
+    )
 
     gc.collect()
 
     return master_matrix
 
 def create_feature_matrix(output_dir):
-    """Wrapper that loads emitted mmgen output files and assembles the master matrix."""
+    """Load finalized MMGen reports and assemble the declared master matrix."""
     sources = load_finalization_sources_from_output_folder(output_dir)
     return create_feature_matrix_from_sources(output_dir, sources)
 
 def validate_feature_matrix(matrix_path, required_id_cols=['individual', 'group', 'sex']):
-    """
-    Validates that a feature matrix has the expected structure.
-    
-    Args:
-        matrix_path: Path to the feature matrix CSV file
-        required_id_cols: List of required ID columns that must be present
-    
-    Returns:
-        tuple: (is_valid, error_message, df)
-            - is_valid: Boolean indicating if matrix is valid
-            - error_message: None if valid, error string if invalid
-            - df: Loaded DataFrame if valid, None if invalid
-    """
+    """Validate the master matrix through the canonical validator."""
     try:
-        df = pd.read_csv(matrix_path)
-        
-        # Check required ID columns
+        with open(matrix_path, newline="", encoding="utf-8-sig") as handle:
+            raw_headers = next(csv.reader(handle), [])
+        if not raw_headers:
+            return False, "Feature matrix has no header row", None
+        if any(not str(column).strip() for column in raw_headers):
+            return False, "Feature matrix has a blank column name", None
+        if len(set(raw_headers)) != len(raw_headers):
+            duplicates = sorted(
+                column for column, count in Counter(raw_headers).items() if count > 1
+            )
+            return False, f"Feature matrix has duplicate columns: {duplicates[:20]}", None
+
+        df = read_metadata_csv(matrix_path)
         missing_cols = [col for col in required_id_cols if col not in df.columns]
         if missing_cols:
             return False, f"Missing required columns: {missing_cols}", None
-        
-        # Check for feature columns
-        feature_cols = [col for col in df.columns if col not in required_id_cols]
-        if len(feature_cols) == 0:
-            return False, "No feature columns found", None
-        
-        # Check for empty dataframe
-        if len(df) == 0:
-            return False, "DataFrame is empty", None
-        
+        validate_master_matrix_dataframe(df)
         return True, None, df
-        
     except Exception as e:
         return False, f"Error loading matrix: {str(e)}", None
 
 
 
 
-# ============================================================================
 # FILE I/O AND FORMATTING
-# ============================================================================
 
 def format_summary_df(pivot_df, desired_order, id_cols=['individual', 'group']):
     """
@@ -1401,14 +1342,15 @@ def format_summary_df(pivot_df, desired_order, id_cols=['individual', 'group']):
     pivot_df = pivot_df.reindex(columns=final_cols)
 
     # 1. Identify numeric columns and grouping columns
-    numeric_cols = pivot_df.select_dtypes(include=np.number).columns.tolist()
+    numeric_cols = [column for column in pivot_df.select_dtypes(include=np.number).columns
+                    if column not in id_cols]
     group_by_cols = [c for c in id_cols if c != 'individual']
     if not group_by_cols:
         group_by_cols = ['group'] if 'group' in id_cols else []
     
     group_summary = pd.DataFrame()
     
-    # 2. Calculate the group average. The .mean() function correctly ignores NaNs.
+    # Calculate group averages from available values.
     if group_by_cols:
         pivot_df_copy = pivot_df.copy() # De-fragment before groupby
         group_summary = pivot_df_copy.groupby(group_by_cols, as_index=False, observed=True)[numeric_cols].mean()
@@ -1433,17 +1375,17 @@ def format_summary_df(pivot_df, desired_order, id_cols=['individual', 'group']):
     else:
         individual_data = pivot_df # No grouping, just use the sorted df
 
-    # The final DataFrame will have NaNs, which is what we want.
+    # Preserve unavailable values as NaNs for blank spreadsheet cells.
     return pd.concat([group_summary, separator, individual_data], ignore_index=True)
 
 def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
-    """
-    Saves multiple DataFrames to a single Excel file, each on its own sheet.
+    """Save multiple DataFrames to a single Excel file, each on its own sheet.
 
     Notes:
     - Excel sheet titles are limited to 31 characters. To avoid openpyxl warnings
       sheet names are sanitized, truncated, and made unique.
     - Header cells are left-aligned for readability.
+    - Reports without eligible summaries contain a visible ``No data`` sheet.
     """
     sheets_to_process = sheet_order if sheet_order else list(sheets_dict.keys())
 
@@ -1456,6 +1398,7 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
         return name or 'Sheet'
 
     def _make_unique_sheet_name(name: str, used: set[str]) -> str:
+        """Add a bounded numeric suffix when sanitized worksheet names collide."""
         name = _sanitize_sheet_name(str(name))
         max_len = 31
         base = name[:max_len]
@@ -1490,6 +1433,14 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
             name_map[str(orig_name)] = safe_name
             df.to_excel(writer, sheet_name=safe_name, index=False)
 
+        # Excel requires a visible sheet even when all summaries are unavailable.
+        if not name_map:
+            safe_name = 'No data'
+            pd.DataFrame({'Status': [
+                'No eligible summary data were available for this report.'
+            ]}).to_excel(writer, sheet_name=safe_name, index=False)
+            name_map[safe_name] = safe_name
+
         # Apply left alignment to headers in all written sheets
         workbook = writer.book
         for safe_name in name_map.values():
@@ -1499,4 +1450,3 @@ def save_to_excel_sheets(sheets_dict, output_path, sheet_order=None):
                     cell.alignment = Alignment(horizontal='left')
 
     print(f"Saved Excel file with {len(name_map)} sheets to {output_path}")
-

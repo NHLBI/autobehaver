@@ -1,4 +1,4 @@
-"""Final keypoint export (rotated coords + likelihoods) for keypre."""
+"""Export raw or rotated keypoint coordinates and likelihoods for KeyPre."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ include_likelihoods = settings.include_likelihoods
 
 
 def add_rotated_keypoints_and_likelihoods(input_df, poscorr_dict, parts):
-    """Write final keypoint columns (rotated) and likelihoods to poscorr_dict."""
+    """Add rotated coordinates and likelihoods to the ordered feature mapping."""
     for part in parts:
         rx = f"{part}_rotated_x"
         ry = f"{part}_rotated_y"
@@ -34,17 +34,10 @@ def add_rotated_keypoints_and_likelihoods(input_df, poscorr_dict, parts):
 
 
 def add_raw_keypoints_and_likelihoods(input_df, poscorr_dict, parts):
-    """Write raw DLC keypoint columns (x/y) and likelihoods to poscorr_dict.
+    """Add direct DeepLabCut coordinates and likelihoods with _raw suffixes.
 
-    This is intended for ablation experiments where you want to test models on
-    only the direct DLC outputs (no centering/rotation/kinematics/body-shape).
-
-    Notes:
-      - Output column names are suffixed with ``_raw`` (e.g. ``Ocelli_x_raw``)
-        to avoid confusion with the standard keypre export (which outputs
-        rotated/corrected coordinates as ``*_x``/``*_y``).
-      - ``parts`` should exclude derived helpers like Front/Back; keypre's
-        canonical list in :mod:`autobehaver.preinf.keypre.spec` already does.
+    Use the canonical raw parts list, which excludes derived Front/Back points.
+    This mode preserves every row and does not apply engineered-feature edge NaNs.
     """
 
     n = int(len(input_df))

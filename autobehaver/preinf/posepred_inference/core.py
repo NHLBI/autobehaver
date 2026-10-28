@@ -1,4 +1,4 @@
-"""Core runner for the posepred inference pipeline stage."""
+"""Coordinate PosePred inference and validate per-frame predictions and provenance."""
 
 from __future__ import annotations
 
@@ -9,14 +9,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
+from autobehaver.preinf.frame_identity import h5_frame_timeline
+from autobehaver.portable_paths import prediction_path, original_name
+import h5py
+import numpy as np
+import pandas as pd
+
+from autobehaver.validation import StageValidationReport
+
 from .config import PosePredInferenceConfig
 
-from ...inference import run_inference
+from ...inference import (
+    _build_inference_provenance,
+    _completed_inference_matches,
+    _provenance_file_identity,
+    run_inference,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _ensure_list(x):
+    """Normalize one or more supplied values into a list of strings."""
     if x is None:
         return []
     if isinstance(x, (list, tuple)):
@@ -24,8 +38,100 @@ def _ensure_list(x):
     return [str(x)]
 
 
+def _validate_inference_csv(source_h5: str, inference_csv: Path, expected_heads=None) -> tuple[bool, str, dict]:
+    """Validate frame alignment, probability bounds, and emitted label vocabularies."""
+
+    try:
+        with h5py.File(source_h5, "r") as handle:
+            if "data" not in handle or getattr(handle["data"], "ndim", None) != 2:
+                return False, "source HDF5 is missing a 2D data dataset", {}
+            expected_rows, _, _ = h5_frame_timeline(handle)
+    except Exception as exc:
+        return False, f"source HDF5 is unreadable: {exc}", {}
+    try:
+        frame = pd.read_csv(inference_csv)
+    except Exception as exc:
+        return False, f"inference CSV is unreadable: {exc}", {}
+
+    if len(frame) != expected_rows:
+        return False, f"row count {len(frame)} does not match source row count {expected_rows}", {}
+    if "Frame Number" not in frame.columns:
+        return False, "inference CSV is missing 'Frame Number'", {}
+    expected_frames = np.arange(1, expected_rows + 1, dtype=np.int64)
+    try:
+        actual_frames = pd.to_numeric(frame["Frame Number"], errors="raise").to_numpy()
+    except Exception as exc:
+        return False, f"Frame Number contains non-numeric values: {exc}", {}
+    if not np.array_equal(actual_frames, expected_frames):
+        return False, "Frame Number must be the unique consecutive sequence 1..N", {}
+
+    present_heads = [p for p in ('Pose', 'Orient') if any(str(c).startswith(p + '-') and str(c).endswith('-Prob') for c in frame)]
+    if not present_heads:
+        return False, 'inference CSV contains no prediction head', {}
+    if expected_heads is not None:
+        if set(present_heads) != set(expected_heads):
+            return False, 'prediction heads differ from the requested checkpoint', {}
+        for head,labels in expected_heads.items():
+            actual={str(c)[len(head)+1:-5] for c in frame if str(c).startswith(head+'-') and str(c).endswith('-Prob')}
+            if actual != set(labels):
+                return False, f'{head} vocabulary differs from the requested checkpoint', {}
+
+    if 'Source Frame Index' in frame and not np.array_equal(pd.to_numeric(frame['Source Frame Index'], errors='coerce'), expected_frames - 1):
+        return False, 'original frame identity does not match Frame Number', {}
+
+    for prefix, label_column in (
+        ("Pose", "Predicted Pose Label"),
+        ("Orient", "Predicted Orient Label"),
+    ):
+        probability_columns = [
+            column
+            for column in frame.columns
+            if str(column).startswith(f"{prefix}-") and str(column).endswith("-Prob")
+        ]
+        if not probability_columns:
+            continue
+        try:
+            probabilities = frame[probability_columns].apply(pd.to_numeric, errors="raise")
+        except Exception as exc:
+            return False, f"{prefix} probability columns contain non-numeric values: {exc}", {}
+        values = probabilities.to_numpy(dtype=np.float64, copy=False)
+        finite = np.isfinite(values)
+        if ((values[finite] < 0.0) | (values[finite] > 1.0)).any():
+            return False, f"{prefix} probabilities fall outside [0, 1]", {}
+        complete_rows = finite.all(axis=1)
+        if complete_rows.any():
+            sums = values[complete_rows].sum(axis=1)
+            tolerance = max(0.002, len(probability_columns) * 0.00011)
+            if not np.allclose(sums, 1.0, atol=tolerance, rtol=0.0):
+                return False, f"{prefix} probabilities do not sum to one", {}
+        if not complete_rows.any():
+            return False, f'{prefix} head has no usable predictions', {}
+        partial_rows = finite.any(axis=1) & ~complete_rows
+        if partial_rows.any():
+            return False, f"{prefix} probability rows are only partially populated", {}
+        if label_column not in frame.columns:
+            return False, f"inference CSV is missing {label_column!r}", {}
+        vocabulary = {
+            str(column)[len(prefix) + 1 : -len("-Prob")]
+            for column in probability_columns
+        }
+        labels = frame[label_column]
+        populated_labels = labels[complete_rows].dropna().map(str)
+        if len(populated_labels) != int(complete_rows.sum()):
+            return False, f"{label_column} is blank on a frame with probabilities", {}
+        unknown = sorted(set(populated_labels) - vocabulary)
+        if unknown:
+            return False, f"{label_column} contains labels outside the probability vocabulary: {unknown[:10]}", {}
+
+    return True, "ok", {"rows": expected_rows, "columns": int(frame.shape[1])}
+
+
+from autobehaver.completion import verified_run
+
+
+@verified_run
 def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
-    """Run posepred inference from a prepared config."""
+    """Run selected PosePred checkpoints and validate prediction outputs before registry updates."""
 
     input_dir_path = Path(cfg.input_dir).expanduser().resolve()
     input_dir = str(input_dir_path)
@@ -54,15 +160,11 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
         use_inferences_subdir = True
         output_root_for_log = input_dir
 
-    # ----------------------------------------------------------------------------------
     # Resolve input HDF5s
     # Priority:
-    #   1) registry (if enabled)
-    #   2) filesystem scan of input_dir
-    #
-    # We pre-filter here so we can safely update the registry without overwriting
-    # posepred_models for files that were not part of the selected run.
-    # ----------------------------------------------------------------------------------
+    # registry (if enabled)
+    # filesystem scan of input_dir
+    # Restrict registry model updates to the inputs selected for this run.
     used_registry = False
     registry_csv_path: Optional[str] = None
     registry_project_root: Optional[Path] = None
@@ -82,7 +184,7 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
         registry_project_root = reg_path.parent
 
         try:
-            from autobehaver.registry import read_registry  # lazy import; pandas required
+            from autobehaver.registry import read_registry, resolve_registry_path
         except Exception as e:
             raise RuntimeError(
                 "Failed to import registry helpers (pandas required). "
@@ -96,7 +198,7 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
                 "Run the keyprenorm stage first, or disable registry for this run."
             )
 
-        # pandas is optional; used only for isna convenience.
+        # Handle null active flags without changing compatibility defaults.
         try:
             import pandas as pd  # type: ignore
         except Exception:  # pragma: no cover
@@ -131,22 +233,12 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
             except Exception:
                 pass
 
-        rels = [
-            str(x).replace("\\", "/")
-            for x in df2["keyprenorm_h5_relpath"].tolist()
-            if str(x).strip() != ""
-        ]
-
         resolved: List[str] = []
-        for rel in rels:
-            p = (registry_project_root / rel).resolve()
-            if not p.exists():
-                bn = Path(rel).name
-                cand = input_dir_path / bn
-                if cand.exists():
-                    p = cand.resolve()
-            if not p.exists():
+        for _, row in df2.iterrows():
+            rel = str(row.get("keyprenorm_h5_relpath") or "").replace("\\", "/")
+            if not rel.strip():
                 continue
+            p = resolve_registry_path(registry_project_root, row, "keyprenorm_h5_relpath")
             if str(p).lower().endswith((".h5", ".hdf5")) and "metadata" not in p.name.lower():
                 resolved.append(str(p))
 
@@ -167,9 +259,20 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
     if getattr(cfg, "file_filter", None):
         needle = str(getattr(cfg, "file_filter")).lower()
         before = len(h5_files)
-        h5_files = [p for p in h5_files if needle in os.path.basename(p).lower()]
+        h5_files = [p for p in h5_files if needle in original_name(p).lower()]
         h5_files.sort()
         logger.info("Applied file_filter='%s': %d -> %d H5 files", needle, before, len(h5_files))
+
+    from autobehaver.preinf.autocropper.selection import filter_included_paths, propagate_selection
+    selection_output_root = Path(output_dir) if output_dir else input_dir_path
+    selection_output = selection_output_root / "inferences" if use_inferences_subdir else selection_output_root
+    propagate_selection([input_dir_path] + [Path(p).parent for p in h5_files], selection_output)
+    h5_files = filter_included_paths(h5_files)
+    from autobehaver.batch_inputs import select_batch_inputs
+    h5_files = select_batch_inputs(h5_files, getattr(cfg, "file_list", None))
+    missing = [p for p in h5_files if not Path(p).is_file()]
+    if missing:
+        raise FileNotFoundError(f'Selected normalized HDF5 inputs are missing at their declared paths: {missing[:25]}')
 
     if not h5_files:
         if used_registry:
@@ -178,21 +281,52 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
                 "Check that the registry has keyprenorm_h5_relpath entries (run the keyprenorm stage), "
                 "or disable registry for this run."
             )
-        print("No HDF5 files to process in input_dir (after filtering).")
-        return
+        raise FileNotFoundError("No HDF5 files to process in input_dir (after filtering).")
 
-    # Determine expected output locations *before* running inference (for safe registry updates).
+    # Capture compatible existing outputs before inference to classify reuse.
     output_root_for_outputs = Path(output_dir).resolve() if output_dir else input_dir_path
     inference_dir = (output_root_for_outputs / "inferences") if use_inferences_subdir else output_root_for_outputs
     preexisting_outputs: set[str] = set()
+    preexisting_compatible: set[str] = set()
+    from autobehaver.augmentation import TTA_RANDOM_ALGORITHM
+    provenance_settings = {
+        "inf_average": int(cfg.inf_average),
+        "sequence_length_argument": int(cfg.sequence_length),
+        "min_pose_bout": int(cfg.min_pose_bout),
+        "min_orient_bout": int(cfg.min_orient_bout),
+        "use_tta": bool(cfg.use_tta),
+        "tta_noise_level": float(cfg.tta_noise_level),
+        "tta_seed": int(cfg.tta_seed),
+        "tta_random_algorithm": TTA_RANDOM_ALGORITHM,
+        "max_inference_cvs": len(model_paths),
+    }
+    import torch
+    from autobehaver.inference import load_inference_checkpoint
+    checkpoint = load_inference_checkpoint(model_paths[0])
+    variables = checkpoint.get('global_vars', {})
+    expected_heads = {head:list(checkpoint.get(key,{})) for head,key,flag in
+                      [('Pose','pose_dict','pose_pred'),('Orient','orient_dict','orient_pred')]
+                      if variables.get(flag, bool(checkpoint.get(key)))}
+    del checkpoint
+    checkpoint_identities = [_provenance_file_identity(path) for path in model_paths]
+    expected_provenance: dict[str, dict] = {}
     for fp in h5_files:
         stem = Path(fp).stem
-        out_path = inference_dir / f"{stem}_inference.csv"
+        out_path = prediction_path(fp, inference_dir)
+        expected = _build_inference_provenance(
+            fp,
+            model_paths,
+            provenance_settings,
+            checkpoint_identities=checkpoint_identities,
+        )
+        expected_provenance[fp] = expected
         if out_path.exists():
             try:
                 preexisting_outputs.add(str(out_path.resolve()))
             except Exception:
                 preexisting_outputs.add(str(out_path))
+            if _completed_inference_matches(str(out_path) + ".provenance.json", expected):
+                preexisting_compatible.add(fp)
 
     # Optional run log.
     if cfg.write_run_log:
@@ -210,9 +344,12 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
             "archive_existing": bool(cfg.archive_existing),
             "num_workers": int(cfg.num_workers),
             "batch": int(cfg.batch),
+            "memory_gb": cfg.memory_gb, "noise_workers": cfg.noise_workers, "vram_fraction": cfg.vram_fraction,
             "inf_average": int(cfg.inf_average),
             "use_tta": bool(cfg.use_tta),
             "tta_noise_level": float(cfg.tta_noise_level),
+            "tta_seed": int(cfg.tta_seed),
+            "tta_random_algorithm": TTA_RANDOM_ALGORITHM,
             "min_pose_bout": int(cfg.min_pose_bout),
             "min_orient_bout": int(cfg.min_orient_bout),
             "sequence_length_fallback": int(cfg.sequence_length),
@@ -224,28 +361,66 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
             # Never fail the run just because logging failed.
             print(f"[WARN] Could not write run log: {log_path} ({e})")
 
-    run_inference(
-        directory=input_dir,
-        inference_model_paths=model_paths,
-        num_workers=int(cfg.num_workers),
-        batch=int(cfg.batch),
-        inf_average=int(cfg.inf_average),
-        sequence_length=int(cfg.sequence_length),
-        min_pose_bout=int(cfg.min_pose_bout),
-        min_orient_bout=int(cfg.min_orient_bout),
-        use_tta=bool(cfg.use_tta),
-        tta_noise_level=float(cfg.tta_noise_level),
-        output_dir=output_dir,
-        file_filter=None,  # already applied above
-        clobber=bool(cfg.clobber),
-        archive_existing=bool(cfg.archive_existing),
-        use_inferences_subdir=bool(use_inferences_subdir),
-        explicit_files=list(h5_files),
+    validation = StageValidationReport.for_items(
+        "posepred_inference",
+        h5_files,
+        metadata={
+            "output_directory": str(inference_dir),
+            "model_count": len(model_paths),
+        },
     )
+    try:
+        run_inference(
+            directory=input_dir,
+            inference_model_paths=model_paths,
+            num_workers=int(cfg.num_workers),
+            batch=int(cfg.batch),
+            memory_gb=cfg.memory_gb, noise_workers=cfg.noise_workers, vram_fraction=cfg.vram_fraction,
+            inf_average=int(cfg.inf_average),
+            sequence_length=int(cfg.sequence_length),
+            min_pose_bout=int(cfg.min_pose_bout),
+            min_orient_bout=int(cfg.min_orient_bout),
+            use_tta=bool(cfg.use_tta),
+            tta_noise_level=float(cfg.tta_noise_level),
+            tta_seed=int(cfg.tta_seed),
+            output_dir=output_dir,
+            file_filter=None,  # already applied above
+            clobber=bool(cfg.clobber),
+            archive_existing=bool(cfg.archive_existing),
+            use_inferences_subdir=bool(use_inferences_subdir),
+            explicit_files=list(h5_files),
+        )
+    except Exception as exc:
+        for fp in h5_files:
+            validation.add_outcome(fp, "failed", reason=f"inference aborted: {exc}")
+        validation.write_run_reports(output_root_for_outputs / "POSEPRED_VALIDATION.json")
+        raise
 
-    # -------------------------
-    # Registry update (best-effort)
-    # -------------------------
+    verified_sources = []
+    for fp in h5_files:
+        output_csv = prediction_path(fp, inference_dir)
+        manifest_path = str(output_csv) + ".provenance.json"
+        if not _completed_inference_matches(manifest_path, expected_provenance[fp]):
+            validation.add_outcome(
+                fp,
+                "failed",
+                reason="output provenance is missing, incompatible, or does not match published files",
+                details={"output": str(output_csv)},
+            )
+            continue
+        ok, reason, details = _validate_inference_csv(fp, output_csv, expected_heads)
+        if ok:
+            verified_sources.append(fp)
+        reused = fp in preexisting_compatible and not cfg.clobber
+        validation.add_outcome(
+            fp,
+            "failed" if not ok else ("reused" if reused else "succeeded"),
+            reason=reason if not ok else ("existing output and provenance matched" if reused else None),
+            details={"output": str(output_csv), **details},
+        )
+
+    # Registry update
+    registry_error: str | None = None
     if bool(getattr(cfg, "registry_enabled", False)) and registry_csv_path and registry_project_root:
         try:
             from .registry_update import update_registry_from_posepred_inference_outputs
@@ -253,14 +428,25 @@ def run_posepred_inference(cfg: PosePredInferenceConfig) -> None:
             update_registry_from_posepred_inference_outputs(
                 registry_csv=Path(registry_csv_path),
                 project_root=Path(registry_project_root),
-                normalized_h5_files=[Path(p) for p in h5_files],
+                normalized_h5_files=[Path(p) for p in verified_sources],
                 output_root=output_root_for_outputs,
                 use_inferences_subdir=bool(use_inferences_subdir),
                 model_paths=model_paths,
-                only_set_models_if_new=not bool(cfg.clobber),
+                only_set_models_if_new=False,
                 existing_outputs_before=preexisting_outputs,
                 lock_timeout_sec=int(getattr(cfg, "registry_lock_timeout_sec", 120)),
                 lock_stale_sec=int(getattr(cfg, "registry_lock_stale_sec", 60 * 60)),
             )
-        except Exception:
+        except Exception as exc:
+            registry_error = str(exc)
             logger.exception("Registry update (posepred_inference) failed")
+
+    if registry_error is not None:
+        validation.add_issue(
+            "registry_update_failed",
+            "error",
+            "Inference outputs were created, but the project registry could not be updated.",
+            details={"error": registry_error},
+        )
+    validation.write_run_reports(output_root_for_outputs / "POSEPRED_VALIDATION.json")
+    validation.raise_for_errors()
