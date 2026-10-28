@@ -75,18 +75,24 @@ def load_name_maps(directory, *, refresh=False):
     cached = indexes.get(key)
     if not refresh and cached is not None and cached[0] == signature:
         return cached[1]
-    values = {}
-    originals = {}
-    # Each native map is immutable and published whole. A directory snapshot
-    # remains usable while unrelated maps arrive; tag it with the starting
-    # signature so the next discovery refreshes if publication overlapped.
-    for path in (Path(directory) / '_names').glob('*.json'):
-        item = _read_name_map(path)
-        short_key = item['short_name'].casefold()
-        if short_key in values and values[short_key] != item['original_name']:
-            raise ValueError(f'Conflicting filename maps: {item["short_name"]}')
-        values[short_key] = item['original_name']
-        originals.setdefault(item['original_name'], set()).add(item['short_name'])
+    # Retry an overlapping publication, without waiting indefinitely for a
+    # busy writer. If all attempts overlap, retain the last starting signature
+    # so the next discovery refreshes the immutable-map snapshot again.
+    for attempt in range(3):
+        values = {}
+        originals = {}
+        for path in (Path(directory) / '_names').glob('*.json'):
+            item = _read_name_map(path)
+            short_key = item['short_name'].casefold()
+            if short_key in values and values[short_key] != item['original_name']:
+                raise ValueError(f'Conflicting filename maps: {item["short_name"]}')
+            values[short_key] = item['original_name']
+            originals.setdefault(item['original_name'], set()).add(item['short_name'])
+        after = _map_signature(directory)
+        if after == signature:
+            break
+        if attempt < 2:
+            signature = after
     indexes[key] = (signature, values, originals)
     _KNOWN_NAMES.update(values)
     return values

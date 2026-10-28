@@ -36,11 +36,11 @@ def test_shared_crop_matches_single_encodes_and_preserves_drift(tmp_path, monkey
     paths = {f'chamber{i}': tmp_path / f'chamber{i}.mp4' for i in (1, 2)}
     coords = {'chamber1': (32, 32), 'chamber2': (96, 64), 'chamber3': (64, 48)}
     commands = []
-    actual_run = cropping.subprocess.run
+    actual_run = cropping.run_ffmpeg
     def traced_run(command, **kwargs):
         commands.append(command)
         return actual_run(command, **kwargs)
-    monkeypatch.setattr(cropping.subprocess, 'run', traced_run)
+    monkeypatch.setattr(cropping, 'run_ffmpeg', traced_run)
     args = SimpleNamespace(timeout=20, crop_crf=16, ffmpeg_threads=1, max_workers=cap)
     result = cropping.crop_chambers_in_parallel(source, coords, paths, 48, args, source_size=(128, 96))
     assert set(result) == {'chamber1', 'chamber2'}
@@ -70,7 +70,7 @@ def test_failed_shared_crop_preserves_prior_movie(tmp_path, monkeypatch):
     def fail(command, **kwargs):
         Path(command[-1]).write_bytes(b'partial')
         raise subprocess.CalledProcessError(1, command, stderr='fixture failure')
-    monkeypatch.setattr(cropping.subprocess, 'run', fail)
+    monkeypatch.setattr(cropping, 'run_ffmpeg', fail)
     result = cropping.crop_chambers_in_parallel(source, {'chamber1':(32,32)}, {'chamber1':output}, 48,
         SimpleNamespace(timeout=10, crop_crf=16, max_workers=6), source_size=(128,96))
     assert result['chamber1'].startswith('failed:')
@@ -88,7 +88,7 @@ def test_shared_crop_rejects_source_modified_during_encoding(tmp_path, monkeypat
         source.write_bytes(b'changed source during encoding')
         Path(command[-1]).write_bytes(b'encoded crop')
         return subprocess.CompletedProcess(command, 0)
-    monkeypatch.setattr(cropping.subprocess, 'run', mutate)
+    monkeypatch.setattr(cropping, 'run_ffmpeg', mutate)
     result = cropping.crop_chambers_in_parallel(source, {'chamber1':(32,32)}, {'chamber1':output}, 48,
         SimpleNamespace(timeout=10, crop_crf=16, max_workers=6), source_size=(128,96))
     assert result['chamber1'].startswith('failed:') and not output.exists()

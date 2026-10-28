@@ -102,7 +102,7 @@ def test_gui_and_native_builder_support_dlc_start_and_record_parallelism(tmp_pat
     try:
         window.apply_values({'start_at': 'features'})
         assert window.fields['start_at'].currentData() == 'features'
-        assert window.fields['feature_workers'].value() == 0
+        assert window.fields['feature_workers'].value() == 8
         assert not window.fields['crop_cpu'].isEnabled()
         assert not window.fields['dlc_cpu'].isEnabled()
         assert not window.fields['moviechecker_mode'].isEnabled()
@@ -139,8 +139,8 @@ def test_automatic_workers_use_gui_allocation_and_migrate_old_defaults(tmp_path,
     coordinate_csv(Path(config['dataset'])/'3_dlc'/'CONTROL_MALE_exp_trial1_rpi-1_movie0_chamber1DLCmodel.csv')
     window = make_window(tmp_path/'state')
     try:
-        assert window.fields['features_cpu'].value() == 8
-        assert window.fields['features_ram'].value() == 32
+        assert window.fields['features_cpu'].value() == 10
+        assert window.fields['features_ram'].value() == 16
         window.apply_values({'feature_workers': 2, 'features_cpu': 4, 'features_ram': 64})
         assert window.fields['feature_workers'].value() == 0
         assert window.fields['features_cpu'].value() == 8

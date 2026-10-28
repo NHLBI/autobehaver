@@ -165,7 +165,7 @@ class GuiTests(unittest.TestCase):
             for kind,overrides in [
                 ('pipeline',{'dataset':str(tmp/'space project'),'pp_batch':128,'pp_use_tta':False,'pp_tta_noise_level':.005,'pp_vram_fraction':.7}),
                 ('featureimp',{'dataset':str(tmp),'group_a':'WT','group_b':'Mut','control_group':'WT','fi_override':True,
-                              'fi_dataset':str(tmp),'matrix':str(tmp/'custom.csv'),'fi_opt_fsea_fdr_threshold':.15,
+                              'fi_dataset':str(tmp),'matrix':str(tmp/'custom.csv'),'fi_opt_fsea_fdr_threshold':.1,
                               'selected_identities':[['a','WT','male'],['b','Mut','male']]}),
                 ('training',{'training_directory':str(tmp),'train_opt_batch':'256','train_opt_base_lr':'0.00002'})]:
                 with self.subTest(kind=kind):

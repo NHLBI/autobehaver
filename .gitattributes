@@ -1,2 +1,4 @@
 # Preserve release checksums and executable-script line endings on every platform.
 * -text
+*.sh text eol=lf
+*.sbatch text eol=lf

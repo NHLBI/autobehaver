@@ -142,7 +142,7 @@ def test_fused_commit_verification_reads_scientific_table_once(tmp_path, monkeyp
     original = pd.HDFStore.select
     scans = []
     def observe(self, key, *args, **kwargs):
-        if kwargs.get('iterator'):
+        if kwargs.get('iterator') or kwargs.get('stop', 0) > kwargs.get('start', 0):
             scans.append(key)
         return original(self, key, *args, **kwargs)
     monkeypatch.setattr(pd.HDFStore, 'select', observe)

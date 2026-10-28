@@ -119,6 +119,8 @@ if __name__ == '__main__':
     else:
         raise AssertionError('Missing worker failure')
 ''', encoding='utf-8')
-    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=40)
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parents[1]), env.get('PYTHONPATH')]))
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=40, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'Worker death reported' in result.stdout

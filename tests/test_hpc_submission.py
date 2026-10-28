@@ -12,6 +12,15 @@ import unittest
 
 PACKAGE = Path(__file__).resolve().parents[1]
 TEMPLATES = PACKAGE / "scripts/hpc"
+
+
+def test_linux_shell_templates_have_unix_line_endings():
+    paths = sorted(TEMPLATES.glob('*.sh')) + sorted(TEMPLATES.glob('*.sbatch'))
+    assert paths
+    for path in paths:
+        assert b'\r' not in path.read_bytes(), f'Linux shell template has CRLF: {path.name}'
+
+
 spec = importlib.util.spec_from_file_location("hpc_prepare", TEMPLATES / "prepare.py")
 prepare = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prepare)

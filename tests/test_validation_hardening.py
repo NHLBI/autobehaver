@@ -38,9 +38,11 @@ def test_keypre_output_must_match_dlc_frame_count(tmp_path) -> None:
     source = tmp_path / "source.csv"
     pd.DataFrame(np.ones((4, 4)), columns=columns).to_csv(source)
     output = tmp_path / "output.csv"
-    pd.DataFrame({"feature": [1.0, 2.0, 3.0]}).to_csv(output, index=False)
+    from autobehaver.preinf.keypre.spec import parts
+    columns = [f'{part}_{coord}_raw' for part in parts for coord in ('x', 'y', 'likelihood')]
+    pd.DataFrame(np.ones((3, len(columns))), columns=columns).to_csv(output, index=False)
 
-    ok, reason, _rows, _columns = inspect_keypre_output(str(source), str(output))
+    ok, reason, _rows, _columns = inspect_keypre_output(str(source), str(output), raw_only=True)
     assert not ok
     assert "row count" in reason
 

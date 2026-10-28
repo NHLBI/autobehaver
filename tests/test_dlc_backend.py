@@ -115,7 +115,14 @@ def test_external_backend_does_not_import_host_tensorflow(monkeypatch, tmp_path)
     monkeypatch.setattr(core, "_require_deeplabcut", lambda: pytest.fail("external backend imported host DLC"))
     monkeypatch.setattr(core, "_prepare_portable_dlc_config", lambda path: path)
     cfg = DLCInferencerConfig(input_dir=str(tmp_path), dlc_config="config.yaml", dlc_python="python-DLC")
-    assert core.run_dlc(cfg) == 2
+    (tmp_path / 'movie.mp4').touch()
+    class BackendSelected(Exception):
+        pass
+    def stop_after_backend_selection(*args):
+        raise BackendSelected()
+    monkeypatch.setattr(core, 'model_identity', stop_after_backend_selection)
+    with pytest.raises(BackendSelected):
+        core.run_dlc(cfg)
     assert loaded == ["python-DLC"]
 
 

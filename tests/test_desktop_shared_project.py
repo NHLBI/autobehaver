@@ -109,6 +109,7 @@ def test_changed_matrix_blocks_build_before_job_preparation(gui, tmp_path, monke
     window.fields['dataset'].setText(str(project)); window.tabs.setCurrentIndex(1)
     window.auto_load_featureimp()
     until(app, lambda: window.loaded_matrix is not None and not window.busy)
+    window.apply_values(dict(group_a='control', group_b='mutant', control_group='control'))
     def unexpected(*args):
         pytest.fail('Changed matrix must not build a job')
     monkeypatch.setattr(desktop_jobs, 'build_job', unexpected)

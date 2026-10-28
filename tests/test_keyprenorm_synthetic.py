@@ -68,10 +68,12 @@ class TestKeypreNormSynthetic(unittest.TestCase):
                 "const": 0.0,
             }
 
-            # log_queue is required by the API; we can provide a dummy Queue.
-            import multiprocessing as mp
+            # Direct worker initialization changes this process's logging.
+            # Own a consumer and restore logging even when an assertion fails.
+            from autobehaver.preinf.keyprenorm.logging_utils import setup_logging_queue
 
-            q = mp.Queue(-1)
+            q, listener = setup_logging_queue(log_level="ERROR", log_file=None)
+            self.addCleanup(listener.stop)
             norm_df = calculate_normalization_params(
                 csv_files=good,
                 canonical_columns=canonical_cols,

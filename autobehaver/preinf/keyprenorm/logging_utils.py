@@ -10,6 +10,42 @@ import multiprocessing as mp
 from typing import List, Optional, Tuple
 
 
+class _OwnedQueueListener(QueueListener):
+    """Restore caller logging and release the stage's queue when it stops."""
+
+    def __init__(self, queue, *handlers, **kwargs):
+        super().__init__(queue, *handlers, **kwargs)
+        root = logging.getLogger()
+        self._previous_handlers = list(root.handlers)
+        self._previous_level = root.level
+        logger = logging.getLogger("keyprenorm")
+        self._previous_logger_state = (logger.level, logger.propagate)
+        self._closed = False
+
+    def stop(self):
+        if self._closed:
+            return
+        # No later message may enter a queue whose consumer has stopped.
+        root = logging.getLogger()
+        other_handlers = [handler for handler in root.handlers
+                          if not (isinstance(handler, QueueHandler)
+                                  and handler.queue is self.queue)
+                          and handler not in self._previous_handlers]
+        root.handlers[:] = self._previous_handlers + other_handlers
+        root.setLevel(self._previous_level)
+        logger = logging.getLogger("keyprenorm")
+        logger.setLevel(self._previous_logger_state[0])
+        logger.propagate = self._previous_logger_state[1]
+        try:
+            super().stop()
+        finally:
+            self.queue.close()
+            self.queue.join_thread()
+            for handler in self.handlers:
+                handler.close()
+            self._closed = True
+
+
 def _parse_log_level(level_str: str) -> int:
     """Resolve a logging level name or raise for an invalid name."""
     level = getattr(logging, str(level_str).upper(), None)
@@ -46,7 +82,7 @@ def setup_logging_queue(*, log_level: str, log_file: Optional[str]) -> Tuple[mp.
         fh.setLevel(level)
         handlers.append(fh)
 
-    listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
+    listener = _OwnedQueueListener(log_queue, *handlers, respect_handler_level=True)
     listener.start()
 
     root = logging.getLogger()

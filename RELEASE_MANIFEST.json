@@ -6,19 +6,19 @@
     "RELEASE_MANIFEST.json",
     "SHA256SUMS"
   ],
-  "file_count": 470,
-  "bytes": 6170885,
-  "python_modules_parsed": 425,
+  "file_count": 471,
+  "bytes": 6173893,
+  "python_modules_parsed": 426,
   "files": [
     {
       "path": ".gitattributes",
-      "bytes": 91,
-      "sha256": "512e8d1e9cc86f0cc2de6450b7c05eaac08ca79697461a2cb94042c2507f8e13"
+      "bytes": 129,
+      "sha256": "1579a29d9a312b8ee12ac9570d51c26d86ff5b525c670304e1e4d5a931568283"
     },
     {
       "path": ".github/workflows/ci.yml",
-      "bytes": 2336,
-      "sha256": "dfbf283c591fa6daf6fd6204960e36a5f4e8f488f8810c739d8f00a73f9b9e21"
+      "bytes": 2529,
+      "sha256": "1193bf37893e933a80d352c2a5e921be8b85de9d7fdfdadd066533936d08493f"
     },
     {
       "path": ".gitignore",
@@ -287,8 +287,8 @@
     },
     {
       "path": "autobehaver/portable_paths.py",
-      "bytes": 11733,
-      "sha256": "56247f605be8361bcdf857da22a54255dbf848b3ef8d149c1c387a704ec0f2f4"
+      "bytes": 11948,
+      "sha256": "d87d95880d3d2e1c2326cac197d5f365aa50db89e653ee5dbf054f8e89bccf2f"
     },
     {
       "path": "autobehaver/postinf/__init__.py",
@@ -737,8 +737,8 @@
     },
     {
       "path": "autobehaver/postinf/mmgen/occupancy.py",
-      "bytes": 45345,
-      "sha256": "4e1d19e5a9b1c44d3249fc596d8f5695b7a08a785a179e42d984aeba612eb7e0"
+      "bytes": 45492,
+      "sha256": "5555478fed8d37210d475613ac83db068c5dc2354fc6e06bc52019e0ebfd2ce8"
     },
     {
       "path": "autobehaver/postinf/mmgen/pipeline.py",
@@ -1027,8 +1027,8 @@
     },
     {
       "path": "autobehaver/preinf/keypre/core.py",
-      "bytes": 22661,
-      "sha256": "8fa96b2ed3c5b95643641317f9f3c65b17eefd02e37f1a9bcf6bb82d7ab0bc48"
+      "bytes": 22750,
+      "sha256": "7dde9801018795648beb29ef09ace52f15c76588f8438a02c7a9ea5ab7ab4f3c"
     },
     {
       "path": "autobehaver/preinf/keypre/dlc_io.py",
@@ -1157,8 +1157,8 @@
     },
     {
       "path": "autobehaver/preinf/keyprenorm/logging_utils.py",
-      "bytes": 2416,
-      "sha256": "af7c722bc9e31880fac1ad28f4b2d99e9b1de54afaa0087aa3d0c8a55c7c454e"
+      "bytes": 3913,
+      "sha256": "309204451988179c701cb78ff8f24be9e25ed48c7375d6b046ac915120a4fa20"
     },
     {
       "path": "autobehaver/preinf/keyprenorm/manifest.py",
@@ -1387,8 +1387,8 @@
     },
     {
       "path": "docs/VALIDATION.md",
-      "bytes": 5084,
-      "sha256": "27e2e6fae49860c2a035ee55d0b361c43dbee97f9e341b985c2796f78091b7ca"
+      "bytes": 5249,
+      "sha256": "9a2fbcaccb922191c589927626fc776d1332470cd17fbd917741d446a4670b81"
     },
     {
       "path": "docs/featureimp-desktop.md",
@@ -1512,8 +1512,8 @@
     },
     {
       "path": "scripts/hpc/submit.sh",
-      "bytes": 11767,
-      "sha256": "de13475caa904ffbb5070805e27ef0e537027e6144c3eeb0d6a968aaf09f314c"
+      "bytes": 11551,
+      "sha256": "1bf5b60c570a7db1294bc4de71efe39d7c403f89e239d20c60b2776d02fd81cf"
     },
     {
       "path": "scripts/release_inventory.py",
@@ -1607,8 +1607,8 @@
     },
     {
       "path": "tests/test_desktop_agent.py",
-      "bytes": 15029,
-      "sha256": "afe7b8c3007c73ecbe72987cdad2152921ecabd380c6b33c27e1b7c5415ebc1e"
+      "bytes": 15027,
+      "sha256": "96d35801cb55912645aa4319c4d7c6bcbf3ed50dbc156064a19381155958eef1"
     },
     {
       "path": "tests/test_desktop_drafts.py",
@@ -1642,8 +1642,8 @@
     },
     {
       "path": "tests/test_desktop_shared_project.py",
-      "bytes": 6380,
-      "sha256": "3852b0fbd58665d966b53fa9766cc378b90ebc142ec1424da130e252bf68bd6b"
+      "bytes": 6472,
+      "sha256": "81b08c8f9b07ecff90beb0e5d10094d0038c0bc9fecde7e44b2e70b6970bacde"
     },
     {
       "path": "tests/test_desktop_ssh.py",
@@ -1667,8 +1667,8 @@
     },
     {
       "path": "tests/test_dlc_backend.py",
-      "bytes": 8601,
-      "sha256": "6cf817e0bfa0bcf4f431293627345a37bbf9fdb9bae2f900e406167c66dc7410"
+      "bytes": 8877,
+      "sha256": "b09ee3477b0dce7008e431c3da5602d88cb833deac33806479553a687a63bf28"
     },
     {
       "path": "tests/test_dlc_completion.py",
@@ -1687,8 +1687,8 @@
     },
     {
       "path": "tests/test_dlc_restart.py",
-      "bytes": 8487,
-      "sha256": "411b350b20adbd7562ee478b95fa0443e38d9e1ab51a55ac6e37e6f79ba91128"
+      "bytes": 8365,
+      "sha256": "8c2fa8105da5a241bef75bdd9ad09e937368973f7a611273ff2340ed906979f2"
     },
     {
       "path": "tests/test_environment_monitoring_requirement.py",
@@ -1887,8 +1887,8 @@
     },
     {
       "path": "tests/test_hpc_submission.py",
-      "bytes": 19752,
-      "sha256": "8b7d068a9a4ddb864cfe6c781879c780769dde0e119e6293724d050ebf835693"
+      "bytes": 20035,
+      "sha256": "3d1ab5143d1655a43d498d87d212cf019dde80a39defd25cabb86c3550793a1c"
     },
     {
       "path": "tests/test_imports.py",
@@ -1936,14 +1936,19 @@
       "sha256": "f7407a70cbfa7260545fe623154c43f7f7e73c499c4d7d76413fb13522a4ddbd"
     },
     {
+      "path": "tests/test_keyprenorm_logging.py",
+      "bytes": 2832,
+      "sha256": "fd210fc45445b55deab5057d4a4b78ae4104db4786e3391ff23463349216a266"
+    },
+    {
       "path": "tests/test_keyprenorm_output_layout.py",
       "bytes": 1413,
       "sha256": "04a466b7a4cd43deb6141dda9ae961bb7b03cb74ceae35d191989866dc6f33da"
     },
     {
       "path": "tests/test_keyprenorm_synthetic.py",
-      "bytes": 6241,
-      "sha256": "d51d4d15afd9fe642d1d9f29cf4f64544924d160930faa904ad0b4532b1c5a65"
+      "bytes": 6454,
+      "sha256": "cdea464dff7deba1cbf8363ef5ef8687cc3f66932a903f5c298f935a2b284679"
     },
     {
       "path": "tests/test_kinematics.py",
@@ -1997,8 +2002,8 @@
     },
     {
       "path": "tests/test_mmgen_keypre_contract_fix.py",
-      "bytes": 10491,
-      "sha256": "d98aea67297dd2c32b94d04fb318a9be82f17e8d6d0bc183a4ce6f2e80f23e7d"
+      "bytes": 10501,
+      "sha256": "609401806f0a476b4f4fa0f8bba935b71051478aac352b6fd7ebbe37a91e21dc"
     },
     {
       "path": "tests/test_mmgen_ledger.py",
@@ -2012,8 +2017,8 @@
     },
     {
       "path": "tests/test_mmgen_memory_bounds.py",
-      "bytes": 5954,
-      "sha256": "1b9fa02ec4716e84ffffb448a9e560dbd39b5ce5c6369f1078ad24362c7fa52b"
+      "bytes": 6112,
+      "sha256": "3e21d7a83ab09a8da372b58ac9fe225fdf157449607b4a1fd137503192a7ddda"
     },
     {
       "path": "tests/test_mmgen_output_modes.py",
@@ -2067,8 +2072,8 @@
     },
     {
       "path": "tests/test_mmgen_report_workers.py",
-      "bytes": 5901,
-      "sha256": "6817ee243ecad61e42764bedb8efceca567634289e551c9203e5299ee3e4338d"
+      "bytes": 2926,
+      "sha256": "39f2fb0c5a571a43d52e598590fc273c712bcf7b0ea024b5f996f0c83f590b09"
     },
     {
       "path": "tests/test_mmgen_runtime_settings_contract.py",
@@ -2202,8 +2207,8 @@
     },
     {
       "path": "tests/test_preinf_audit_repairs.py",
-      "bytes": 11752,
-      "sha256": "0bfd0ae98be17f90a68e20024fd426729b217c634d34b7e8bcd5325c4d889bbe"
+      "bytes": 11624,
+      "sha256": "347711e4c8c20f96a98b5f558ae9cd3dc76509204e3fafc0d540189a9089686b"
     },
     {
       "path": "tests/test_preinf_direct_cli.py",
@@ -2222,8 +2227,8 @@
     },
     {
       "path": "tests/test_preprocessing_efficiency.py",
-      "bytes": 11585,
-      "sha256": "027bfde723f8da936fca77e8a5a186080da1afde6ba5e4cbb5e5a0c2eb079fb8"
+      "bytes": 11635,
+      "sha256": "33d63d4533080f6dafe4b3adb7797eb4c20593325d564485ceae031aca5c7844"
     },
     {
       "path": "tests/test_preprocessing_memory.py",
@@ -2312,8 +2317,8 @@
     },
     {
       "path": "tests/test_shared_repair_contracts.py",
-      "bytes": 6758,
-      "sha256": "cbfff9f4d678679431859a1e684f14fa009f9e08a502d5f60f7fb323236cc80a"
+      "bytes": 6790,
+      "sha256": "03000b40be04b90204b469a76228499f15e47bdd909ddccb1b2b0c6018b07233"
     },
     {
       "path": "tests/test_source_distribution.py",
@@ -2347,8 +2352,8 @@
     },
     {
       "path": "tests/test_validation_hardening.py",
-      "bytes": 10082,
-      "sha256": "a6b5948285a0d127a864b58a56a671e9ed169e93ce465f36c37fafd2aabc58a1"
+      "bytes": 10259,
+      "sha256": "db7b5b68a876827b8d01940bea2c0c9a195366853242e21d731663668a647d99"
     },
     {
       "path": "tests/test_variable_length_and_recorded_occupancy.py",
@@ -2357,8 +2362,8 @@
     },
     {
       "path": "tests/test_video_efficiency.py",
-      "bytes": 11614,
-      "sha256": "a0f975e297300192b16c1229e704cf0fd7b928cb824a76ac2b93c718582e693b"
+      "bytes": 11598,
+      "sha256": "fd3824b8c724878ec1c3d23f27b92404cedc2cb410ad164931f824687cabfe8e"
     }
   ]
 }

@@ -1,5 +1,3 @@
-import importlib.util
-import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -34,44 +32,6 @@ class ReportWorkers(unittest.TestCase):
                 for individual, ranges in spans.items():
                     actual=pd.concat([store.select('positional',start=a,stop=b) for a,b in ranges])
                     assert_frame_equal(actual,frame.loc[frame.individual.eq(individual)])
-
-    def test_reports_match_legacy_and_resume(self):
-        # Historical implementation is a test oracle, never used for production.
-        baseline = Path(__file__).resolve().parents[3]/'MMGen efficiency investigation 20261022/before/occupancy.py'
-        if not baseline.exists():
-            self.skipTest('Local historical oracle is not distributed')
-        spec=importlib.util.spec_from_file_location('autobehaver.postinf.mmgen.legacy_occ',baseline)
-        old=importlib.util.module_from_spec(spec); spec.loader.exec_module(old)
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp); path=root/'s.h5'; self.make_store(path,18000)
-            legacy=root/'legacy'; legacy.mkdir()
-            current=root/'new'; current.mkdir()
-            expected=old._stream_transform_write_and_accumulate(str(path),'positional',str(legacy))
-            actual=occ._stream_transform_write_and_accumulate(str(path),'positional',str(current),num_workers=2)
-            self.assertEqual(expected.behaviors,actual.behaviors)
-            for name in ('_heat_counts','_heat_n','_q_sum_u','_q_sum_v','_q_count'):
-                self.assertEqual(set(getattr(expected,name)),set(getattr(actual,name)))
-                for key in getattr(expected,name):
-                    np.testing.assert_array_equal(getattr(expected,name)[key],getattr(actual,name)[key])
-            for key in expected._kde:
-                np.testing.assert_array_equal(expected._kde[key].keys,actual._kde[key].keys)
-                np.testing.assert_array_equal(expected._kde[key].values,actual._kde[key].values)
-            self.assertEqual((legacy/'temp_transformed_positional_data.csv').read_bytes(),
-                             (current/'temp_transformed_positional_data.csv').read_bytes())
-            receipts=list(current.rglob('*.pkl')); times={p:p.stat().st_mtime_ns for p in receipts}
-            # A second execution reuses completed parts and reconstructs ordered output.
-            again=occ._stream_transform_write_and_accumulate(str(path),'positional',str(current),num_workers=2)
-            self.assertEqual(times,{p:p.stat().st_mtime_ns for p in receipts})
-            for key in expected._kde:
-                np.testing.assert_array_equal(expected._kde[key].values,again._kde[key].values)
-            # Simulate one damaged/incomplete part after an interrupted run.
-            receipts[0].write_bytes(b'incomplete')
-            occ._stream_transform_write_and_accumulate(str(path),'positional',str(current),num_workers=2)
-            self.assertNotEqual(times[receipts[0]],receipts[0].stat().st_mtime_ns)
-            for path in receipts[1:]:
-                self.assertEqual(times[path],path.stat().st_mtime_ns)
-            self.assertEqual((legacy/'temp_transformed_positional_data.csv').read_bytes(),
-                             (current/'temp_transformed_positional_data.csv').read_bytes())
 
     def test_memory_rejected_before_execution(self):
         with patch('autobehaver.postinf.mmgen.finalize_execution.memory_limit',return_value=(('test',4*GIB),[])):

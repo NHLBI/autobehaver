@@ -148,14 +148,10 @@ def test_failed_keypre_input_is_not_registered(tmp_path, monkeypatch):
     source.write_text('fixture')
     registry = tmp_path / 'registry.csv'
     upsert_registry_rows(csv_path=registry, rows=[{'recording_id': 'a', 'dlc_csv_relpath': source.name}])
-    class FailedPool:
-        def __init__(self, **kwargs): pass
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-        def map(self, function, files):
-            return [{'status': 'failed', 'file': file, 'error': 'synthetic failure'} for file in files]
+    def failed_workers(function, files, **kwargs):
+        return iter({'status': 'failed', 'file': file, 'error': 'synthetic failure'} for file in files)
     seen = []
-    monkeypatch.setattr(core, 'Pool', FailedPool)
+    monkeypatch.setattr(core, 'execute_workers', failed_workers)
     monkeypatch.setattr(registry_update, 'update_registry_from_keypre_outputs', lambda **kwargs: seen.extend(kwargs['dlc_csv_files']))
     cfg = KeypreConfig(input_dir=str(tmp_path), output_dir=str(tmp_path / 'out'), clobber=True,
         registry_enabled=True, registry_csv=str(registry))

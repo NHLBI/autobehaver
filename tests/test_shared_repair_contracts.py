@@ -135,6 +135,7 @@ def test_batch_reports_survive_later_batches(tmp_path):
 
 
 def test_scratch_cleanup_error_preserves_success_and_warns(tmp_path, monkeypatch, caplog):
+    caplog.set_level('WARNING')
     def cannot_delete(path):
         raise PermissionError('sharing conflict')
     with monkeypatch.context() as context:

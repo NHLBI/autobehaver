@@ -109,7 +109,7 @@ def test_featureimp_groups_include_corrected_names_and_keep_legacy_names():
 
 def test_sequential_hdf_transform_agrees_with_individual_transform(tmp_path):
     df=pd.DataFrame({'centroid_x':[399.5,299.5,199.5,299.5],'centroid_y':[299.5,399.5,299.5,199.5],'angle':[90.,180.,270.,0.],'individual':['G_FEMALE_rpi-1_trial1_chamber1']*4,'group':['G']*4,'masked_pose':['Walking']*4,'masked_orient':['Floor']*4,'masked_pose_orient':['Walking + Floor']*4,'frame_idx':np.arange(4)})
-    for c in df.select_dtypes(include=['str','object']).columns:df[c]=df[c].astype(object)
+    for c in [c for c in df if pd.api.types.is_string_dtype(df[c].dtype)]:df[c]=df[c].astype(object)
     store=tmp_path/'positional.h5';df.to_hdf(store,key='positional',format='table',data_columns=['individual'])
     output=tmp_path/'transformed.csv'
     occ._stream_transform_write_and_accumulate(str(store),'positional',str(tmp_path),chamber_diameter_px=530,generate_quiver_plots=True,transformed_output_path=str(output))

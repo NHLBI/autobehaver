@@ -190,18 +190,19 @@ def run_keypre(*, cfg: KeypreConfig, args: argparse.Namespace | None = None) -> 
         out_dir_name = "raw_positional_calcs" if getattr(cfg, "raw_only", False) else "positional_calcs"
         out_dir = os.path.join(input_folder, out_dir_name)
     completion_details(output=out_dir)
+    from autobehaver.portable_paths import original_name, recording_name
+    planned = {}
+    for csv_file in csv_files:
+        target = recording_name(Path(original_name(csv_file)).stem).casefold()
+        if target in planned and planned[target] != csv_file:
+            raise ValueError(f'Multiple DLC inputs map to the same recording output: {planned[target]}; {csv_file}. Select one DLC result per recording.')
+        planned[target] = csv_file
     if cfg.dry_run:
         completion_details(status='dry run complete')
         logger.info('Dry run: discovered %d CSV file(s); planned output: %s', len(csv_files), out_dir)
         return
     os.makedirs(out_dir, exist_ok=True)
     propagate_selection(selection_sources, output_selection_dir)
-    planned = {}
-    for csv_file in csv_files:
-        target = str(output_path(csv_file, out_dir)).casefold()
-        if target in planned and planned[target] != csv_file:
-            raise ValueError(f'Multiple DLC inputs map to the same recording output: {planned[target]}; {csv_file}. Select one DLC result per recording.')
-        planned[target] = csv_file
 
     # Optional: pre-skip jobs if outputs already exist and clobber is False.
     # Validate compatible outputs before scheduling workers.

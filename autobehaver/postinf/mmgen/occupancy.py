@@ -328,10 +328,13 @@ def _stream_transform_write_and_accumulate(
     ]
 
     from .finalize_execution import prepare_report_tasks, budgeted_results, report_part, merge_reduction
-    with pd.HDFStore(temp_store_path, mode="r") as store:
-        cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
-    tasks, estimates = prepare_report_tasks(temp_store_path, positional_key, output_dir,
-                                           cols_for_select, fixed_arena_radius, generate_quiver_plots)
+    try:
+        with pd.HDFStore(temp_store_path, mode="r") as store:
+            cols_for_select = _load_positional_cols_for_select(store, positional_key, cols_to_load)
+        tasks, estimates = prepare_report_tasks(temp_store_path, positional_key, output_dir,
+                                               cols_for_select, fixed_arena_radius, generate_quiver_plots)
+    except (OSError, KeyError) as exc:
+        raise RuntimeError('Failed to read persisted positional data') from exc
     temporary_output = transformed_path + '.assembling'
     try:
         with open(temporary_output, 'w', encoding='utf-8', newline='') as output:

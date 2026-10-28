@@ -9,9 +9,12 @@ scientific quality-control warnings are recorded without altering measurements.
 In the scientific environment, install the development dependencies and run:
 
 ```bash
-python -m pip install -e ".[dev,monitoring]"
+python -m pip install -e ".[dev,monitoring,desktop]"
 python -m pytest -q
 ```
+
+On a Linux machine without a display, set `QT_QPA_PLATFORM=offscreen` before
+running the suite so GUI checks can create their windows without a desktop.
 
 The tests cover input contracts, frame alignment, scientific calculations,
 parallel execution, interrupted processing, output reuse, and job preparation.
